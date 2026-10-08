@@ -1,0 +1,100 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Desktop Build run ID
+        required: true
+        type: string
+      version:
+        description: Desktop version, without v prefix
+        required: true
+        default: '0.1.1'
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_BUILD_RUN: ${{ inputs.run_id }}
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download and verify the successful build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_BUILD_RUN -notmatch '^\d+$' -or $env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$') { throw '无效的运行编号或版本号' }
+          $runText = gh run view $env:RELEASE_BUILD_RUN --repo $env:GITHUB_REPOSITORY --json status,conclusion,headSha,workflowName
+          if ($LASTEXITCODE -ne 0) { throw '无法读取构建记录' }
+          $run = $runText | ConvertFrom-Json
+          if ($run.status -ne 'completed' -or $run.conclusion -ne 'success' -or $run.workflowName -ne 'Desktop Build') { throw '只能发布成功的 Desktop Build 产物' }
+          $records = @()
+          $checksums = @()
+          foreach ($platform in @('windows-x64', 'macos-arm64')) {
+              $dir = Join-Path 'packages' $platform
+              gh run download $env:RELEASE_BUILD_RUN --repo $env:GITHUB_REPOSITORY --name ('zhizhi-' + $platform) --dir $dir
+              if ($LASTEXITCODE -ne 0) { throw "产物下载失败：$platform" }
+              $info = Get-Content -LiteralPath (Join-Path $dir 'build-info.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+              if ($info.commit -ne $run.headSha -or $info.desktop_version -ne $env:RELEASE_VERSION -or $info.platform -ne $platform) { throw '源码提交、版本或平台不匹配' }
+              foreach ($line in (Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') -Encoding UTF8)) {
+                  if ($line -notmatch '^([0-9a-f]{64})\s{2}(zhizhi-[a-zA-Z0-9.-]+\.(?:exe|dmg))$') { throw '校验清单格式错误' }
+                  $expectedHash = $Matches[1]
+                  $file = Join-Path $dir $Matches[2]
+                  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant() -ne $expectedHash) { throw '安装包哈希不匹配' }
+                  $checksums += $line
+              }
+              $records += $info
+          }
+          $checksums | Set-Content -LiteralPath 'packages/SHA256SUMS.txt' -Encoding UTF8
+          [ordered]@{commit=$run.headSha; run_url="https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:RELEASE_BUILD_RUN"; platforms=$records} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'packages/build-info.json' -Encoding UTF8
+          Set-Content -LiteralPath 'packages/source-commit.txt' -Value $run.headSha -Encoding UTF8
+
+      - name: Publish verified packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (Get-Content -LiteralPath 'packages/source-commit.txt' -Encoding UTF8 -Raw).Trim()
+          $tag = 'v' + $env:RELEASE_VERSION
+          $notes = @"
+          知枝：从代码实践中长出自己的知识。
+
+          - Git 分支与新叶图标，统一应用、托盘、浏览器和 PWA 品牌资源。
+          - Windows x64 NSIS 安装包和 macOS Apple Silicon DMG。
+          - 保留历史工作区、技术入口与上游 MIT 许可证。
+          - 所有产物由 GitHub 托管的 Actions runner 构建，随包提供 SHA256 与源码提交记录。
+
+          构建提交：$commit
+          构建记录：https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:RELEASE_BUILD_RUN
+
+          Windows 已检查桌面启动，macOS 已检查临时签名与后端启动；未做页面视觉检查或完整使用情境验收。macOS 尚未公证，Windows 尚未配置证书签名。
+
+          首次使用请自行配置模型服务；Git 来源需要系统 Git。使用方法见项目 README 和 docs/USER_GUIDE.md。
+          "@
+          Set-Content -LiteralPath 'packages/release-notes.md' -Value $notes -Encoding UTF8
+          $existingText = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,targetCommitish
+          if ($LASTEXITCODE -eq 0) {
+              $existing = $existingText | ConvertFrom-Json
+              if (-not $existing.isDraft -or $existing.targetCommitish -ne $commit) { throw '不覆盖已发布版本或其他提交的草稿' }
+          } else {
+              gh release create $tag --repo $env:GITHUB_REPOSITORY --target $commit --draft --title ('知枝 ' + $tag) --notes-file 'packages/release-notes.md'
+              if ($LASTEXITCODE -ne 0) { throw '发布草稿创建失败' }
+          }
+          $assets = @(Get-ChildItem -LiteralPath 'packages/windows-x64', 'packages/macos-arm64' -File | Where-Object Extension -In '.exe', '.dmg' | ForEach-Object FullName)
+          if ($assets.Count -ne 2) { throw '安装包数量不正确' }
+          $assets += @('packages/SHA256SUMS.txt', 'packages/build-info.json')
+          gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release 附件上传失败' }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest --title ('知枝 ' + $tag) --notes-file 'packages/release-notes.md'
+          if ($LASTEXITCODE -ne 0) { throw 'Release 发布失败' }

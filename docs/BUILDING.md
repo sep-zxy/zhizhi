@@ -22,7 +22,7 @@
 3. 手动触发工作流，明确选择要构建的分支或已有标签。
 4. 确认两个平台任务的结果；查看日志与 `build-info.json` 中的源码提交。
 5. 下载成功任务的 Artifact，校验安装包哈希。
-6. 发布时将已验证的安装包、校验文件和构建记录附到 GitHub Release，不重新在本地打包。
+6. 触发 `publish-release.yml`，填写成功构建的运行编号与桌面版本。GitHub 将核对提交、版本和哈希，然后直接上传安装包并发布 Release；不重新构建。
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -31,6 +31,7 @@ gh run list --repo 'sep-zxy/zhizhi' --workflow 'desktop-build.yml' --limit 5
 # 替换 123456789 为实际运行编号
 gh run view 123456789 --repo 'sep-zxy/zhizhi'
 gh run download 123456789 --repo 'sep-zxy/zhizhi' --dir './dist/downloads/123456789'
+gh workflow run 'publish-release.yml' --repo 'sep-zxy/zhizhi' -f 'run_id=123456789' -f 'version=0.1.1'
 ```
 
 每次运行都对应确定的源码提交。发布标签应指向成功构建的提交；发布已有产物不需要重新构建。
