@@ -1,0 +1,27 @@
+# Reviewed legacy fixtures: entropy/redaction samples, mock provider credentials,
+# and a model-name parameter misidentified as an API key.
+# Exact commit/path/rule/line fingerprints only. New commits are NOT exempt.
+# Never add real credentials here or ignore an entire test directory.
+
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/llm/test_model_limits.py:generic-api-key:1463
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/serve/test_routes_growth_model.py:generic-api-key:50
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_allowlist.py:generic-api-key:166
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_allowlist.py:generic-api-key:203
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_allowlist.py:generic-api-key:238
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_allowlist.py:generic-api-key:72
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:1636
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:532
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:620
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:774
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:883
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_routes_providers.py:generic-api-key:895
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:171
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:181
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:191
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:205
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:215
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:227
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:234
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:330
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_security_hardening.py:generic-api-key:489
+75c5b0064565edcefaa5d234ebcef458e74471aa:tests/unit/test_stage1_task1.py:generic-api-key:762
