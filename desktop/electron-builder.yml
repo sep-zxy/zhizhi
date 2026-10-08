@@ -19,6 +19,7 @@ win:
 mac:
   icon: build/icon.icns
   identity: '-'
+  sign: './sign-macos.mjs'
   target: dmg
   category: public.app-category.education
 nsis:

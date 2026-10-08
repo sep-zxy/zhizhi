@@ -39,6 +39,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '桌面入口语法校验失败' }
           node --check scripts/require-github-actions.mjs
           if ($LASTEXITCODE -ne 0) { throw '构建限制脚本语法校验失败' }
+          node --check desktop/sign-macos.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'macOS 签名脚本语法校验失败' }
       - name: Check Python syntax
         run: |
           $ErrorActionPreference = 'Stop'

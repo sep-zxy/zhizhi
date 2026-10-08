@@ -6,6 +6,7 @@
 - `sidecar_entry.py`：PyInstaller 的 Python 入口。
 - `build-sidecar.ps1`：只允许在 GitHub 托管的 runner 上运行。
 - `electron-builder.yml`：Windows NSIS、macOS DMG 与应用资源配置。
+- `sign-macos.mjs`：复用已锁定的 Electron 签名库，为 macOS 包执行临时签名。
 - `build/icon.ico`、`build/icon.icns`：桌面品牌图标。
 
 所有前端、sidecar 和 Electron 构建统一通过 [Desktop Build](../.github/workflows/desktop-build.yml) 执行。本地不运行 `pnpm build`、PyInstaller 或 `package:win` / `package:mac`。完整流程见 [构建说明](../docs/BUILDING.md)。
