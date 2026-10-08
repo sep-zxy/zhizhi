@@ -11,6 +11,41 @@ permissions:
   contents: read
 
 jobs:
+  secrets:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan Git history for credentials
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '8.30.1'
+          $asset = "gitleaks_${version}_windows_x64.zip"
+          $baseUrl = "https://github.com/gitleaks/gitleaks/releases/download/v$version"
+          $archive = Join-Path $env:RUNNER_TEMP $asset
+          $checksumFile = Join-Path $env:RUNNER_TEMP 'gitleaks_checksums.txt'
+          Invoke-WebRequest -Uri "$baseUrl/$asset" -OutFile $archive
+          Invoke-WebRequest -Uri "$baseUrl/gitleaks_${version}_checksums.txt" -OutFile $checksumFile
+          $checksumLine = Get-Content -LiteralPath $checksumFile -Encoding UTF8 | Where-Object { $_ -match ('\s' + [regex]::Escape($asset) + '$') }
+          if (@($checksumLine).Count -ne 1) { throw '无法确认 Gitleaks 校验值' }
+          $expected = ($checksumLine -split '\s+')[0]
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Gitleaks 下载校验失败' }
+          $toolDir = Join-Path $env:RUNNER_TEMP 'gitleaks'
+          Expand-Archive -LiteralPath $archive -DestinationPath $toolDir
+          & (Join-Path $toolDir 'gitleaks.exe') git --redact=100 --no-banner --log-opts='--all' --report-format=json --report-path="$env:RUNNER_TEMP/gitleaks-redacted.json"
+          if ($LASTEXITCODE -ne 0) { throw '凭证扫描失败；请查看已脱敏的检测结果' }
+      - name: Upload redacted scan findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: credential-scan-redacted
+          path: ${{ runner.temp }}/gitleaks-redacted.json
+          retention-days: 1
+
   static:
     runs-on: windows-latest
     defaults:
