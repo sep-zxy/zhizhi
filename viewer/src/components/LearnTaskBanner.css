@@ -1,0 +1,414 @@
+/* ==========================================================================
+   LearnTaskBanner — inline task progress/result banner for Dashboard.
+   ========================================================================== */
+
+.learn-banner {
+  max-width: 1360px; /* 1440px - 40px*2 */
+  margin: 32px 40px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: 14px var(--sp-5);
+  border-radius: 12px;
+  border: 1px solid var(--hair);
+  background: var(--elevated);
+  box-shadow: var(--shadow-md);
+  animation: fadeUp var(--dur-base) ease-out;
+}
+
+@media (min-width: 1280px) {
+  .learn-banner {
+    margin-left: clamp(28px, 4vw, 56px);
+    margin-right: clamp(28px, 4vw, 56px);
+    max-width: calc(1440px - clamp(28px, 4vw, 56px) * 2);
+  }
+}
+
+@media (max-width: 768px) {
+  .learn-banner {
+    margin: 24px 24px 0;
+    max-width: none;
+  }
+}
+
+.learn-banner--running,
+.learn-banner--cancelling,
+.learn-banner--submitting,
+.learn-banner--estimating {
+  border-color: var(--accent-hair);
+  background: var(--accent-softer);
+  box-shadow: 0 1px 0 rgba(180,160,130,.06), 0 4px 20px -16px rgba(176,78,40,.18);
+}
+
+.learn-banner--completed {
+  border-color: var(--success-hair);
+  background: var(--success-soft);
+}
+
+.learn-banner--confirming {
+  border-color: var(--warning-hair);
+  background: var(--warning-soft-bg);
+}
+
+.learn-banner--cancelled {
+  border-color: var(--hair-strong);
+  background: var(--subtle);
+}
+
+.learn-banner--failed {
+  border-color: var(--danger-hair);
+  background: var(--danger-soft);
+}
+
+/* ---- Body ---- */
+
+.learn-banner__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+/* ---- Confirm panel ---- */
+
+.learn-banner__confirm {
+  gap: var(--sp-3);
+}
+
+.learn-banner__confirm-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 14px;
+}
+
+.learn-banner__risk {
+  font-size: 16px;
+}
+
+.learn-banner__risk--danger {
+  color: var(--danger);
+}
+
+.learn-banner__risk--warn {
+  color: var(--warning);
+}
+
+.learn-banner__confirm-stats {
+  display: flex;
+  gap: var(--sp-4);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  flex-wrap: wrap;
+}
+
+.learn-banner__confirm-warnings {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+.learn-banner__confirm-warnings li {
+  margin-bottom: 2px;
+}
+
+.learn-banner__confirm-actions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+.learn-banner__info {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.learn-banner__step {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 13.5px;
+  color: var(--ink);
+}
+
+.learn-banner__msg {
+  font-size: 13px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.learn-banner__elapsed {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.learn-banner__total-elapsed {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.learn-banner__hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.learn-banner__hint--long-running {
+  color: var(--ink);
+  font-style: italic;
+}
+
+.learn-banner__pulse {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  animation: pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+  align-self: center;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.75); }
+}
+
+.learn-banner__error-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  background: rgba(163, 54, 45, 0.12); /* fallback */
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.learn-banner__icon {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--success);
+}
+
+.learn-banner__icon--error {
+  color: var(--danger);
+}
+
+.learn-banner__result {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.learn-banner__score {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* ---- Progress bar ---- */
+
+.learn-banner__bar-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(210, 112, 80, 0.18); /* fallback */
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  overflow: hidden;
+}
+
+.learn-banner__bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width var(--dur-slow) ease-out;
+}
+
+.learn-banner__bar-track--active .learn-banner__bar-fill {
+  background: var(--accent); /* fallback */
+  background: linear-gradient(
+    90deg,
+    var(--accent) 0%,
+    color-mix(in srgb, var(--accent) 60%, white) 50%,
+    var(--accent) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ---- Spinner ---- */
+
+.learn-banner__spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(210, 112, 80, 0.3); /* fallback */
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---- Actions ---- */
+
+.learn-banner__actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.learn-banner__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px var(--sp-3);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--ink);
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+
+.learn-banner__btn:hover:not(:disabled) {
+  background: var(--subtle);
+  border-color: var(--hair-strong);
+}
+
+.learn-banner__btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.learn-banner__btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.learn-banner__btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.learn-banner__btn--primary:hover:not(:disabled) {
+  background: var(--accent-ink);
+  border-color: var(--accent-ink);
+  color: var(--on-accent);
+}
+
+.learn-banner__btn--cancel {
+  border-color: var(--hair-strong);
+  color: var(--ink);
+}
+
+.learn-banner__btn--retry {
+  border-color: var(--accent-hair);
+  color: var(--accent-ink);
+}
+
+.learn-banner__btn--retry:hover:not(:disabled) {
+  background: var(--accent-softer);
+}
+
+.learn-banner__btn--dismiss {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.learn-banner__btn--dismiss:hover:not(:disabled) {
+  background: var(--subtle);
+  color: var(--ink);
+}
+
+.learn-banner__btn--view {
+  border-color: var(--accent-hair);
+  color: var(--accent-ink);
+}
+
+.learn-banner__btn--view:hover:not(:disabled) {
+  background: var(--accent-softer);
+}
+
+/* ---- Responsive ---- */
+
+@media (max-width: 540px) {
+  .learn-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .learn-banner__actions {
+    justify-content: flex-end;
+  }
+}
+
+/* ---- Forced colors ---- */
+
+@media (forced-colors: active) {
+  .learn-banner {
+    border: 2px solid ButtonText;
+  }
+  .learn-banner__bar-track {
+    background: GrayText;
+  }
+  .learn-banner__bar-fill {
+    background: Highlight;
+  }
+}
+
+/* ---- Reduced motion ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .learn-banner {
+    animation: none;
+  }
+  .learn-banner__bar-fill {
+    transition: none;
+    animation: none;
+  }
+  .learn-banner__spinner {
+    animation: none;
+  }
+  .learn-banner__pulse {
+    animation: none;
+  }
+}
+
+/* ---- Print ---- */
+
+@media print {
+  .learn-banner--running,
+  .learn-banner--submitting,
+  .learn-banner--cancelling {
+    display: none;
+  }
+}

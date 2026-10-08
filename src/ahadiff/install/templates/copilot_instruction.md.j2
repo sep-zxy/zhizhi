@@ -1,0 +1,30 @@
+---
+applyTo: "**"
+---
+<!-- AHADIFF:GENERATED -->
+# AhaDiff
+
+Use AhaDiff when suggesting, reviewing, or explaining code changes that should
+be learned back from the actual diff.
+
+## Commands
+
+- `ahadiff learn HEAD~1..HEAD` captures the latest commit.
+- `ahadiff learn --staged` captures staged changes before commit.
+- `ahadiff quiz <run_id>` reviews generated quiz questions.
+- `ahadiff review` opens the due SRS queue.
+- `ahadiff verify <run_id>` rechecks claims and score artifacts.
+- `ahadiff improve --rounds 1` runs one targeted improvement round.
+- `ahadiff serve` opens the local WebUI.
+- `ahadiff init` initializes per-repo AhaDiff state.
+
+Additional learn capture modes: `ahadiff learn --last`, `ahadiff learn --since
+"2 hours ago"`, `ahadiff learn --unstaged`, and `ahadiff learn --patch FILE|-`.
+
+## Boundaries
+
+- Keep provider credentials in environment variables.
+- Do not commit `.ahadiff/audit.private.jsonl`.
+- Treat `.ahadiff/` as local state.
+- Prefer verified claims with file-line evidence.
+- Do not upload `.ahadiff/` artifacts to external services without explicit user consent.

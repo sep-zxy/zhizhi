@@ -1,0 +1,961 @@
+from __future__ import annotations
+
+import csv
+import json
+import os
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from typer.testing import CliRunner
+
+from ahadiff import cli as cli_module
+from ahadiff.cli import app
+from ahadiff.contracts import ClaimRecord, SourceHunk
+from ahadiff.core import orchestrator as orchestrator_module
+from ahadiff.core.errors import InputError
+from ahadiff.eval import results as results_module
+from ahadiff.eval.evaluator import ScoreReport, evaluate_run
+from ahadiff.eval.results import (
+    append_result,
+    compute_prompt_version,
+    export_results,
+    finalized_artifact_digest,
+    finalized_marker_path,
+    load_result_events,
+    publish_result_artifacts,
+    results_tsv_path_for_run,
+    review_db_path_for_run,
+    rollback_result_event,
+)
+from ahadiff.git.line_map import build_line_map, serialize_line_map_payload
+from ahadiff.review import database as review_database_module
+
+if TYPE_CHECKING:
+    import sqlite3
+    from collections.abc import Iterator
+
+_RUNNER = CliRunner()
+
+
+def _zero_identity_stat(path_stat: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_mode=path_stat.st_mode,
+        st_size=path_stat.st_size,
+        st_dev=0,
+        st_ino=0,
+        st_nlink=1,
+        st_mtime=path_stat.st_mtime,
+        st_ctime=path_stat.st_ctime,
+        st_mtime_ns=getattr(path_stat, "st_mtime_ns", int(path_stat.st_mtime * 1_000_000_000)),
+        st_ctime_ns=getattr(path_stat, "st_ctime_ns", int(path_stat.st_ctime * 1_000_000_000)),
+    )
+
+
+def _patch_zero_identity_lstat(
+    monkeypatch: pytest.MonkeyPatch,
+    target_path: Path,
+) -> None:
+    original_lstat = results_module.os.lstat
+
+    def fake_lstat(path: Any) -> Any:
+        path_stat = original_lstat(path)
+        if Path(cast("str | Path", path)) == target_path:
+            return _zero_identity_stat(path_stat)
+        return path_stat
+
+    monkeypatch.setattr(results_module.os, "lstat", fake_lstat)
+
+
+def _write_run_fixture(workspace_root: Path, run_id: str = "run_results") -> Path:
+    run_path = workspace_root / ".ahadiff" / "runs" / run_id
+    run_path.mkdir(parents=True, exist_ok=True)
+    patch_text = """\
+diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1,2 @@
+-value = 1
++value = 2
++print(value)
+"""
+    metadata = {
+        "run_id": run_id,
+        "source_kind": "patch_file",
+        "source_ref": "sha256:fixture",
+        "capability_level": 1,
+        "degraded_flags": {},
+        "learnability": {"score": 0.7},
+        "source_detail": {},
+        "privacy_mode": "strict_local",
+    }
+    claim = ClaimRecord(
+        claim_id="claim_fixture",
+        run_id=run_id,
+        text="The module now prints the updated value.",
+        status="verified",
+        confidence="high",
+        source_hunks=[SourceHunk(file="src/app.py", start=1, end=2, side="new")],
+    )
+    lesson_dir = run_path / "lesson"
+    lesson_dir.mkdir()
+    (lesson_dir / "lesson.full.md").write_text("full lesson\n", encoding="utf-8")
+    (lesson_dir / "lesson.hint.md").write_text("hint lesson\n", encoding="utf-8")
+    (lesson_dir / "lesson.compact.md").write_text("compact lesson\n", encoding="utf-8")
+    quiz_dir = run_path / "quiz"
+    quiz_dir.mkdir()
+    (quiz_dir / "quiz.jsonl").write_text(
+        json.dumps({"question": "What changed?", "source_claims": ["claim_fixture"]}) + "\n",
+        encoding="utf-8",
+    )
+    (run_path / "metadata.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+    (run_path / "patch.diff").write_text(patch_text, encoding="utf-8")
+    (run_path / "line_map.json").write_text(
+        json.dumps(serialize_line_map_payload(build_line_map(patch_text))) + "\n",
+        encoding="utf-8",
+    )
+    (run_path / "claims.jsonl").write_text(
+        json.dumps(claim.model_dump(mode="json")) + "\n",
+        encoding="utf-8",
+    )
+    return run_path
+
+
+def _report_for_run(run_path: Path) -> ScoreReport:
+    report = evaluate_run(run_path)
+    return ScoreReport(
+        run_id=report.run_id,
+        source_ref=report.source_ref,
+        source_kind=report.source_kind,
+        capability_level=report.capability_level,
+        degraded_flags=report.degraded_flags,
+        overall=report.overall,
+        verdict=report.verdict,
+        weakest_dim=report.weakest_dim,
+        eval_bundle_version=report.eval_bundle_version,
+        rubric_version=report.rubric_version,
+        dimensions=report.dimensions,
+        hard_gates=report.hard_gates,
+        notes=report.notes,
+    )
+
+
+def test_append_result_writes_sqlite_tsv_and_finalized_marker(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path)
+    report = _report_for_run(run_path)
+
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        note_payload={"ratchet_reason": "no_git_ancestry"},
+        event_id="018f0f52-91c0-7abc-8123-000000000001",
+    )
+
+    assert outcome.sqlite_inserted is True
+    assert outcome.tsv_appended is True
+    assert outcome.finalized_written is True
+    assert finalized_marker_path(run_path).exists()
+    marker = json.loads(finalized_marker_path(run_path).read_text(encoding="utf-8"))
+    artifact_count, checksum = finalized_artifact_digest(run_path)
+    assert marker["finalized_at"] == outcome.event.timestamp
+    assert marker["artifact_count"] == artifact_count
+    assert marker["checksum"] == checksum
+    assert len(marker["checksum"]) == 64
+    assert results_tsv_path_for_run(run_path).exists()
+    assert outcome.event.prompt_version != "no-prompts"
+    rows = load_result_events(review_db_path_for_run(run_path))
+    assert len(rows) == 1
+    assert rows[0].status == "non_ratcheted"
+
+
+def test_prompt_version_ignores_workspace_prompts_directory(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_prompt_version")
+    workspace_prompts = tmp_path / "prompts"
+    workspace_prompts.mkdir()
+    (workspace_prompts / "lesson_hint.md").write_text(
+        "workspace-specific prompt\n",
+        encoding="utf-8",
+    )
+    report = _report_for_run(run_path)
+
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000007",
+    )
+
+    assert outcome.event.prompt_version == compute_prompt_version(tmp_path / "another-workspace")
+    assert outcome.event.prompt_version != "no-prompts"
+
+
+def test_append_result_is_idempotent_for_same_event_id(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path)
+    report = _report_for_run(run_path)
+
+    first = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000002",
+    )
+    second = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000002",
+    )
+
+    assert first.sqlite_inserted is True
+    assert second.sqlite_inserted is False
+    assert second.tsv_appended is False
+    assert second.finalized_written is False
+    rows = load_result_events(review_db_path_for_run(run_path))
+    assert len(rows) == 1
+    with results_tsv_path_for_run(run_path).open("r", encoding="utf-8", newline="") as handle:
+        tsv_rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert len(tsv_rows) == 1
+    finalized_payload = json.loads(finalized_marker_path(run_path).read_text(encoding="utf-8"))
+    assert finalized_payload["event_id"] == first.event.event_id
+
+
+def test_export_results_rebuilds_tsv_from_sqlite(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path)
+    report = _report_for_run(run_path)
+    append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000003",
+    )
+
+    output_path = tmp_path / "rebuilt.tsv"
+    export_results(
+        db_path=review_db_path_for_run(run_path),
+        output_path=output_path,
+    )
+
+    with output_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = list(reader)
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "run_results"
+
+
+def test_rollback_result_event_uses_single_review_db_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_rollback")
+    report = _report_for_run(run_path)
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000008",
+    )
+    connection_count = 0
+    real_connect = review_database_module.connect_review_db
+
+    def counting_connect(db_path: Path) -> sqlite3.Connection:
+        nonlocal connection_count
+        connection_count += 1
+        return real_connect(db_path)
+
+    monkeypatch.setattr(review_database_module, "connect_review_db", counting_connect)
+
+    rollback_result_event(run_path=run_path, event_id=outcome.event.event_id)
+
+    assert connection_count == 1
+    assert load_result_events(review_db_path_for_run(run_path)) == ()
+    with results_tsv_path_for_run(run_path).open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert rows == []
+
+
+def test_export_results_cli_uses_workspace_review_db(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_cli_export")
+    report = _report_for_run(run_path)
+    append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000004",
+    )
+
+    output_path = tmp_path / "custom-results.tsv"
+    result = _RUNNER.invoke(
+        app(),
+        ["export-results", "--repo-root", str(tmp_path), "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0
+    assert output_path.exists()
+    with output_path.open("r", encoding="utf-8") as handle:
+        text = handle.read()
+    assert "run_cli_export" in text
+
+
+def test_score_command_writes_custom_output_and_finalized_reference(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_cli_score")
+    custom_output = tmp_path / "artifacts" / "custom-score.json"
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "score",
+            "run_cli_score",
+            "--repo-root",
+            str(tmp_path),
+            "--output",
+            str(custom_output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert custom_output.exists()
+    payload = json.loads(finalized_marker_path(run_path).read_text(encoding="utf-8"))
+    assert payload["score_path"] == str(custom_output.resolve())
+
+
+def test_export_results_cli_acquires_repo_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_lock_export")
+    report = _report_for_run(run_path)
+    append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000005",
+    )
+    commands: list[str] = []
+
+    @contextmanager
+    def fake_repo_write_lock(lock_path: Path, *, command: str) -> Iterator[Path]:
+        commands.append(command)
+        yield lock_path
+
+    monkeypatch.setattr(cli_module, "repo_write_lock", fake_repo_write_lock)
+
+    output_path = tmp_path / "locked-results.tsv"
+    result = _RUNNER.invoke(
+        app(),
+        ["export-results", "--repo-root", str(tmp_path), "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0
+    assert commands == ["export-results"]
+
+
+@pytest.mark.parametrize(
+    "publish_error",
+    [OSError("simulated publish failure"), InputError("bad artifact")],
+)
+def test_score_command_rolls_back_result_event_when_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publish_error: Exception,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_publish_fail")
+
+    def fail_publish_result_artifacts(**kwargs: object) -> None:
+        del kwargs
+        raise publish_error
+
+    monkeypatch.setattr(cli_module, "publish_result_artifacts", fail_publish_result_artifacts)
+
+    result = _RUNNER.invoke(
+        app(),
+        ["score", "run_publish_fail", "--repo-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "failed to publish score artifacts" in result.output
+    assert load_result_events(review_db_path_for_run(run_path)) == ()
+    with results_tsv_path_for_run(run_path).open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert rows == []
+    assert not finalized_marker_path(run_path).exists()
+    assert not (run_path / "score.json").exists()
+
+
+def test_publish_result_artifacts_restores_backups_when_temp_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_publish_restore")
+    report = _report_for_run(run_path)
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000006",
+        write_finalized=False,
+    )
+    original_score = '{"old": true}\n'
+    original_finalized = '{"old": "finalized"}\n'
+    score_path = run_path / "score.json"
+    finalized_path = finalized_marker_path(run_path)
+    score_path.write_text(original_score, encoding="utf-8")
+    finalized_path.write_text(original_finalized, encoding="utf-8")
+
+    real_write_text = Path.write_text
+    failure_injected = False
+
+    def flaky_write_text(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        nonlocal failure_injected
+        if not failure_injected and str(self).endswith(".finalized.tmp"):
+            failure_injected = True
+            raise OSError("simulated finalized temp write failure")
+        return real_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+    with pytest.raises(OSError, match="simulated finalized temp write failure"):
+        publish_result_artifacts(
+            run_path=run_path,
+            report=report,
+            event=outcome.event,
+            score_path=score_path,
+            overwrite=True,
+        )
+
+    assert failure_injected is True
+    assert score_path.read_text(encoding="utf-8") == original_score
+    assert finalized_path.read_text(encoding="utf-8") == original_finalized
+
+
+@pytest.mark.parametrize("wrapper", ["cli", "core"])
+@pytest.mark.parametrize("failure_point", ["finalized_write", "finalized_replace"])
+def test_persist_wrappers_restore_real_publication_and_history_on_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
+    failure_point: str,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_interrupt_publication")
+    report = _report_for_run(run_path)
+    original = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="learn",
+        write_finalized=False,
+    )
+    score_path = run_path / "score.json"
+    finalized_path = finalized_marker_path(run_path)
+    publish_result_artifacts(
+        run_path=run_path,
+        report=report,
+        event=original.event,
+        score_path=score_path,
+        overwrite=True,
+    )
+    before_files = {
+        str(path.relative_to(run_path)): path.read_bytes()
+        for path in run_path.rglob("*")
+        if path.is_file()
+    }
+    before_events = load_result_events(review_db_path_for_run(run_path))
+    before_history = results_tsv_path_for_run(run_path).read_bytes()
+    new_report = replace(report, notes=(*report.notes, "Synthetic next publication."))
+    original_write = Path.write_text
+    original_replace = Path.replace
+    score_moved = False
+    interrupted = False
+
+    def interrupted_write(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        nonlocal interrupted
+        if (
+            failure_point == "finalized_write"
+            and self.name.endswith(".finalized.tmp")
+            and not interrupted
+        ):
+            assert score_moved
+            assert "Synthetic next publication." in score_path.read_text(encoding="utf-8")
+            interrupted = True
+            raise KeyboardInterrupt("synthetic publication interruption")
+        return original_write(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    def interrupted_replace(self: Path, target: str | Path) -> Path:
+        nonlocal score_moved, interrupted
+        moved = original_replace(self, target)
+        if self.name.endswith(".score.tmp") and Path(target) == score_path:
+            score_moved = True
+        if (
+            failure_point == "finalized_replace"
+            and self.name.endswith(".finalized.tmp")
+            and Path(target) == finalized_path
+            and not interrupted
+        ):
+            assert score_moved
+            assert (
+                json.loads(finalized_path.read_text(encoding="utf-8"))["event_id"]
+                != original.event.event_id
+            )
+            interrupted = True
+            raise KeyboardInterrupt("synthetic publication interruption")
+        return moved
+
+    monkeypatch.setattr(Path, "write_text", interrupted_write)
+    monkeypatch.setattr(Path, "replace", interrupted_replace)
+    persist = (
+        cli_module._persist_evaluated_run  # pyright: ignore[reportPrivateUsage]
+        if wrapper == "cli"
+        else orchestrator_module._persist_evaluated_run_sync  # pyright: ignore[reportPrivateUsage]
+    )
+    with pytest.raises(KeyboardInterrupt, match="synthetic publication interruption"):
+        persist(
+            run_path=run_path,
+            report=new_report,
+            workspace_root=tmp_path,
+            event_type="verify",
+            output_path=score_path,
+            force=True,
+            note_payload={"synthetic_interruption": True},
+        )
+    assert score_moved and interrupted
+    assert {
+        str(path.relative_to(run_path)): path.read_bytes()
+        for path in run_path.rglob("*")
+        if path.is_file()
+    } == before_files
+    assert load_result_events(review_db_path_for_run(run_path)) == before_events
+    assert results_tsv_path_for_run(run_path).read_bytes() == before_history
+    marker = json.loads(finalized_path.read_text(encoding="utf-8"))
+    assert marker["event_id"] == original.event.event_id
+    assert (marker["artifact_count"], marker["checksum"]) == finalized_artifact_digest(run_path)
+
+
+@pytest.mark.parametrize("wrapper", ["cli", "core"])
+def test_persist_wrappers_keep_completed_publication_when_interrupted_after_publish_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_committed_interrupt")
+    report = _report_for_run(run_path)
+    original = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="learn",
+        write_finalized=False,
+    )
+    score_path = run_path / "score.json"
+    publish_result_artifacts(
+        run_path=run_path,
+        report=report,
+        event=original.event,
+        score_path=score_path,
+        overwrite=True,
+    )
+    score_before = score_path.read_bytes()
+    new_report = replace(report, notes=(*report.notes, "Synthetic fully committed publication."))
+    committed_files: dict[str, bytes] = {}
+    published_event_ids: list[str] = []
+    actual_publish = results_module.publish_result_artifacts
+
+    def publish_then_interrupt(**kwargs: Any) -> None:
+        actual_publish(**kwargs)
+        event_id = str(kwargs["event"].event_id)
+        assert results_module.result_artifacts_are_published(run_path, event_id=event_id)
+        committed_files.update(
+            {
+                str(path.relative_to(run_path)): path.read_bytes()
+                for path in run_path.rglob("*")
+                if path.is_file()
+            }
+        )
+        published_event_ids.append(event_id)
+        raise KeyboardInterrupt("synthetic interruption after publication returned")
+
+    if wrapper == "cli":
+        monkeypatch.setattr(cli_module, "publish_result_artifacts", publish_then_interrupt)
+    else:
+        monkeypatch.setattr(results_module, "publish_result_artifacts", publish_then_interrupt)
+    persist = (
+        cli_module._persist_evaluated_run  # pyright: ignore[reportPrivateUsage]
+        if wrapper == "cli"
+        else orchestrator_module._persist_evaluated_run_sync  # pyright: ignore[reportPrivateUsage]
+    )
+    with pytest.raises(KeyboardInterrupt, match="after publication returned"):
+        persist(
+            run_path=run_path,
+            report=new_report,
+            workspace_root=tmp_path,
+            event_type="verify",
+            output_path=score_path,
+            force=True,
+            note_payload={"synthetic_late_interruption": True},
+        )
+    assert len(published_event_ids) == 1
+    assert score_path.read_bytes() != score_before
+    assert json.loads(score_path.read_text(encoding="utf-8")) == new_report.to_payload()
+    assert {
+        str(path.relative_to(run_path)): path.read_bytes()
+        for path in run_path.rglob("*")
+        if path.is_file()
+    } == committed_files
+    events = load_result_events(review_db_path_for_run(run_path))
+    assert len(events) == 2 and original.event in events
+    assert {event.event_id for event in events} == {original.event.event_id, published_event_ids[0]}
+    marker = json.loads(finalized_marker_path(run_path).read_text(encoding="utf-8"))
+    assert marker["event_id"] == published_event_ids[0]
+    assert (marker["artifact_count"], marker["checksum"]) == finalized_artifact_digest(run_path)
+    with results_tsv_path_for_run(run_path).open(encoding="utf-8", newline="") as handle:
+        history = list(csv.DictReader(handle, delimiter="\t"))
+    assert len(history) == 2
+    assert any("synthetic_late_interruption" in row["note_json"] for row in history)
+
+
+def test_publish_result_artifacts_restores_backups_when_digest_rejects_artifact(
+    tmp_path: Path,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_publish_reject")
+    report = _report_for_run(run_path)
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000009",
+        write_finalized=False,
+    )
+    original_score = '{"old": true}\n'
+    original_finalized = '{"old": "finalized"}\n'
+    score_path = run_path / "score.json"
+    finalized_path = finalized_marker_path(run_path)
+    score_path.write_text(original_score, encoding="utf-8")
+    finalized_path.write_text(original_finalized, encoding="utf-8")
+    outside_target = tmp_path / "outside.txt"
+    outside_target.write_text("outside\n", encoding="utf-8")
+    (run_path / "unsafe-link").symlink_to(outside_target)
+
+    with pytest.raises(InputError, match="refusing symlink artifact"):
+        publish_result_artifacts(
+            run_path=run_path,
+            report=report,
+            event=outcome.event,
+            score_path=score_path,
+            overwrite=True,
+        )
+
+    assert score_path.read_text(encoding="utf-8") == original_score
+    assert finalized_path.read_text(encoding="utf-8") == original_finalized
+
+
+def test_append_result_catches_non_os_error_in_finalized_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_non_os_error")
+    report = _report_for_run(run_path)
+
+    original_write = results_module._write_finalized_marker  # pyright: ignore[reportPrivateUsage]
+
+    def raise_value_error(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise ValueError("simulated non-OSError failure")
+
+    monkeypatch.setattr(results_module, "_write_finalized_marker", raise_value_error)
+
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000099",
+    )
+
+    assert outcome.sqlite_inserted is True
+    assert outcome.finalized_written is False
+    assert any("simulated non-OSError" in w for w in outcome.warnings)
+
+    del original_write
+
+
+@pytest.mark.skipif(not hasattr(results_module.os, "symlink"), reason="requires symlink support")
+def test_append_result_does_not_follow_results_tsv_symlink(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_results_tsv_symlink")
+    report = _report_for_run(run_path)
+    outside = tmp_path / "outside-results.tsv"
+    outside.write_text("outside\n", encoding="utf-8")
+    results_tsv_path_for_run(run_path).symlink_to(outside)
+
+    outcome = append_result(
+        run_path=run_path,
+        report=report,
+        status="non_ratcheted",
+        base_ref=None,
+        event_type="verify",
+        event_id="018f0f52-91c0-7abc-8123-000000000199",
+        write_finalized=False,
+    )
+
+    assert outcome.tsv_appended is False
+    assert any("results.tsv append failed" in warning for warning in outcome.warnings)
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_finalized_artifact_digest_rejects_oversized_artifact(tmp_path: Path) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_huge_artifact")
+    large_artifact = run_path / "huge.bin"
+    with large_artifact.open("wb") as handle:
+        handle.truncate(16 * 1024 * 1024 + 1)
+
+    with pytest.raises(InputError, match="artifact exceeds size limit"):
+        finalized_artifact_digest(run_path)
+
+
+@pytest.mark.skipif(
+    not hasattr(results_module.os, "symlink") or not hasattr(results_module.os, "O_NOFOLLOW"),
+    reason="requires POSIX symlink no-follow support",
+)
+def test_finalized_artifact_digest_rejects_symlink_swap_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = _write_run_fixture(tmp_path, run_id="run_digest_swap")
+    artifact_path = run_path / "artifact.txt"
+    artifact_path.write_text("safe artifact\n", encoding="utf-8")
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_text("outside\n", encoding="utf-8")
+    original_open = results_module.os.open
+    swapped = False
+
+    def swapping_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if Path(path) == artifact_path and not swapped:
+            swapped = True
+            artifact_path.unlink()
+            results_module.os.symlink(outside_path, artifact_path)
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(results_module.os, "open", swapping_open)
+
+    with pytest.raises(InputError, match="symlink|changed during validation"):
+        finalized_artifact_digest(run_path)
+
+    assert swapped is True
+
+
+def test_finalized_artifact_digest_rejects_too_many_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_many_artifacts"
+    run_path.mkdir()
+    monkeypatch.setattr(results_module, "_MAX_FINALIZED_ARTIFACT_COUNT", 2)
+    for index in range(3):
+        (run_path / f"artifact-{index}.txt").write_text("x\n", encoding="utf-8")
+
+    with pytest.raises(InputError, match="too many artifacts"):
+        finalized_artifact_digest(run_path)
+
+
+def test_finalized_artifact_digest_rejects_total_artifact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_total_artifacts"
+    run_path.mkdir()
+    monkeypatch.setattr(results_module, "_MAX_FINALIZED_ARTIFACTS_TOTAL_BYTES", 4)
+    (run_path / "one.txt").write_text("abc", encoding="utf-8")
+    (run_path / "two.txt").write_text("def", encoding="utf-8")
+
+    with pytest.raises(InputError, match="total size limit"):
+        finalized_artifact_digest(run_path)
+
+
+def test_finalized_artifact_digest_rejects_reparse_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_reparse_dir"
+    reparse_dir = run_path / "junction"
+    reparse_dir.mkdir(parents=True)
+    (reparse_dir / "outside-secret.txt").write_text("outside-secret\n", encoding="utf-8")
+
+    def fake_has_reparse_point(path_stat: object) -> bool:
+        return results_module.stat.S_ISDIR(cast("Any", path_stat).st_mode)
+
+    monkeypatch.setattr(
+        results_module,
+        "_has_windows_reparse_point",
+        fake_has_reparse_point,
+    )
+
+    with pytest.raises(InputError, match="Windows reparse point"):
+        finalized_artifact_digest(run_path)
+
+
+def test_finalized_artifact_digest_rejects_hardlinked_artifact(tmp_path: Path) -> None:
+    if not hasattr(os, "link"):
+        pytest.skip("hardlinks unavailable on this platform")
+
+    outside_path = tmp_path / "outside-secret.txt"
+    outside_path.write_text("outside-secret\n", encoding="utf-8")
+    run_path = tmp_path / "run_hardlink"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    os.link(outside_path, artifact_path)
+
+    with pytest.raises(InputError, match="hardlinked artifact"):
+        finalized_artifact_digest(run_path)
+
+
+def test_finalized_artifact_digest_allows_zero_inode_lstat_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_zero_inode"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    artifact_path.write_text("safe artifact\n", encoding="utf-8")
+    _patch_zero_identity_lstat(monkeypatch, artifact_path)
+
+    artifact_count, checksum = finalized_artifact_digest(run_path)
+
+    assert artifact_count == 1
+    assert len(checksum) == 64
+
+
+def test_finalized_artifact_digest_rejects_replacement_with_zero_inode_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_zero_inode_swap"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    artifact_bytes = b"safe-data-01\n"
+    replacement_bytes = b"evil-data-02\n"
+    assert len(artifact_bytes) == len(replacement_bytes)
+    artifact_path.write_bytes(artifact_bytes)
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_bytes(replacement_bytes)
+    expected_zero_stat = _zero_identity_stat(artifact_path.stat())
+    _patch_zero_identity_lstat(monkeypatch, artifact_path)
+    original_open = results_module.os.open
+    original_fstat = results_module.os.fstat
+    open_count = 0
+    opened_fds: set[int] = set()
+
+    def fake_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        nonlocal open_count
+        if Path(cast("str | Path", path)) == artifact_path:
+            open_count += 1
+            opened_path = artifact_path if open_count == 1 else outside_path
+            fd = original_open(opened_path, flags, mode)
+            opened_fds.add(fd)
+            return fd
+        return original_open(path, flags, mode)
+
+    def fake_fstat(fd: int) -> Any:
+        if fd in opened_fds:
+            return expected_zero_stat
+        return original_fstat(fd)
+
+    monkeypatch.setattr(results_module.os, "open", fake_open)
+    monkeypatch.setattr(results_module.os, "fstat", fake_fstat)
+
+    with pytest.raises(InputError, match="changed during validation"):
+        finalized_artifact_digest(run_path)
+
+
+@pytest.mark.skipif(not hasattr(results_module.os, "symlink"), reason="requires symlink support")
+def test_results_tsv_row_escapes_formula_injection_prefixes() -> None:
+    from ahadiff.eval.results import _results_tsv_row  # pyright: ignore[reportPrivateUsage]
+
+    event = results_module.ResultEvent(
+        event_id="ev-001",
+        event_type="learn",
+        timestamp="2026-01-01T00:00:00Z",
+        run_id="run-001",
+        source_ref="=cmd|'/C calc'!A0",
+        base_ref="+malicious",
+        prompt_version="pv",
+        eval_bundle_version="ebv",
+        rubric_version="rv",
+        overall=95.0,
+        verdict="PASS",
+        status="baseline",
+        weakest_dim="accuracy",
+        note_json='=HYPERLINK("http://evil")',
+    )
+    row = _results_tsv_row(event)
+    assert row["source_ref"] == "'=cmd|'/C calc'!A0"
+    assert row["base_ref"] == "'+malicious"
+    assert row["note_json"] == '\'=HYPERLINK("http://evil")'
+
+
+def test_hash_finalized_artifact_file_rejects_symlink_when_open_may_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_path = tmp_path / "target.txt"
+    target_path.write_text("target\n", encoding="utf-8")
+    link_path = tmp_path / "artifact-link.txt"
+    results_module.os.symlink(target_path, link_path)
+    expected_stat = target_path.stat()
+    original_open = results_module.os.open
+    nofollow_flag = getattr(results_module.os, "O_NOFOLLOW", 0)
+
+    def following_open(path: str, flags: int, mode: int = 0o777) -> int:
+        if nofollow_flag:
+            flags &= ~nofollow_flag
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(results_module.os, "open", following_open)
+    hash_artifact = results_module._hash_finalized_artifact_file  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(InputError, match="symlink"):
+        hash_artifact(link_path, "artifact-link.txt", expected_stat)

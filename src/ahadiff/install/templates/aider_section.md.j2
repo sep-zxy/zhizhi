@@ -1,0 +1,30 @@
+## AhaDiff
+
+Use AhaDiff as the learn-back layer for AI-written diffs:
+
+Common commands:
+
+- `ahadiff learn HEAD~1..HEAD`
+- `ahadiff learn --staged`
+- `ahadiff quiz <run_id>`
+- `ahadiff review`
+- `ahadiff verify <run_id>`
+- `ahadiff improve --rounds 1`
+- `ahadiff serve`
+
+Additional learn capture modes:
+
+- `ahadiff learn --last`
+- `ahadiff learn --since "2 hours ago"`
+
+For Aider, consider starting with `--read CONVENTIONS.md` when this repository
+uses that convention. A project `.aider.conf.yml` can also include optional
+read-only context files.
+
+## Boundaries
+
+- Keep provider credentials in environment variables.
+- Do not commit `.ahadiff/audit.private.jsonl`.
+- Treat `.ahadiff/` as local state.
+- Prefer verified claims with file-line evidence.
+- Do not upload `.ahadiff/` artifacts to external services without explicit user consent.

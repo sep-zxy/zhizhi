@@ -1,0 +1,1755 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { RefreshCw } from 'lucide-react';
+import type { ProviderSummary } from '../api/config';
+import type {
+  ModelLimitsResponse,
+  ModelLimitsWarning,
+  ModelThinkingSupport,
+  ProviderCreateInput,
+  ProviderMutationResponse,
+  ProviderUpdateInput,
+  ProviderVerification,
+  TaskInfoResponse,
+  ThinkingLevel,
+} from '../api/types';
+import { thinkingLevelSchema } from '../api/schemas';
+import { ApiError } from '../api/client';
+import { getTask } from '../api/tasks';
+import {
+  discoverModels,
+  fetchProviderModels,
+  previewModelLimits,
+  saveProviderModels,
+} from '../api/providers';
+import { useTranslation, type MessageKey, type TranslateFn } from '../i18n/useTranslation';
+import './ProviderCard.css';
+
+const THINKING_HINT_KEY_BY_PROVIDER: Record<string, MessageKey> = {
+  anthropic: 'Settings_page.provider_thinking_hint_anthropic',
+  azure: 'Settings_page.provider_thinking_hint_azure',
+  gemini: 'Settings_page.provider_thinking_hint_gemini',
+  ollama: 'Settings_page.provider_thinking_hint_ollama',
+  openai_compat: 'Settings_page.provider_thinking_hint_openai_compat',
+  openai_responses: 'Settings_page.provider_thinking_hint_openai_responses',
+};
+const PROVIDER_WARNING_KEY_BY_CODE: Record<string, MessageKey> = {
+  'provider_limits.default_fallback': 'Settings_page.provider_limits_warning_default_fallback',
+  'provider_limits.local_runtime': 'Settings_page.provider_limits_warning_local_runtime',
+  'provider_limits.route_specific': 'Settings_page.provider_limits_warning_route_specific',
+  'provider_limits.low_confidence': 'Settings_page.provider_limits_warning_low_confidence',
+  'provider_limits.registry_warning': 'Settings_page.provider_limits_warning_registry_warning',
+  'provider_limits.max_output_clamped': 'Settings_page.provider_limits_warning_max_output_clamped',
+  'provider_limits.unverified_override': 'Settings_page.provider_limits_warning_unverified_override',
+};
+const THINKING_WARNING_KEY_BY_CODE: Record<string, MessageKey> = {
+  thinking_always_on: 'Settings_page.provider_thinking_warning_always_on',
+  thinking_toggle_only: 'Settings_page.provider_thinking_warning_toggle_only',
+  thinking_budget_mapping: 'Settings_page.provider_thinking_warning_budget_mapping',
+  compatible_endpoint_thinking_unverified: 'Settings_page.provider_thinking_warning_compatible_unverified',
+  thinking_minimal_not_off: 'Settings_page.provider_thinking_warning_minimal_not_off',
+  azure_thinking_uses_model_profile: 'Settings_page.provider_thinking_warning_azure_profile',
+  thinking_controls_agent_count: 'Settings_page.provider_thinking_warning_agent_count',
+};
+export const PROVIDER_ERROR_KEY_BY_CODE: Record<string, MessageKey> = {
+  INPUT_VALIDATION: 'Settings_page.provider_error_validation_error',
+  INPUT_BAD_FIELD: 'Settings_page.provider_error_bad_field',
+  PROVIDER_NOT_FOUND: 'Settings_page.provider_error_provider_not_found',
+  AUTH_REQUIRED: 'Settings_page.provider_error_auth_required',
+  LOCK_CONFLICT: 'Settings_page.provider_error_lock_conflict',
+  INTERNAL_ERROR: 'Settings_page.provider_error_internal_error',
+  STORAGE_FS: 'Settings_page.provider_error_storage_fs',
+  STORAGE_REVIEW_DB: 'Settings_page.provider_error_storage_db',
+  STORAGE_USAGE_DB: 'Settings_page.provider_error_storage_db',
+  LOOPBACK_DENIED: 'Settings_page.provider_error_loopback_denied',
+  RATE_LIMITED: 'Settings_page.provider_error_rate_limited',
+  REQUEST_TIMEOUT: 'Settings_page.provider_error_timeout',
+  NOT_FOUND: 'Settings_page.provider_error_not_found',
+  FEATURE_UNAVAILABLE: 'Settings_page.provider_error_feature_unavailable',
+};
+
+const PROVIDER_CLASSES = [
+  'openai',
+  'openai_responses',
+  'gemini',
+  'anthropic',
+  'azure',
+  'newapi',
+  'ollama',
+  'lmstudio',
+  'openai_compat',
+] as const;
+
+type ProviderClass = (typeof PROVIDER_CLASSES)[number];
+
+export interface DraftFields {
+  alias: string;
+  provider_class: string;
+  model_name: string;
+  base_url: string;
+  /** Plaintext secret typed by the user. Empty on edit = keep existing key. */
+  api_key: string;
+  max_output_tokens: string;
+  thinking_level: string;
+  model_limits_name: string;
+  scope: 'repo' | 'global';
+}
+
+export interface ProviderSaveReadiness {
+  saving: boolean;
+  aliasInvalid: boolean;
+  modelInvalid: boolean;
+  baseInvalid: boolean;
+  maxOutputInvalid: boolean;
+  modelLimitsLoading: boolean;
+  thinkingInvalid: boolean;
+}
+
+export interface ProviderCardProps {
+  provider: ProviderSummary;
+  isNew?: boolean;
+  onSave: (alias: string, data: ProviderUpdateInput | ProviderCreateInput) => Promise<ProviderMutationResponse | void>;
+  onDelete: (alias: string, scope?: 'repo' | 'global') => Promise<void>;
+  onProbe: (alias: string, scope?: 'repo' | 'global') => Promise<string | null>;
+  onRefresh?: () => void;
+  onCancelNew?: () => void;
+}
+
+const DEFAULT_DRAFT: DraftFields = {
+  alias: '',
+  provider_class: 'openai',
+  model_name: '',
+  base_url: '',
+  api_key: '',
+  max_output_tokens: '',
+  thinking_level: '',
+  model_limits_name: '',
+  scope: 'repo',
+};
+
+interface ProviderExample {
+  base_url: string;
+  model_name: string;
+  api_key: string;
+}
+
+const PROVIDER_EXAMPLES: Record<string, ProviderExample> = {
+  openai: {
+    base_url: 'https://api.openai.com/v1',
+    model_name: 'gpt-5.6-luna',
+    api_key: 'sk-...',
+  },
+  openai_responses: {
+    base_url: 'https://api.openai.com/v1',
+    model_name: 'gpt-5.6-luna',
+    api_key: 'sk-...',
+  },
+  gemini: {
+    base_url: 'https://generativelanguage.googleapis.com',
+    model_name: 'gemini-3.8-flash',
+    api_key: 'AIza...',
+  },
+  anthropic: {
+    base_url: 'https://api.anthropic.com',
+    model_name: 'claude-sonnet-5',
+    api_key: 'sk-ant-...',
+  },
+  azure: {
+    base_url: 'https://{resource}.openai.azure.com',
+    model_name: 'gpt-5.6-luna',
+    api_key: '<azure-openai-key>',
+  },
+  newapi: {
+    base_url: 'https://api.newapi.com/v1',
+    model_name: 'gpt-5.6-luna',
+    api_key: 'sk-...',
+  },
+  ollama: {
+    base_url: 'http://localhost:11434',
+    model_name: 'qwen3.6-27b',
+    api_key: '(optional)',
+  },
+  lmstudio: {
+    base_url: 'http://localhost:1234/v1',
+    model_name: 'qwen3.6-27b',
+    api_key: 'lm-studio',
+  },
+  openai_compat: {
+    base_url: 'https://api.deepseek.com',
+    model_name: 'deepseek-v4-flash',
+    api_key: 'sk-...',
+  },
+};
+
+const DEFAULT_EXAMPLE: ProviderExample = PROVIDER_EXAMPLES.openai;
+
+type ProbeTaskFetcher = (
+  taskId: string,
+  opts?: { signal?: AbortSignal },
+) => Promise<TaskInfoResponse>;
+type PollTimer = ReturnType<typeof setTimeout>;
+
+export interface ProviderProbePollCallbacks {
+  onSuccess: () => void;
+  onError: (message: string) => void;
+}
+
+export interface ProviderProbePoller {
+  start: (taskId: string, callbacks: ProviderProbePollCallbacks) => void;
+  cancel: () => void;
+}
+
+interface ProviderProbePollerOptions {
+  delayMs?: number;
+  setTimeoutFn?: (callback: () => void, delayMs: number) => PollTimer;
+  clearTimeoutFn?: (timer: PollTimer) => void;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === 'AbortError'
+    : error instanceof Error && error.name === 'AbortError';
+}
+
+function taskErrorMessage(info: TaskInfoResponse): string {
+  return info.error ?? info.status;
+}
+
+export function createProviderProbePoller(
+  fetchTask: ProbeTaskFetcher,
+  {
+    delayMs = 1000,
+    setTimeoutFn = (callback, timeout) => setTimeout(callback, timeout),
+    clearTimeoutFn = (timer) => clearTimeout(timer),
+  }: ProviderProbePollerOptions = {},
+): ProviderProbePoller {
+  let timer: PollTimer | null = null;
+  let controller: AbortController | null = null;
+  let generation = 0;
+
+  const clearTimer = () => {
+    if (timer != null) {
+      clearTimeoutFn(timer);
+      timer = null;
+    }
+  };
+
+  const cancel = () => {
+    generation += 1;
+    clearTimer();
+    controller?.abort();
+    controller = null;
+  };
+
+  const start = (taskId: string, callbacks: ProviderProbePollCallbacks) => {
+    generation += 1;
+    const runGeneration = generation;
+    clearTimer();
+    controller?.abort();
+    controller = null;
+
+    const isCurrent = () => generation === runGeneration;
+    const tick = async () => {
+      clearTimer();
+      const currentController = new AbortController();
+      controller = currentController;
+      try {
+        const info = await fetchTask(taskId, { signal: currentController.signal });
+        if (controller === currentController) controller = null;
+        if (!isCurrent()) return;
+
+        if (info.status === 'completed') {
+          callbacks.onSuccess();
+          return;
+        }
+        if (info.status === 'failed' || info.status === 'cancelled') {
+          callbacks.onError(taskErrorMessage(info));
+          return;
+        }
+        timer = setTimeoutFn(() => void tick(), delayMs);
+      } catch (error) {
+        if (controller === currentController) controller = null;
+        if (!isCurrent() || isAbortError(error)) return;
+        callbacks.onError(error instanceof Error ? error.message : 'probe_poll_failed');
+      }
+    };
+
+    void tick();
+  };
+
+  return { start, cancel };
+}
+
+export function providerLimitsWarningMessage(
+  t: TranslateFn,
+  warning: ModelLimitsWarning,
+): string {
+  const key = PROVIDER_WARNING_KEY_BY_CODE[warning.code]
+    ?? 'Settings_page.provider_limits_warning_unknown';
+  return t(key);
+}
+
+export function providerThinkingHintKey(providerClass: string): MessageKey | null {
+  return THINKING_HINT_KEY_BY_PROVIDER[providerClass] ?? null;
+}
+
+export function isThinkingLevelValidForDraft(
+  level: string,
+  modelLimits: Pick<ModelLimitsResponse, 'thinking'> | null,
+): boolean {
+  if (!level) return true;
+  return modelLimits?.thinking.supported === true
+    && modelLimits.thinking.accepted_levels.some((accepted) => accepted === level);
+}
+
+export function minimumThinkingOutputForDraft(
+  level: string,
+  modelLimits: Pick<ModelLimitsResponse, 'thinking'> | null,
+): number | null {
+  const parsed = thinkingLevelSchema.safeParse(level);
+  if (!parsed.success || !isThinkingLevelValidForDraft(level, modelLimits)) return null;
+  return modelLimits?.thinking.minimum_output_tokens?.[parsed.data] ?? null;
+}
+
+function providerThinkingWarningMessages(
+  t: TranslateFn,
+  thinking: ModelThinkingSupport,
+): string[] {
+  return [...new Set(thinking.warnings.map((warning) => t(
+    THINKING_WARNING_KEY_BY_CODE[warning] ?? 'Settings_page.provider_thinking_warning_unknown',
+  )))];
+}
+
+export function shouldShowRecommendedLimitAction(
+  limits: Pick<ModelLimitsResponse, 'max_output_known' | 'max_output_tokens'>,
+  draftValue: string,
+): boolean {
+  if (!limits.max_output_known || limits.max_output_tokens == null) return false;
+  const parsed = Number(draftValue);
+  return Number.isFinite(parsed) && parsed > 0 && parsed !== limits.max_output_tokens;
+}
+
+export function canSubmitProviderForm(readiness: ProviderSaveReadiness): boolean {
+  return !readiness.saving
+    && !readiness.aliasInvalid
+    && !readiness.modelInvalid
+    && !readiness.baseInvalid
+    && !readiness.maxOutputInvalid
+    && !readiness.modelLimitsLoading
+    && !readiness.thinkingInvalid;
+}
+
+function providerActionError(t: TranslateFn, key: MessageKey): string {
+  return t(key);
+}
+
+function toDraft(p: ProviderSummary): DraftFields {
+  return {
+    alias: p.alias,
+    provider_class: p.provider_class,
+    model_name: p.model_name,
+    base_url: p.base_url,
+    api_key: '',
+    max_output_tokens: p.max_output_tokens != null ? String(p.max_output_tokens) : '',
+    thinking_level: p.thinking_level ?? '',
+    model_limits_name: p.model_limits_name ?? '',
+    scope: p.scope ?? 'repo',
+  };
+}
+
+function draftThinkingLevel(draft: DraftFields): ThinkingLevel | null {
+  return draft.thinking_level ? thinkingLevelSchema.parse(draft.thinking_level) : null;
+}
+
+function draftMaxOutput(draft: DraftFields): number | null {
+  const value = draft.max_output_tokens.trim();
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(parsed)) {
+    throw new Error('Invalid max_output_tokens');
+  }
+  return parsed;
+}
+
+export function buildModelLimitsPreviewPayload(draft: DraftFields): {
+  provider_class: string;
+  model_name: string;
+  base_url: string | null;
+  model_limits_name: string | null;
+} {
+  return {
+    provider_class: draft.provider_class,
+    model_name: draft.model_name.trim(),
+    base_url: draft.base_url.trim() || null,
+    model_limits_name: draft.model_limits_name.trim() || null,
+  };
+}
+
+export function buildProviderUpdatePayload(
+  draft: DraftFields,
+  provider: ProviderSummary,
+): ProviderUpdateInput {
+  const maxOutput = draftMaxOutput(draft);
+  const thinkingLevel = draftThinkingLevel(draft);
+  const modelLimitsName = draft.model_limits_name.trim() || null;
+  const apiKey = draft.api_key.trim();
+
+  const payload: ProviderUpdateInput = {
+    // Empty = keep the existing key (masked round-trip).
+    api_key: apiKey || undefined,
+    max_output_tokens: maxOutput,
+    thinking_level: thinkingLevel,
+    model_limits_name: modelLimitsName,
+    scope: draft.scope,
+  };
+
+  if (draft.provider_class !== provider.provider_class) {
+    payload.provider_class = draft.provider_class;
+  }
+  if (draft.model_name.trim() !== provider.model_name) {
+    payload.model_name = draft.model_name.trim();
+  }
+  if (draft.base_url.trim() !== provider.base_url) {
+    payload.base_url = draft.base_url.trim();
+  }
+
+  return payload;
+}
+
+export default function ProviderCard({
+  provider,
+  isNew = false,
+  onSave,
+  onDelete,
+  onProbe,
+  onRefresh,
+  onCancelNew,
+}: ProviderCardProps) {
+  const { t, locale } = useTranslation();
+  const [expanded, setExpanded] = useState<boolean>(isNew);
+  const [editing, setEditing] = useState<boolean>(isNew);
+  const [draft, setDraft] = useState<DraftFields>(() => (isNew ? DEFAULT_DRAFT : toDraft(provider)));
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [probeTaskId, setProbeTaskId] = useState<string | null>(null);
+  const [probeStatus, setProbeStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [remoteModels, setRemoteModels] = useState<string[] | null>(null);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchModelsError, setFetchModelsError] = useState<string | null>(null);
+  const [selectedModels, setSelectedModels] = useState<Set<string>>(
+    new Set(provider.available_models ?? []),
+  );
+  const [savingModels, setSavingModels] = useState(false);
+  const [mutationWarnings, setMutationWarnings] = useState<ModelLimitsWarning[]>([]);
+  const [verification, setVerification] = useState<ProviderVerification | null>(null);
+  const mountedRef = useRef(false);
+  const probeRequestRef = useRef(0);
+  const probePollerRef = useRef<ProviderProbePoller | null>(null);
+
+  const getProbePoller = useCallback(() => {
+    probePollerRef.current ??= createProviderProbePoller(getTask);
+    return probePollerRef.current;
+  }, []);
+
+  const cancelProbePolling = useCallback(() => {
+    probeRequestRef.current += 1;
+    probePollerRef.current?.cancel();
+  }, []);
+
+  const isCurrentProbe = (requestId: number) =>
+    mountedRef.current && probeRequestRef.current === requestId;
+
+  // Sync external provider updates back to draft when not editing
+  useEffect(() => {
+    if (!editing && !isNew) {
+      setDraft(toDraft(provider));
+    }
+  }, [provider, editing, isNew]);
+
+  // Cleanup probe poll timer and in-flight fetches
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelProbePolling();
+    };
+  }, [cancelProbePolling]);
+
+  useEffect(() => {
+    return () => {
+      cancelProbePolling();
+    };
+  }, [provider.alias, cancelProbePolling]);
+
+  const headerClick = () => {
+    if (editing) return;
+    setExpanded((v) => !v);
+  };
+
+  const headerKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (editing) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      setExpanded((v) => !v);
+    }
+  };
+
+  const enterEdit = () => {
+    setDraft(toDraft(provider));
+    setEditing(true);
+    setExpanded(true);
+    setSaveError(null);
+    setMutationWarnings([]);
+    setVerification(null);
+  };
+
+  const cancelEdit = () => {
+    if (isNew) {
+      onCancelNew?.();
+      return;
+    }
+    setDraft(toDraft(provider));
+    setEditing(false);
+    setSaveError(null);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaveError(null);
+    setVerification(null);
+    try {
+      const maxOutput = draftMaxOutput(draft);
+      const thinkingLevel = draftThinkingLevel(draft);
+      const modelLimitsName = draft.model_limits_name.trim() || null;
+      const apiKey = draft.api_key.trim();
+      let result: ProviderMutationResponse | void;
+      if (isNew) {
+        const payload: ProviderCreateInput = {
+          alias: draft.alias.trim(),
+          provider_class: draft.provider_class,
+          model_name: draft.model_name.trim(),
+          base_url: draft.base_url.trim(),
+          api_key: apiKey || null,
+          max_output_tokens: maxOutput,
+          thinking_level: thinkingLevel,
+          model_limits_name: modelLimitsName,
+          scope: draft.scope,
+        };
+        result = await onSave(draft.alias.trim(), payload);
+      } else {
+        const payload = buildProviderUpdatePayload(draft, provider);
+        result = await onSave(provider.alias, payload);
+      }
+      setMutationWarnings(result?.warnings ?? []);
+      setVerification(result?.verification ?? null);
+      setEditing(false);
+    } catch (err) {
+      // Surface the backend's specific reason (e.g. base_url/alias error) instead of
+      // collapsing every failure into the generic message.
+      let errorMessage = '';
+      if (err instanceof ApiError) {
+        const errorCode = err.errorCode;
+        const mappedKey = errorCode ? PROVIDER_ERROR_KEY_BY_CODE[errorCode] : undefined;
+        if (mappedKey) {
+          errorMessage = t(mappedKey);
+        } else if (err.message) {
+          errorMessage = err.message;
+        } else {
+          errorMessage = t('Settings_page.provider_save_failed');
+        }
+      } else {
+        const detail = err instanceof Error ? err.message : String(err);
+        errorMessage = t('Settings_page.provider_save_unexpected', { detail });
+      }
+      setSaveError(errorMessage);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteConfirmed = async () => {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await onDelete(provider.alias, provider.scope);
+    } catch {
+      setDeleteError(providerActionError(t, 'Settings_page.provider_delete_failed'));
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  };
+
+  const handleProbe = async () => {
+    cancelProbePolling();
+    const requestId = probeRequestRef.current;
+    setProbeStatus('running');
+    setProbeError(null);
+    try {
+      const taskId = await onProbe(provider.alias, provider.scope);
+      if (!isCurrentProbe(requestId)) return;
+      if (taskId) {
+        setProbeTaskId(taskId);
+        getProbePoller().start(taskId, {
+          onSuccess: () => {
+            if (!isCurrentProbe(requestId)) return;
+            setProbeStatus('success');
+            setProbeTaskId(null);
+            onRefresh?.();
+          },
+          onError: () => {
+            if (!isCurrentProbe(requestId)) return;
+            setProbeStatus('error');
+            setProbeError(providerActionError(t, 'Settings_page.provider_probe_error'));
+            setProbeTaskId(null);
+          },
+        });
+      } else {
+        setProbeStatus('error');
+        setProbeError(providerActionError(t, 'Settings_page.provider_probe_error'));
+      }
+    } catch {
+      if (!isCurrentProbe(requestId)) return;
+      setProbeStatus('error');
+      setProbeError(providerActionError(t, 'Settings_page.provider_probe_error'));
+    }
+  };
+
+  const handleFetchModels = async () => {
+    if (isNew) return;
+    setFetchingModels(true);
+    setFetchModelsError(null);
+    try {
+      const result = await fetchProviderModels(provider.alias);
+      setRemoteModels(result.models);
+      const existing = new Set(provider.available_models ?? []);
+      setSelectedModels(existing.size > 0 ? existing : new Set(result.models));
+    } catch {
+      setFetchModelsError(providerActionError(t, 'Settings_page.provider_models_fetch_failed'));
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  const handleSaveModels = async () => {
+    if (isNew) return;
+    setSavingModels(true);
+    try {
+      await saveProviderModels(provider.alias, [...selectedModels], { scope: provider.scope });
+      setRemoteModels(null);
+    } catch {
+      // keep panel open on error
+    } finally {
+      setSavingModels(false);
+    }
+  };
+
+  const toggleModel = (modelId: string) => {
+    setSelectedModels(prev => {
+      const next = new Set(prev);
+      if (next.has(modelId)) next.delete(modelId);
+      else next.add(modelId);
+      return next;
+    });
+  };
+
+  // Determine status dot variant
+  const statusVariant: 'probed' | 'not-probed' | 'missing' = (() => {
+    if (provider.key_status === 'missing') return 'missing';
+    if (provider.probed) return 'probed';
+    return 'not-probed';
+  })();
+
+  const statusLabel = (() => {
+    if (statusVariant === 'missing') return t('Settings_page.provider_status_key_missing');
+    if (statusVariant === 'probed') return t('Settings_page.provider_status_probed');
+    return t('Settings_page.provider_status_not_probed');
+  })();
+
+  const keyStatusLabelKey: MessageKey = provider.key_status === 'configured'
+    ? 'Settings_page.key_configured'
+    : provider.key_status === 'unknown'
+      ? 'Settings_page.key_unknown'
+      : 'Settings_page.key_missing';
+
+  const cardClass = [
+    'provider-card',
+    'card-accent',
+    expanded ? 'provider-card--expanded' : '',
+    editing ? 'provider-card--editing' : '',
+    isNew ? 'provider-card--new' : '',
+  ].filter(Boolean).join(' ');
+
+  const headerId = `provider-card-header-${isNew ? 'new' : provider.alias}`;
+  const bodyId = `provider-card-body-${isNew ? 'new' : provider.alias}`;
+
+  return (
+    <div className={cardClass} data-testid={`provider-card-${isNew ? 'new' : provider.alias}`}>
+      {/* Header (clickable to toggle expand, except in edit mode) */}
+      <div
+        className="provider-card__header"
+        id={headerId}
+        role={editing ? undefined : 'button'}
+        tabIndex={editing ? undefined : 0}
+        aria-expanded={expanded}
+        aria-controls={bodyId}
+        onClick={headerClick}
+        onKeyDown={headerKey}
+      >
+        <span
+          className={`provider-card__status-dot provider-card__status-dot--${statusVariant}`}
+          aria-hidden="true"
+          title={statusLabel}
+        />
+        <span className="sr-only">{statusLabel}</span>
+        <div className="provider-card__header-main">
+          <div className="provider-card__alias">
+            {isNew ? t('Settings_page.provider_new_title') : provider.alias}
+          </div>
+          <div className="provider-card__header-meta">
+            <span className="provider-card__badge">
+              {editing ? draft.provider_class : provider.provider_class}
+            </span>
+            {(editing ? draft.model_name : provider.model_name) && (
+              <span className="provider-card__model">{editing ? draft.model_name : provider.model_name}</span>
+            )}
+          </div>
+        </div>
+        {!isNew && (
+          <span
+            className={`provider-card__key-badge provider-card__key-badge--${provider.key_status}`}
+          >
+            {t(keyStatusLabelKey)}
+          </span>
+        )}
+        {!editing && (
+          <span className="provider-card__caret" aria-hidden="true">
+            {expanded ? '▾' : '▸'}
+          </span>
+        )}
+      </div>
+
+      {/* Body (read-only details OR edit form) */}
+      {expanded && (
+        <div className="provider-card__body" id={bodyId} role="region" aria-labelledby={headerId}>
+          {mutationWarnings.length > 0 && <ProviderWarnings warnings={mutationWarnings} t={t} />}
+          {verification && <ProviderVerificationNotice verification={verification} t={t} />}
+          {editing ? (
+            <ProviderEditForm
+              draft={draft}
+              setDraft={setDraft}
+              isNew={isNew}
+              saving={saving}
+              saveError={saveError}
+              onSave={handleSave}
+              onCancel={cancelEdit}
+              t={t}
+              locale={locale}
+            />
+          ) : (
+            <ProviderDetailView
+              provider={provider}
+              probeStatus={probeStatus}
+              probeError={probeError}
+              probeRunning={probeTaskId != null || probeStatus === 'running'}
+              confirmDelete={confirmDelete}
+              deleting={deleting}
+              deleteError={deleteError}
+              onEdit={enterEdit}
+              onProbe={handleProbe}
+              onAskDelete={() => {
+                setConfirmDelete(true);
+                setDeleteError(null);
+              }}
+              onCancelDelete={() => setConfirmDelete(false)}
+              onConfirmDelete={handleDeleteConfirmed}
+              remoteModels={remoteModels}
+              fetchingModels={fetchingModels}
+              fetchModelsError={fetchModelsError}
+              selectedModels={selectedModels}
+              savingModels={savingModels}
+              onFetchModels={handleFetchModels}
+              onSaveModels={handleSaveModels}
+              onToggleModel={toggleModel}
+              onCancelModels={() => setRemoteModels(null)}
+              t={t}
+              locale={locale}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- subcomponents ---------------- */
+
+interface DetailProps {
+  provider: ProviderSummary;
+  probeStatus: 'idle' | 'running' | 'success' | 'error';
+  probeError: string | null;
+  probeRunning: boolean;
+  confirmDelete: boolean;
+  deleting: boolean;
+  deleteError: string | null;
+  onEdit: () => void;
+  onProbe: () => void;
+  onAskDelete: () => void;
+  onCancelDelete: () => void;
+  onConfirmDelete: () => void;
+  remoteModels: string[] | null;
+  fetchingModels: boolean;
+  fetchModelsError: string | null;
+  selectedModels: Set<string>;
+  savingModels: boolean;
+  onFetchModels: () => void;
+  onSaveModels: () => void;
+  onToggleModel: (id: string) => void;
+  onCancelModels: () => void;
+  t: ReturnType<typeof useTranslation>['t'];
+  locale: string;
+}
+
+export function ProviderDetailView({
+  provider,
+  probeStatus,
+  probeError,
+  probeRunning,
+  confirmDelete,
+  deleting,
+  deleteError,
+  onEdit,
+  onProbe,
+  onAskDelete,
+  onCancelDelete,
+  onConfirmDelete,
+  remoteModels,
+  fetchingModels,
+  fetchModelsError,
+  selectedModels,
+  savingModels,
+  onFetchModels,
+  onSaveModels,
+  onToggleModel,
+  onCancelModels,
+  t,
+  locale,
+}: DetailProps) {
+  return (
+    <>
+      <dl className="provider-card__fields">
+        <Field
+          label={t('Settings_page.provider_base_url_label')}
+          value={provider.base_url}
+          mono
+        />
+        <Field
+          label={t('Settings_page.provider_model_name_label')}
+          value={provider.model_name}
+          mono
+        />
+        <Field
+          label={t('Settings_page.provider_api_key_env_label')}
+          value={provider.api_key_env ?? '—'}
+          mono
+        />
+        {provider.max_output_tokens != null && (
+          <Field label={t('Settings_page.provider_max_output_label')} value={formatTokenCount(provider.max_output_tokens, locale)} mono />
+        )}
+        <Field
+          label={t('Settings_page.provider_thinking_label')}
+          value={provider.thinking_level == null
+            ? t('Settings_page.provider_thinking_level_default')
+            : t(`Settings_page.provider_thinking_level_${provider.thinking_level}`)}
+        />
+      </dl>
+
+      {provider.scope === 'global' && (
+        <div className="provider-card__scope-info">
+          <span>{t('Settings_page.provider_scope_global_badge')}</span>
+          {t('Settings_page.provider_scope_global_hint_override')}
+        </div>
+      )}
+
+      {provider.probed && (
+        <div className="provider-card__probe-results">
+          {(provider.probed_max_input_tokens != null
+            || provider.probed_max_output_tokens != null) ? (
+            <>
+              {provider.probed_max_input_tokens != null && (
+                <Field
+                  label={t('Settings_page.provider_input_tokens')}
+                  value={formatTokenCount(provider.probed_max_input_tokens, locale)}
+                  mono
+                />
+              )}
+              {provider.probed_max_output_tokens != null && (
+                <Field
+                  label={t('Settings_page.provider_output_tokens')}
+                  value={formatTokenCount(provider.probed_max_output_tokens, locale)}
+                  mono
+                />
+              )}
+            </>
+          ) : (
+            provider.probed_max_context != null && (
+              <Field
+                label={t('Settings_page.provider_context_label')}
+                value={formatTokenCount(provider.probed_max_context, locale)}
+                mono
+              />
+            )
+          )}
+          {provider.probed_limits_source && (
+            <Field
+              label={t('Settings_page.provider_limits_source')}
+              value={providerLimitsSourceLabel(t, provider.probed_limits_source)}
+              mono
+            />
+          )}
+          {provider.model_limits_name && (
+            <Field
+              label={t('Settings_page.provider_model_limits_name')}
+              value={provider.model_limits_name}
+              mono
+            />
+          )}
+          {provider.probe_timestamp && (
+            <Field
+              label={t('Settings_page.provider_probe_time_label')}
+              value={provider.probe_timestamp}
+              mono
+            />
+          )}
+        </div>
+      )}
+
+      {/* Models section */}
+      <div className="provider-card__models-section">
+        <div className="provider-card__models-header">
+          <span className="provider-card__models-label">
+            {t('Settings_page.provider_models_label')}
+            {(provider.available_models?.length ?? 0) > 0 && (
+              <span className="provider-card__models-count">{provider.available_models!.length}</span>
+            )}
+          </span>
+          <button
+            type="button"
+            className="provider-card__btn provider-card__btn--secondary provider-card__btn--sm"
+            onClick={onFetchModels}
+            disabled={fetchingModels}
+          >
+            {fetchingModels ? t('Settings_page.provider_models_fetching') : t('Settings_page.provider_models_fetch')}
+          </button>
+        </div>
+        {fetchModelsError && (
+          <p className="provider-card__error">{fetchModelsError}</p>
+        )}
+        {remoteModels && (
+          <div className="provider-card__models-list">
+            {remoteModels.length === 0 ? (
+              <p className="provider-card__models-empty">{t('Settings_page.provider_models_empty')}</p>
+            ) : (
+              <>
+                <div className="provider-card__models-grid">
+                  {remoteModels.map(m => (
+                    <label key={m} className="provider-card__model-item">
+                      <input
+                        type="checkbox"
+                        checked={selectedModels.has(m)}
+                        onChange={() => onToggleModel(m)}
+                      />
+                      <span className="provider-card__model-name">{m}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="provider-card__models-actions">
+                  <button
+                    type="button"
+                    className="provider-card__btn provider-card__btn--primary provider-card__btn--sm"
+                    onClick={onSaveModels}
+                    disabled={savingModels || selectedModels.size === 0}
+                  >
+                    {savingModels ? '...' : t('Settings_page.provider_models_save')}
+                  </button>
+                  <button
+                    type="button"
+                    className="provider-card__btn provider-card__btn--sm"
+                    onClick={onCancelModels}
+                  >
+                    {t('Settings_page.provider_models_cancel')}
+                  </button>
+                  <span className="provider-card__models-selected">
+                    {selectedModels.size} / {remoteModels.length}
+                  </span>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="provider-card__actions" role="group" aria-label={provider.alias}>
+        <button type="button" className="provider-card__btn" onClick={onEdit}>
+          {t('Settings_page.provider_edit')}
+        </button>
+        <button
+          type="button"
+          className="provider-card__btn provider-card__btn--secondary"
+          onClick={onProbe}
+          disabled={probeRunning}
+        >
+          {probeRunning ? (
+            <>
+              <span className="provider-card__probe-spinner" aria-hidden="true" />
+              {t('Settings_page.provider_probe_running')}
+            </>
+          ) : (
+            t('Settings_page.provider_probe')
+          )}
+        </button>
+        {!confirmDelete ? (
+          <button
+            type="button"
+            className="provider-card__btn provider-card__btn--danger"
+            onClick={onAskDelete}
+          >
+            {t('Settings_page.provider_delete')}
+          </button>
+        ) : (
+          <span className="provider-card__confirm-delete" role="alert">
+            <span className="provider-card__confirm-delete-text">
+              {t('Settings_page.provider_delete_confirm')}
+            </span>
+            <button
+              type="button"
+              className="provider-card__btn provider-card__btn--danger-solid"
+              onClick={onConfirmDelete}
+              disabled={deleting}
+            >
+              {t('Settings_page.provider_delete_yes')}
+            </button>
+            <button
+              type="button"
+              className="provider-card__btn"
+              onClick={onCancelDelete}
+              disabled={deleting}
+            >
+              {t('Settings_page.provider_delete_no')}
+            </button>
+          </span>
+        )}
+      </div>
+
+      {probeStatus === 'success' && (
+        <div className="provider-card__probe-msg provider-card__probe-msg--success" role="status">
+          {t('Settings_page.provider_probe_success')}
+        </div>
+      )}
+      {probeStatus === 'error' && (
+        <div className="provider-card__probe-msg provider-card__probe-msg--error" role="alert">
+          {t('Settings_page.provider_probe_error')}
+          {probeError && <code className="provider-card__probe-msg-code">{probeError}</code>}
+        </div>
+      )}
+      {deleteError && (
+        <div className="provider-card__probe-msg provider-card__probe-msg--error" role="alert">
+          {deleteError}
+        </div>
+      )}
+    </>
+  );
+}
+
+function ProviderWarnings({
+  warnings,
+  t,
+}: {
+  warnings: ModelLimitsWarning[];
+  t: TranslateFn;
+}) {
+  if (warnings.length === 0) return null;
+  return (
+    <div className="provider-card__warning-list" role="status">
+      {warnings.map((warning, index) => (
+        <div className="provider-card__warning" key={`${warning.code}-${index}`}>
+          {providerLimitsWarningMessage(t, warning)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ProviderVerificationNotice({
+  verification,
+  t,
+}: {
+  verification: ProviderVerification;
+  t: TranslateFn;
+}) {
+  if (verification.ok) {
+    return (
+      <div className="provider-card__verify provider-card__verify--ok" role="status">
+        {t('Settings_page.provider_verify_ok')}
+      </div>
+    );
+  }
+  return (
+    <div className="provider-card__verify provider-card__verify--failed" role="alert">
+      {t('Settings_page.provider_verify_failed')}
+      {verification.error && (
+        <code className="provider-card__verify-code">{verification.error}</code>
+      )}
+    </div>
+  );
+}
+
+interface FormProps {
+  draft: DraftFields;
+  setDraft: React.Dispatch<React.SetStateAction<DraftFields>>;
+  isNew: boolean;
+  saving: boolean;
+  saveError: string | null;
+  onSave: () => void;
+  onCancel: () => void;
+  t: ReturnType<typeof useTranslation>['t'];
+  locale: string;
+}
+
+export function ProviderEditForm({
+  draft,
+  setDraft,
+  isNew,
+  saving,
+  saveError,
+  onSave,
+  onCancel,
+  t,
+  locale,
+}: FormProps) {
+  const [discoveredModels, setDiscoveredModels] = useState<string[] | null>(null);
+  const [discoveringModels, setDiscoveringModels] = useState(false);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [manualModelEntry, setManualModelEntry] = useState(false);
+  const discoverAbortRef = useRef<AbortController | null>(null);
+  const discoverRequestRef = useRef(0);
+  const [limitsPreview, setLimitsPreview] = useState<{
+    key: string;
+    status: 'loading' | 'ready' | 'error';
+    result: ModelLimitsResponse | null;
+  } | null>(null);
+  const [previewRetry, setPreviewRetry] = useState(0);
+  const limitsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const limitsAbortRef = useRef<AbortController | null>(null);
+  const limitsRequestRef = useRef(0);
+  const previewKey = JSON.stringify(buildModelLimitsPreviewPayload(draft));
+  // A changed draft must never reuse the previous model's capability, even in
+  // the render before the preview effect starts its next request.
+  const currentPreview = limitsPreview?.key === previewKey ? limitsPreview : null;
+  const modelLimits = currentPreview?.status === 'ready' ? currentPreview.result : null;
+  const modelLimitsLoading = Boolean(draft.model_name.trim())
+    && (currentPreview == null || currentPreview.status === 'loading');
+  const modelLimitsError = currentPreview?.status === 'error';
+
+  useEffect(() => {
+    if (limitsTimerRef.current) clearTimeout(limitsTimerRef.current);
+    limitsAbortRef.current?.abort();
+    const requestId = limitsRequestRef.current + 1;
+    limitsRequestRef.current = requestId;
+    if (!draft.model_name.trim()) {
+      setLimitsPreview(null);
+      return;
+    }
+    const key = JSON.stringify(buildModelLimitsPreviewPayload(draft));
+    setLimitsPreview({ key, status: 'loading', result: null });
+
+    limitsTimerRef.current = setTimeout(() => {
+      const controller = new AbortController();
+      limitsAbortRef.current = controller;
+
+      const fetchPromise = previewModelLimits(
+        buildModelLimitsPreviewPayload(draft),
+        { signal: controller.signal },
+      );
+
+      fetchPromise
+        .then((res) => {
+          if (!controller.signal.aborted && limitsRequestRef.current === requestId) {
+            setLimitsPreview({ key, status: 'ready', result: res });
+          }
+        })
+        .catch(() => {
+          if (!controller.signal.aborted && limitsRequestRef.current === requestId) {
+            setLimitsPreview({ key, status: 'error', result: null });
+          }
+        });
+    }, 300);
+
+    return () => {
+      if (limitsTimerRef.current) clearTimeout(limitsTimerRef.current);
+      limitsAbortRef.current?.abort();
+    };
+  }, [draft.provider_class, draft.model_name, draft.base_url, draft.model_limits_name, previewRetry]);
+  useEffect(() => {
+    return () => {
+      discoverRequestRef.current += 1;
+      discoverAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    discoverRequestRef.current += 1;
+    discoverAbortRef.current?.abort();
+    setDiscoveredModels(null);
+    setManualModelEntry(false);
+    setDiscoverError(null);
+    setDiscoveringModels(false);
+  }, [draft.api_key, draft.base_url, draft.provider_class]);
+
+  const handleDiscoverModels = async () => {
+    const requestDraft = {
+      base_url: draft.base_url.trim(),
+      api_key: draft.api_key.trim(),
+      provider_class: draft.provider_class,
+    };
+    if (!requestDraft.base_url || !requestDraft.api_key) return;
+
+    discoverAbortRef.current?.abort();
+    const controller = new AbortController();
+    discoverAbortRef.current = controller;
+    const requestId = discoverRequestRef.current + 1;
+    discoverRequestRef.current = requestId;
+    setDiscoveringModels(true);
+    setDiscoverError(null);
+    try {
+      const result = await discoverModels(requestDraft, { signal: controller.signal });
+      if (controller.signal.aborted || discoverRequestRef.current !== requestId) return;
+      setDiscoveredModels(result.models);
+      setManualModelEntry(false);
+      const firstModel = result.models[0];
+      if (firstModel && !draft.model_name.trim()) {
+        setDraft((prev) => {
+          const stillSameProvider =
+            prev.base_url.trim() === requestDraft.base_url
+            && prev.api_key.trim() === requestDraft.api_key
+            && prev.provider_class === requestDraft.provider_class;
+          if (!stillSameProvider || prev.model_name.trim()) return prev;
+          return { ...prev, model_name: firstModel };
+        });
+      }
+    } catch {
+      if (controller.signal.aborted || discoverRequestRef.current !== requestId) return;
+      setDiscoverError(providerActionError(t, 'Settings_page.provider_models_fetch_failed'));
+    } finally {
+      if (!controller.signal.aborted && discoverRequestRef.current === requestId) {
+        setDiscoveringModels(false);
+      }
+    }
+  };
+
+  const setField = <K extends keyof DraftFields>(key: K, value: DraftFields[K]) => {
+    setDraft((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const example = PROVIDER_EXAMPLES[draft.provider_class] ?? DEFAULT_EXAMPLE;
+  const aliasInvalid = isNew && draft.alias.trim() === '';
+  const modelInvalid = draft.model_name.trim() === '';
+  const baseInvalid = draft.base_url.trim() === '';
+  const maxOutputTrimmed = draft.max_output_tokens.trim();
+  const maxOutputInvalid = maxOutputTrimmed !== ''
+    && (!/^[1-9]\d*$/.test(maxOutputTrimmed) || !Number.isSafeInteger(Number(maxOutputTrimmed)));
+  const thinkingInvalid = !isThinkingLevelValidForDraft(draft.thinking_level, modelLimits);
+  const minimumThinkingOutput = minimumThinkingOutputForDraft(draft.thinking_level, modelLimits);
+  const thinkingBudgetInvalid = !maxOutputInvalid && maxOutputTrimmed !== ''
+    && minimumThinkingOutput != null && Number(maxOutputTrimmed) < minimumThinkingOutput;
+  const acceptedThinkingLevels = modelLimits?.thinking.supported
+    ? modelLimits.thinking.accepted_levels
+    : [];
+  const canSave = canSubmitProviderForm({
+    saving,
+    aliasInvalid,
+    modelInvalid,
+    baseInvalid,
+    maxOutputInvalid: maxOutputInvalid || thinkingBudgetInvalid,
+    modelLimitsLoading,
+    thinkingInvalid,
+  });
+  const thinkingHintKey = modelLimits?.thinking.supported
+    ? providerThinkingHintKey(modelLimits.provider_class)
+    : null;
+
+  return (
+    <form
+      className="provider-card__form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (canSave) onSave();
+      }}
+    >
+      {isNew && (
+        <div className="provider-card__form-row">
+          <label className="provider-card__form-label" htmlFor="provider-alias-input">
+            {t('Settings_page.provider_alias_label')}
+          </label>
+          <input
+            id="provider-alias-input"
+            type="text"
+            className="provider-card__input"
+            value={draft.alias}
+            onChange={(e) => setField('alias', e.target.value)}
+            placeholder={t('Settings_page.provider_alias_ph')}
+            required
+            aria-invalid={aliasInvalid}
+            autoFocus
+          />
+        </div>
+      )}
+
+      <div className="provider-card__form-row">
+        <label
+          className="provider-card__form-label"
+          htmlFor={`provider-class-${isNew ? 'new' : draft.alias}`}
+        >
+          {t('Settings_page.provider_class_label')}
+        </label>
+        <select
+          id={`provider-class-${isNew ? 'new' : draft.alias}`}
+          className="provider-card__select"
+          value={draft.provider_class}
+          onChange={(e) => setField('provider_class', e.target.value as ProviderClass)}
+        >
+          {PROVIDER_CLASSES.map((cls) => (
+            <option key={cls} value={cls}>
+              {cls === 'openai_compat' ? t('Settings_page.provider_class_openai_compat' as MessageKey) : cls}
+            </option>
+          ))}
+        </select>
+        {draft.provider_class === 'openai_compat' && (
+          <p className="provider-card__hint">
+            {t('Settings_page.provider_hint_deepseek' as MessageKey)}
+          </p>
+        )}
+      </div>
+
+      <div className="provider-card__form-row">
+        <span className="provider-card__form-label" id={`provider-scope-label-${isNew ? 'new' : draft.alias}`}>
+          {t('Settings_page.provider_scope_label')}
+        </span>
+        <div
+          className="provider-card__scope-segmented"
+          role="radiogroup"
+          aria-labelledby={`provider-scope-label-${isNew ? 'new' : draft.alias}`}
+          aria-describedby={`provider-scope-hint-${isNew ? 'new' : draft.alias}`}
+        >
+          <label className={`provider-card__scope-option${draft.scope === 'repo' ? ' is-active' : ''}`}>
+            <input
+              type="radio"
+              name={`provider-scope-${isNew ? 'new' : draft.alias}`}
+              value="repo"
+              checked={draft.scope === 'repo'}
+              onChange={() => setField('scope', 'repo')}
+              className="provider-card__scope-radio"
+            />
+            <span>{t('Settings_page.provider_scope_repo')}</span>
+          </label>
+          <label className={`provider-card__scope-option${draft.scope === 'global' ? ' is-active' : ''}`}>
+            <input
+              type="radio"
+              name={`provider-scope-${isNew ? 'new' : draft.alias}`}
+              value="global"
+              checked={draft.scope === 'global'}
+              onChange={() => setField('scope', 'global')}
+              className="provider-card__scope-radio"
+            />
+            <span>{t('Settings_page.provider_scope_global')}</span>
+          </label>
+        </div>
+        <p
+          id={`provider-scope-hint-${isNew ? 'new' : draft.alias}`}
+          className="provider-card__hint"
+        >
+          {t('Settings_page.provider_scope_hint')}
+        </p>
+      </div>
+
+      <div className="provider-card__form-row">
+        <label
+          className="provider-card__form-label"
+          htmlFor={`provider-model-${isNew ? 'new' : draft.alias}`}
+        >
+          {t('Settings_page.provider_model_name_label')}
+        </label>
+        <div className="provider-card__model-discover">
+          {discoveredModels && discoveredModels.length > 0 && !manualModelEntry ? (
+            <select
+              id={`provider-model-${isNew ? 'new' : draft.alias}`}
+              className="provider-card__select"
+              value={draft.model_name}
+              onChange={(e) => setField('model_name', e.target.value)}
+              required
+              aria-invalid={modelInvalid}
+            >
+              {!discoveredModels.includes(draft.model_name) && draft.model_name && (
+                <option value={draft.model_name}>{draft.model_name}</option>
+              )}
+              {discoveredModels.map(m => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id={`provider-model-${isNew ? 'new' : draft.alias}`}
+              type="text"
+              className="provider-card__input"
+              value={draft.model_name}
+              onChange={(e) => setField('model_name', e.target.value)}
+              placeholder={example.model_name}
+              required
+              aria-invalid={modelInvalid}
+              spellCheck={false}
+            />
+          )}
+          <button
+            type="button"
+            className="provider-card__btn provider-card__btn--secondary provider-card__btn--sm"
+            onClick={handleDiscoverModels}
+            disabled={discoveringModels || !draft.base_url.trim() || !draft.api_key.trim()}
+            title={t('Settings_page.provider_models_fetch')}
+            aria-label={t('Settings_page.provider_models_fetch')}
+          >
+            <RefreshCw size={16} aria-hidden="true" />
+          </button>
+        </div>
+        {discoveredModels && discoveredModels.length > 0 && (
+          <button
+            type="button"
+            className="provider-card__model-entry-toggle"
+            onClick={() => setManualModelEntry((previous) => !previous)}
+          >
+            {t(manualModelEntry
+              ? 'Settings_page.provider_model_choose_list'
+              : 'Settings_page.provider_model_enter_id')}
+          </button>
+        )}
+        {discoveredModels?.length === 0 && (
+          <p className="provider-card__hint" role="status">{t('Settings_page.provider_models_empty_manual')}</p>
+        )}
+        {discoverError && <p className="provider-card__error provider-card__error--sm">{discoverError}</p>}
+      </div>
+
+      <div className="provider-card__form-row">
+        <label
+          className="provider-card__form-label"
+          htmlFor={`provider-baseurl-${isNew ? 'new' : draft.alias}`}
+        >
+          {t('Settings_page.provider_base_url_label')}
+        </label>
+        <input
+          id={`provider-baseurl-${isNew ? 'new' : draft.alias}`}
+          type="text"
+          className="provider-card__input"
+          value={draft.base_url}
+          onChange={(e) => setField('base_url', e.target.value)}
+          placeholder={example.base_url}
+          required
+          aria-invalid={baseInvalid}
+        />
+      </div>
+
+      <div className="provider-card__form-row">
+        <label
+          className="provider-card__form-label"
+          htmlFor={`provider-apikey-${isNew ? 'new' : draft.alias}`}
+        >
+          {t('Settings_page.provider_api_key_env_label')}
+        </label>
+        <input
+          id={`provider-apikey-${isNew ? 'new' : draft.alias}`}
+          type="password"
+          autoComplete="off"
+          className="provider-card__input"
+          value={draft.api_key}
+          onChange={(e) => setField('api_key', e.target.value)}
+          placeholder={
+            !isNew
+              ? t('Settings_page.provider_api_key_keep_ph')
+              : draft.provider_class === 'ollama'
+                ? t('Settings_page.provider_api_key_optional_ph')
+                : example.api_key
+          }
+          aria-describedby={`provider-apikey-hint-${isNew ? 'new' : draft.alias}`}
+        />
+        <p
+          id={`provider-apikey-hint-${isNew ? 'new' : draft.alias}`}
+          className="provider-card__hint"
+        >
+          {t('Settings_page.provider_api_key_hint', {
+            location: draft.scope === 'global'
+              ? t('Settings_page.provider_api_key_location_global')
+              : t('Settings_page.provider_api_key_location_repo')
+          })}
+        </p>
+      </div>
+
+      <details className="provider-card__advanced">
+        <summary>{t('Settings_page.provider_advanced')}</summary>
+        <div className="provider-card__form-row">
+          <label
+            className="provider-card__form-label"
+            htmlFor={`provider-maxout-${isNew ? 'new' : draft.alias}`}
+          >
+            {t('Settings_page.provider_max_output_label')}
+          </label>
+          <input
+            id={`provider-maxout-${isNew ? 'new' : draft.alias}`}
+            type="text"
+            className="provider-card__input"
+            value={draft.max_output_tokens}
+            onChange={(e) => setField('max_output_tokens', e.target.value)}
+            placeholder={t('Settings_page.provider_max_output_ph')}
+            aria-invalid={maxOutputInvalid || thinkingBudgetInvalid}
+            aria-describedby={`provider-maxout-hint-${isNew ? 'new' : draft.alias}${thinkingBudgetInvalid ? ` provider-thinking-budget-error-${isNew ? 'new' : draft.alias}` : ''}`}
+          />
+          {maxOutputInvalid && (
+            <p className="provider-card__error provider-card__error--sm" style={{ gridColumn: '1 / -1', marginTop: 0 }}>
+              {t('Settings_page.provider_max_output_invalid')}
+            </p>
+          )}
+          <p
+            id={`provider-maxout-hint-${isNew ? 'new' : draft.alias}`}
+            className="provider-card__hint"
+          >
+            {t('Settings_page.provider_max_output_hint')}
+          </p>
+        </div>
+        <div className="provider-card__form-row">
+          <label
+            className="provider-card__form-label"
+            htmlFor={`provider-limits-name-${isNew ? 'new' : draft.alias}`}
+          >
+            {t('Settings_page.provider_model_limits_name')}
+          </label>
+          <input
+            id={`provider-limits-name-${isNew ? 'new' : draft.alias}`}
+            type="text"
+            className="provider-card__input"
+            value={draft.model_limits_name}
+            onChange={(e) => setField('model_limits_name', e.target.value)}
+            placeholder={t('Settings_page.provider_model_limits_name_ph')}
+          />
+        </div>
+      </details>
+
+      {modelLimitsLoading && (
+        <p className="provider-card__hint" role="status">
+          {t('Settings_page.provider_capabilities_loading')}
+        </p>
+      )}
+      {modelLimitsError && (
+        <div className="provider-card__preview-status" role="status">
+          <p className="provider-card__warning">{t('Settings_page.provider_capabilities_failed')}</p>
+          <button
+            type="button"
+            className="provider-card__btn provider-card__btn--secondary provider-card__btn--sm"
+            onClick={() => setPreviewRetry((previous) => previous + 1)}
+          >
+            {t('Settings_page.provider_capabilities_retry')}
+          </button>
+        </div>
+      )}
+
+      {modelLimits && (
+        <div className="provider-card__limits-info">
+          <div>
+            <span
+              className={`provider-card__badge provider-card__badge--${modelLimits.source}`}
+            >
+              {t(
+                `Settings_page.provider_output_badge_${modelLimits.source === 'live' ? 'probed' : modelLimits.source}` as MessageKey,
+              )}
+            </span>
+            {shouldShowRecommendedLimitAction(modelLimits, draft.max_output_tokens) && (
+              <button
+                type="button"
+                className="provider-card__recommend-btn"
+                onClick={() =>
+                  setField('max_output_tokens', String(modelLimits.max_output_tokens))
+                }
+              >
+                {t('Settings_page.provider_limits_use_recommended')}
+              </button>
+            )}
+          </div>
+          <ProviderWarnings warnings={modelLimits.warnings} t={t} />
+          <dl className="provider-card__limits-values">
+            <div>
+              <dt>{t('Settings_page.limits_context')}</dt>
+              <dd>
+                {modelLimits.max_context_known && modelLimits.max_context_tokens != null
+                  ? formatTokenCount(modelLimits.max_context_tokens, locale)
+                  : t('Settings_page.limits_unknown')}
+              </dd>
+            </div>
+            <div>
+              <dt>{t('Settings_page.limits_max_in')}</dt>
+              <dd>
+                {modelLimits.max_input_known && modelLimits.max_input_tokens != null
+                  ? formatTokenCount(modelLimits.max_input_tokens, locale)
+                  : t('Settings_page.limits_unknown')}
+              </dd>
+            </div>
+            <div>
+              <dt>{t('Settings_page.limits_max_out')}</dt>
+              <dd>
+                {modelLimits.max_output_known && modelLimits.max_output_tokens != null
+                  ? formatTokenCount(modelLimits.max_output_tokens, locale)
+                  : t('Settings_page.limits_unknown')}
+              </dd>
+            </div>
+          </dl>
+          {modelLimits.max_output_known
+            && modelLimits.max_output_tokens != null
+            && Number(draft.max_output_tokens) > modelLimits.max_output_tokens && (
+              <div className="provider-card__warning" role="alert">
+                {t('Settings_page.provider_output_warn_exceeds')}
+              </div>
+            )}
+          {thinkingHintKey && (
+            <div className="provider-card__hint">
+              {t(thinkingHintKey)}
+            </div>
+          )}
+          {providerThinkingWarningMessages(t, modelLimits.thinking).map((message) => (
+            <div className="provider-card__warning" key={message}>
+              {message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="provider-card__form-row provider-card__thinking-row">
+        <label
+          className="provider-card__form-label"
+          htmlFor={`provider-thinking-${isNew ? 'new' : draft.alias}`}
+        >
+          {t('Settings_page.provider_thinking_label')}
+        </label>
+        <select
+          id={`provider-thinking-${isNew ? 'new' : draft.alias}`}
+          className="provider-card__select"
+          value={draft.thinking_level}
+          onChange={(e) => setField('thinking_level', e.target.value)}
+          disabled={saving || modelLimitsLoading}
+          aria-invalid={(thinkingInvalid && !modelLimitsLoading) || thinkingBudgetInvalid}
+          aria-describedby={`provider-thinking-hint-${isNew ? 'new' : draft.alias}${thinkingInvalid && !modelLimitsLoading ? ` provider-thinking-error-${isNew ? 'new' : draft.alias}` : ''}${thinkingBudgetInvalid ? ` provider-thinking-budget-error-${isNew ? 'new' : draft.alias}` : ''}`}
+        >
+          <option value="">{t('Settings_page.provider_thinking_level_default')}</option>
+          {draft.thinking_level && thinkingInvalid && (
+            <option value={draft.thinking_level} disabled>
+              {thinkingLevelSchema.safeParse(draft.thinking_level).success
+                ? t(`Settings_page.provider_thinking_level_${draft.thinking_level}`)
+                : draft.thinking_level}
+            </option>
+          )}
+          {acceptedThinkingLevels.map((level) => (
+            <option key={level} value={level}>{t(`Settings_page.provider_thinking_level_${level}`)}</option>
+          ))}
+        </select>
+        <p
+          id={`provider-thinking-hint-${isNew ? 'new' : draft.alias}`}
+          className="provider-card__hint"
+        >
+          {t('Settings_page.provider_thinking_default_hint')}
+        </p>
+        {modelLimits && !modelLimits.thinking.supported
+          && !modelLimits.thinking.warnings.includes('thinking_always_on') && (
+          <p className="provider-card__hint" role="status">
+            {t('Settings_page.provider_thinking_unsupported')}
+          </p>
+        )}
+        {thinkingInvalid && !modelLimitsLoading && (
+          <p
+            id={`provider-thinking-error-${isNew ? 'new' : draft.alias}`}
+            className="provider-card__error provider-card__error--sm"
+            role="alert"
+          >
+            {t(modelLimits
+              ? 'Settings_page.provider_thinking_invalid'
+              : 'Settings_page.provider_thinking_unverified')}
+          </p>
+        )}
+        {thinkingBudgetInvalid && minimumThinkingOutput != null && (
+          <p
+            id={`provider-thinking-budget-error-${isNew ? 'new' : draft.alias}`}
+            className="provider-card__error provider-card__error--sm"
+            role="alert"
+          >
+            {t('Settings_page.provider_thinking_output_minimum', {
+              minimum: formatTokenCount(minimumThinkingOutput, locale),
+            })}
+          </p>
+        )}
+      </div>
+
+      {saveError && (
+        <div className="provider-card__probe-msg provider-card__probe-msg--error" role="alert">
+          {saveError}
+        </div>
+      )}
+
+      <div className="provider-card__actions">
+        <button
+          type="submit"
+          className="provider-card__btn provider-card__btn--primary"
+          disabled={!canSave}
+        >
+          {saving ? t('Settings_page.capture_saving') : t('Settings_page.provider_save')}
+        </button>
+        <button
+          type="button"
+          className="provider-card__btn"
+          onClick={onCancel}
+          disabled={saving}
+        >
+          {t('Settings_page.provider_cancel')}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function formatTokenCount(value: number, locale: string): string {
+  try {
+    return value.toLocaleString(locale || undefined);
+  } catch {
+    return value.toLocaleString();
+  }
+}
+
+const PROVIDER_LIMITS_SOURCE_KEYS: Record<string, MessageKey> = {
+  live: 'Settings_page.provider_limits_source_live',
+  registry: 'Settings_page.provider_limits_source_registry',
+  default: 'Settings_page.provider_limits_source_default',
+  fallback: 'Settings_page.provider_limits_source_fallback',
+};
+
+export function providerLimitsSourceLabel(
+  t: TranslateFn,
+  source: string,
+): string {
+  const key = PROVIDER_LIMITS_SOURCE_KEYS[source];
+  return key ? t(key) : source;
+}
+
+function Field({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="provider-card__field">
+      <dt className="provider-card__field-label">{label}</dt>
+      <dd className={`provider-card__field-value${mono ? ' provider-card__field-value--mono' : ''}`}>
+        {value}
+      </dd>
+    </div>
+  );
+}

@@ -1,0 +1,2208 @@
+"""POST/PUT/DELETE /api/providers and /api/providers/{alias}/probe endpoints.
+
+CRUD operations on the per-repo ``[providers.<alias>]`` table inside
+``.ahadiff/config.toml``.  Probe submits an async ``provider_probe:<alias>``
+task to the ``TaskRunner`` and persists probe metadata only if the provider
+core fields did not change while the probe was running.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from collections.abc import Mapping
+from contextlib import contextmanager, suppress
+from copy import deepcopy
+from dataclasses import asdict
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, cast
+
+import httpx
+from anyio import to_thread
+from pydantic import ValidationError
+from starlette.responses import JSONResponse
+
+from ahadiff.contracts import ErrorCode
+from ahadiff.contracts.run_source import ProviderConfig
+from ahadiff.contracts.serve_providers import (
+    ModelLimitsPreviewRequest,
+    ModelLimitsResponse,
+    ProviderCreateRequest,
+    ProviderDeleteResponse,
+    ProviderMutationResponse,
+    ProviderProbeRequest,
+    ProviderProbeSubmitResponse,
+    ProviderScope,
+    ProviderUpdateRequest,
+)
+from ahadiff.core import config as config_module
+from ahadiff.core.config import (
+    SecurityConfig,
+    clear_provider_probe_fields,
+    global_config_write_lock,
+    load_repo_env_file,
+    local_hosts_for_privacy_mode,
+    mask_provider_base_url_for_display,
+    normalize_provider_base_url,
+    provider_core_fingerprint,
+    read_config_data,
+    remove_provider_env_var,
+    resolve_provider_api_key,
+    validate_provider_alias,
+    validate_provider_base_url,
+    validate_repo_api_key_env_name,
+    write_config_data,
+    write_global_env_var,
+    write_provider_env_var,
+)
+from ahadiff.core.errors import ConfigError, ProviderError, SafetyError
+from ahadiff.core.ids import make_event_id
+from ahadiff.core.task_runner import TaskStatus
+from ahadiff.llm import provider as provider_module
+from ahadiff.llm.adapters.thinking import (
+    minimum_thinking_output_tokens,
+    reject_unsupported_thinking,
+    thinking_policy_for,
+)
+from ahadiff.llm.cost import resolve_model_limits
+from ahadiff.llm.probe import probe_provider
+from ahadiff.safety.audit import append_audit_record
+
+from ._errors import error_response
+from .auth import require_write_token, serve_state
+from .lock import serve_repo_write_lock
+from .routes_stats import provider_summary_from_mapping
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from starlette.requests import Request
+
+    from ahadiff.core.task_runner import TaskHandle
+    from ahadiff.llm.schemas import ProbeReport
+
+    from .state import ServeState
+
+
+_CORE_FIELDS = ("provider_class", "model_name", "base_url", "api_key_env")
+_LIMIT_IDENTITY_FIELDS = (*_CORE_FIELDS, "model_limits_name")
+_PROBE_RESULT_FIELDS = (
+    "probed_max_context",
+    "probed_max_input_tokens",
+    "probed_max_output_tokens",
+    "probed_limits_source",
+    "probed_tpm",
+    "probed_rpm",
+    "probe_timestamp",
+)
+_MAX_PENDING_PROVIDER_PROBE_TASKS = 1
+_MAX_GLOBAL_PENDING_PROBE_TASKS = 3
+_MODEL_DISCOVERY_RESPONSE_BYTE_CAP = 1_048_576
+_MODEL_DISCOVERY_TIMEOUT_SECONDS = 5.0
+_UNTRUSTED_CLAMP_POLICIES = {"route_specific", "local_runtime"}
+
+
+class _ProviderBaseUrlError(Exception):
+    pass
+
+
+class _ProviderFieldError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _config_path(state: ServeState, scope: ProviderScope = "repo") -> Path:
+    """Return the provider config path for the requested scope."""
+    return state.provider_scope_dir(scope) / "config.toml"
+
+
+def _env_path(state: ServeState, scope: ProviderScope) -> Path:
+    return state.provider_scope_dir(scope) / ".env"
+
+
+@contextmanager
+def _provider_scope_write_lock(state: ServeState, scope: ProviderScope, *, command: str) -> Any:
+    if scope == "repo":
+        with serve_repo_write_lock(state, command=command):
+            yield
+        return
+    with global_config_write_lock(state.provider_scope_dir("global")):
+        yield
+
+
+def _write_scoped_config_data(
+    config_path: Path,
+    data: Mapping[str, Any],
+    *,
+    scope: ProviderScope,
+) -> Path:
+    return write_config_data(config_path, data, lock_global=scope == "repo")
+
+
+def _validate_provider_scope(value: object) -> ProviderScope:
+    if value in ("repo", "global"):
+        return value
+    raise _ProviderFieldError("scope must be 'repo' or 'global'")
+
+
+def _read_providers_table(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(full_data, providers_table)``; both are mutable dict copies."""
+    data: dict[str, Any] = read_config_data(config_path) if config_path.exists() else {}
+    raw_providers = data.get("providers")
+    if raw_providers is None:
+        providers: dict[str, Any] = {}
+        data["providers"] = providers
+        return data, providers
+    if not isinstance(raw_providers, dict):
+        raise ConfigError("config key [providers] must be a table")
+    providers = cast("dict[str, Any]", raw_providers)
+    return data, providers
+
+
+def _read_optional_providers_table(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not config_path.exists():
+        return {}, {}
+    return _read_providers_table(config_path)
+
+
+def _load_effective_provider_for_read(
+    state: ServeState,
+    alias: str,
+) -> tuple[dict[str, Any], dict[str, Any], ProviderScope] | None:
+    repo_data, repo_providers = _read_optional_providers_table(_config_path(state, "repo"))
+    repo_provider = repo_providers.get(alias)
+    if isinstance(repo_provider, dict):
+        return dict(cast("dict[str, Any]", repo_provider)), repo_data, "repo"
+
+    global_data, global_providers = _read_optional_providers_table(_config_path(state, "global"))
+    global_provider = global_providers.get(alias)
+    if isinstance(global_provider, dict):
+        return dict(cast("dict[str, Any]", global_provider)), global_data, "global"
+    return None
+
+
+def _build_summary(
+    state: ServeState,
+    alias: str,
+    provider_data: dict[str, Any],
+    *,
+    scope: ProviderScope = "repo",
+) -> dict[str, Any] | None:
+    """Build a JSON-ready ProviderSummary dict via the canonical helper."""
+    del state  # unused; ServeState is accepted for symmetry with other helpers
+    raw_role = provider_data.get("role")
+    role = str(raw_role) if isinstance(raw_role, str) and raw_role else None
+    summary = provider_summary_from_mapping(alias, provider_data, role=role, scope=scope)
+    if summary is None:
+        return None
+    return summary.model_dump(mode="json")
+
+
+def _clean_optional_provider_text(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        raise _ProviderFieldError(f"{field_name} must be a non-empty string")
+    return stripped
+
+
+def _validate_provider_api_key_env(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise _ProviderFieldError("api_key_env must be a non-empty string")
+    try:
+        validate_repo_api_key_env_name(value)
+    except ConfigError as exc:
+        raise _ProviderFieldError(f"api_key_env: {exc}") from exc
+    return value
+
+
+def _provider_key_env_base(alias: str) -> str:
+    sanitized = re.sub(r"[^A-Z0-9_]+", "_", alias.upper())
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_") or "PROVIDER"
+    return f"AHADIFF_{sanitized}_KEY"
+
+
+def _is_provider_key_env_name(name: str) -> bool:
+    if not name.startswith("AHADIFF_") or not name.endswith("_KEY"):
+        return False
+    try:
+        validate_repo_api_key_env_name(name)
+    except ConfigError:
+        return False
+    return True
+
+
+def _provider_key_env_names_in_use(
+    providers: Mapping[str, object],
+    *,
+    exclude_alias: str | None = None,
+) -> set[str]:
+    names: set[str] = set()
+    for provider_alias, provider_data in providers.items():
+        if exclude_alias is not None and provider_alias == exclude_alias:
+            continue
+        if not isinstance(provider_data, Mapping):
+            continue
+        provider_mapping = cast("Mapping[str, object]", provider_data)
+        api_key_env = provider_mapping.get("api_key_env")
+        if isinstance(api_key_env, str) and api_key_env:
+            names.add(api_key_env)
+    return names
+
+
+def _provider_key_env_name(
+    alias: str,
+    providers: Mapping[str, object],
+    *,
+    existing_provider: Mapping[str, object] | None = None,
+    occupied_env_names: set[str] | None = None,
+    owned_repo_env_names: set[str] | None = None,
+) -> str:
+    provider_used_names = _provider_key_env_names_in_use(providers, exclude_alias=alias)
+    occupied_names = set(provider_used_names)
+    if occupied_env_names is not None:
+        occupied_names.update(occupied_env_names)
+    owned_names = owned_repo_env_names or set()
+    if existing_provider is not None:
+        existing_api_key_env = existing_provider.get("api_key_env")
+        if (
+            isinstance(existing_api_key_env, str)
+            and existing_api_key_env.startswith("AHADIFF_")
+            and existing_api_key_env not in provider_used_names
+        ):
+            try:
+                validate_repo_api_key_env_name(existing_api_key_env)
+            except ConfigError:
+                pass
+            else:
+                if (
+                    existing_api_key_env in owned_names
+                    or existing_api_key_env not in occupied_names
+                ):
+                    return existing_api_key_env
+
+    base_name = _provider_key_env_base(alias)
+    if base_name not in occupied_names:
+        return base_name
+    stem = base_name.removesuffix("_KEY")
+    for suffix in range(2, 1000):
+        candidate = f"{stem}_{suffix}_KEY"
+        if candidate not in occupied_names:
+            return candidate
+    raise _ProviderFieldError("api_key_env collision could not be resolved")
+
+
+def _occupied_provider_key_env_names(repo_env: Mapping[str, str]) -> set[str]:
+    return set(os.environ) | set(repo_env)
+
+
+def _occupied_provider_key_env_names_for_scope(
+    scope: ProviderScope,
+    scoped_env: Mapping[str, str],
+    *,
+    saved_global_value: str | None = None,
+) -> set[str]:
+    if scope == "global":
+        occupied_names = set(scoped_env) | config_module.original_ambient_provider_key_env_names()
+        for name, value in os.environ.items():
+            # Global .env apply must not override repo/ambient process values.
+            # Treat current AHADIFF_*_KEY names with other values as occupied,
+            # or a fresh global save can resolve to the wrong secret immediately.
+            if _is_provider_key_env_name(name) and value != saved_global_value:
+                occupied_names.add(name)
+        return occupied_names
+    return _occupied_provider_key_env_names(scoped_env)
+
+
+def _owned_repo_env_names(repo_env: Mapping[str, str]) -> set[str]:
+    names: set[str] = set()
+    for name, value in repo_env.items():
+        current_value = os.environ.get(name)
+        if current_value is None or current_value == value:
+            names.add(name)
+    return names
+
+
+def _owned_provider_env_names_for_scope(
+    scope: ProviderScope,
+    scoped_env: Mapping[str, str],
+    *,
+    saved_global_value: str | None = None,
+) -> set[str]:
+    if scope == "global":
+        names: set[str] = set()
+        for name, value in scoped_env.items():
+            current_value = os.environ.get(name)
+            if (
+                saved_global_value is None
+                or current_value is None
+                or current_value in (value, saved_global_value)
+            ):
+                names.add(name)
+        return names
+    return _owned_repo_env_names(scoped_env)
+
+
+def _repo_env_name_for_cleanup(name: object) -> str | None:
+    if not isinstance(name, str):
+        return None
+    try:
+        validate_repo_api_key_env_name(name)
+    except ConfigError:
+        return None
+    return name
+
+
+def _remove_previous_provider_repo_env_value(
+    env_path: Path,
+    *,
+    previous_name: object,
+    current_name: str,
+    repo_env: Mapping[str, str],
+    providers: Mapping[str, object],
+    alias: str,
+    scope: ProviderScope = "repo",
+) -> str | None:
+    previous_env_name = _repo_env_name_for_cleanup(previous_name)
+    if (
+        previous_env_name is None
+        or previous_env_name == current_name
+        or previous_env_name not in repo_env
+        or previous_env_name in _provider_key_env_names_in_use(providers, exclude_alias=alias)
+    ):
+        return None
+    owned_names = _owned_provider_env_names_for_scope(scope, repo_env)
+    if not previous_env_name.startswith("AHADIFF_") and previous_env_name not in owned_names:
+        return None
+    if not _remove_owned_repo_env_value(
+        env_path,
+        previous_env_name,
+        repo_env=repo_env,
+        scope=scope,
+    ):
+        return None
+    return previous_env_name
+
+
+def _apply_saved_repo_env_value(
+    name: str,
+    value: str,
+    *,
+    previous_repo_env: Mapping[str, str],
+    scope: ProviderScope = "repo",
+) -> None:
+    current_value = os.environ.get(name)
+    previous_value = previous_repo_env.get(name)
+    if scope == "global":
+        if current_value is None or (
+            previous_value is not None and current_value == previous_value
+        ):
+            os.environ[name] = value
+            config_module._clear_repo_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+            config_module._remember_global_env_applied_value(name, value)  # pyright: ignore[reportPrivateUsage]
+        return
+    if (
+        current_value is None
+        or (previous_value is not None and current_value == previous_value)
+        or config_module.is_global_env_applied_value(name)
+        or config_module.is_repo_env_applied_value(name)
+    ):
+        os.environ[name] = value
+        config_module._clear_global_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+        config_module._remember_repo_env_applied_value(name, value)  # pyright: ignore[reportPrivateUsage]
+
+
+def _restore_repo_env_value(
+    env_path: Path,
+    name: str,
+    *,
+    previous_repo_env: Mapping[str, str],
+    scope: ProviderScope = "repo",
+) -> None:
+    previous_repo_value = previous_repo_env.get(name)
+    if previous_repo_value is None:
+        _remove_scoped_provider_env_var(env_path, name, scope=scope)
+    else:
+        _write_scoped_provider_env_var(
+            env_path,
+            name,
+            previous_repo_value,
+            scope=scope,
+        )
+        if name not in os.environ:
+            os.environ[name] = previous_repo_value
+
+
+def _remove_owned_repo_env_value(
+    env_path: Path,
+    name: str,
+    *,
+    repo_env: Mapping[str, str],
+    scope: ProviderScope = "repo",
+) -> bool:
+    repo_value = repo_env.get(name)
+    removed = _remove_scoped_provider_env_var(env_path, name, scope=scope)
+    if removed and repo_value is not None and os.environ.get(name) == repo_value:
+        os.environ.pop(name, None)
+        if scope == "global":
+            config_module._clear_global_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+        else:
+            config_module._clear_repo_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+    return removed
+
+
+def _write_scoped_provider_env_var(
+    env_path: Path,
+    name: str,
+    value: str,
+    *,
+    scope: ProviderScope,
+) -> None:
+    if scope == "global":
+        write_global_env_var(name, value, config_dir=env_path.parent, lock=False)
+        return
+    write_provider_env_var(env_path, name, value)
+
+
+def _remove_scoped_provider_env_var(
+    env_path: Path,
+    name: str,
+    *,
+    scope: ProviderScope,
+) -> bool:
+    if scope == "global":
+        return config_module.remove_global_env_var(name, config_dir=env_path.parent, lock=False)
+    return remove_provider_env_var(env_path, name)
+
+
+def _restore_repo_env_value_best_effort(
+    env_path: Path,
+    name: str,
+    *,
+    previous_repo_env: Mapping[str, str],
+    scope: ProviderScope = "repo",
+) -> None:
+    with suppress(Exception):
+        _restore_repo_env_value(
+            env_path,
+            name,
+            previous_repo_env=previous_repo_env,
+            scope=scope,
+        )
+
+
+def _rollback_saved_repo_env_value(
+    env_path: Path,
+    name: str,
+    attempted_value: str,
+    *,
+    previous_repo_env: Mapping[str, str],
+    previous_process_value: str | None,
+    previous_process_value_exists: bool,
+    scope: ProviderScope = "repo",
+) -> None:
+    _restore_repo_env_value(env_path, name, previous_repo_env=previous_repo_env, scope=scope)
+    if os.environ.get(name) == attempted_value:
+        if previous_process_value_exists:
+            assert previous_process_value is not None
+            os.environ[name] = previous_process_value
+        else:
+            os.environ.pop(name, None)
+        if scope == "global":
+            config_module._clear_global_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+        else:
+            config_module._clear_repo_env_applied_value(name)  # pyright: ignore[reportPrivateUsage]
+
+
+def _restore_config_snapshot(
+    config_path: Path,
+    data: Mapping[str, Any],
+    *,
+    existed: bool,
+    scope: ProviderScope = "repo",
+) -> None:
+    if existed:
+        _write_scoped_config_data(config_path, data, scope=scope)
+    else:
+        config_path.unlink(missing_ok=True)
+
+
+def _restore_config_snapshot_best_effort(
+    config_path: Path,
+    data: Mapping[str, Any],
+    *,
+    existed: bool,
+    scope: ProviderScope = "repo",
+) -> None:
+    with suppress(Exception):
+        _restore_config_snapshot(config_path, data, existed=existed, scope=scope)
+
+
+def _is_api_key_noop(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return not stripped or all(char == "*" for char in stripped)
+
+
+def _validate_plain_api_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if "\n" in value or "\r" in value:
+        raise _ProviderFieldError("api_key must not contain newlines")
+    if any(ord(char) < 32 for char in value):
+        raise _ProviderFieldError("api_key must not contain control characters")
+    return value
+
+
+def _drop_noop_api_key(payload: dict[str, object]) -> bool:
+    if "api_key" not in payload:
+        return False
+    value = payload.get("api_key")
+    if _is_api_key_noop(value):
+        payload.pop("api_key", None)
+        return True
+    return False
+
+
+def _error(message: str, *, status: int) -> JSONResponse:
+    code = ErrorCode.INPUT_BAD_FIELD
+    if status == 404:
+        code = (
+            ErrorCode.PROVIDER_NOT_FOUND if message == "provider_not_found" else ErrorCode.NOT_FOUND
+        )
+    elif status >= 500:
+        code = ErrorCode.INTERNAL_ERROR
+    return error_response(code, message, status=status)
+
+
+def _provider_base_url_error(prefix: str, base_url: str) -> str:
+    safe_base_url = config_module._safe_url_repr(base_url)  # pyright: ignore[reportPrivateUsage]
+    if safe_base_url == base_url.strip():
+        return prefix
+    return f"{prefix}: {safe_base_url}"
+
+
+def _validation_error(exc: ValidationError, *, status: int = 422) -> JSONResponse:
+    return error_response(
+        ErrorCode.INPUT_VALIDATION,
+        "validation_error",
+        status=status,
+        details={"errors": exc.errors(include_context=False, include_input=False)},
+    )
+
+
+def _invalid_alias_response(alias: str) -> JSONResponse | None:
+    try:
+        validate_provider_alias(alias)
+    except ConfigError:
+        return _error("invalid_alias", status=400)
+    return None
+
+
+def _provider_allowed_local_hosts(data: Mapping[str, object]) -> tuple[str, ...]:
+    security_obj = data.get("security")
+    if not isinstance(security_obj, Mapping):
+        return ()
+    security = cast("Mapping[str, object]", security_obj)
+    hosts: list[str] = []
+    for key in ("local_hosts", "strict_local_hosts"):
+        raw_hosts = security.get(key)
+        if isinstance(raw_hosts, list | tuple):
+            host_items = cast("list[object] | tuple[object, ...]", raw_hosts)
+            hosts.extend(item for item in host_items if isinstance(item, str))
+    return tuple(hosts)
+
+
+def _security_string_tuple(security: Mapping[str, object], key: str) -> tuple[str, ...]:
+    raw_value = security.get(key)
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list | tuple):
+        raise ConfigError(f"security.{key} must be an array of strings")
+    items = cast("list[object] | tuple[object, ...]", raw_value)
+    if not all(isinstance(item, str) for item in items):
+        raise ConfigError(f"security.{key} must be an array of strings")
+    return tuple(cast("tuple[str, ...]", tuple(items)))
+
+
+def _security_config_from_data(data: Mapping[str, object]) -> SecurityConfig:
+    raw_security = data.get("security", {})
+    if raw_security is None:
+        return SecurityConfig()
+    if not isinstance(raw_security, Mapping):
+        raise ConfigError("config key [security] must be a table")
+    security = cast("Mapping[str, object]", raw_security)
+    return SecurityConfig(
+        allow_exact=_security_string_tuple(security, "allow_exact"),
+        allow_paths=_security_string_tuple(security, "allow_paths"),
+        suppress_rules=_security_string_tuple(security, "suppress_rules"),
+        local_hosts=_security_string_tuple(security, "local_hosts"),
+        strict_local_hosts=_security_string_tuple(security, "strict_local_hosts"),
+    )
+
+
+def _security_config_for_provider_scope(
+    state: ServeState,
+    scope: ProviderScope,
+    scoped_data: Mapping[str, Any],
+) -> SecurityConfig:
+    if scope == "repo":
+        return _security_config_from_data(scoped_data)
+    repo_config_path = _config_path(state, "repo")
+    repo_data = read_config_data(repo_config_path) if repo_config_path.exists() else {}
+    return _security_config_from_data(repo_data)
+
+
+_DEFAULT_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _normalize_and_validate_base_url(
+    base_url: str,
+    *,
+    provider_class: str,
+    data: Mapping[str, object],
+) -> str:
+    normalized = normalize_provider_base_url(base_url, provider_class=provider_class)
+    try:
+        validate_provider_base_url(
+            normalized,
+            allowed_local_hosts=(
+                *_provider_allowed_local_hosts(data),
+                *_DEFAULT_LOCAL_HOSTS,
+            ),
+        )
+    except ConfigError as exc:
+        raise _ProviderBaseUrlError(str(exc)) from exc
+    return normalized
+
+
+def _append_provider_audit_event(
+    state: ServeState,
+    *,
+    event_type: str,
+    alias: str,
+    provider_data: Mapping[str, Any],
+) -> None:
+    record = {
+        "event_id": make_event_id(),
+        "schema_version": 1,
+        "event_type": event_type,
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "alias": alias,
+        "provider_class": str(provider_data.get("provider_class") or ""),
+        "model_name": str(provider_data.get("model_name") or ""),
+        "base_url": mask_provider_base_url_for_display(str(provider_data.get("base_url") or "")),
+    }
+    append_audit_record(state.state_dir / "audit.jsonl", record)
+
+
+def _provider_required_str(provider_data: Mapping[str, Any], field_name: str) -> str:
+    value = provider_data.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"provider {field_name} must be a non-empty string")
+    return value
+
+
+def _provider_optional_str(provider_data: Mapping[str, Any], field_name: str) -> str | None:
+    value = provider_data.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"provider {field_name} must be a non-empty string")
+    return value
+
+
+def _provider_config_for_limits(provider_data: Mapping[str, Any]) -> ProviderConfig:
+    payload: dict[str, object] = {
+        "provider_class": provider_data.get("provider_class"),
+        "model_name": provider_data.get("model_name"),
+        "base_url": provider_data.get("base_url") or "http://127.0.0.1",
+        "api_key_env": provider_data.get("api_key_env") or "AHADIFF_PROVIDER_API_KEY",
+    }
+    for field_name in (
+        "max_output_tokens",
+        "thinking_level",
+        "probed_max_context",
+        "probed_tpm",
+        "probed_rpm",
+        "probed_max_input_tokens",
+        "probed_max_output_tokens",
+        "probed_limits_source",
+        "model_limits_name",
+        "probe_timestamp",
+    ):
+        value = provider_data.get(field_name)
+        if value is not None:
+            payload[field_name] = value
+    return ProviderConfig.model_validate(payload)
+
+
+def _append_limit_warning(
+    warnings: list[dict[str, object]],
+    code: str,
+    *,
+    params: dict[str, object] | None = None,
+) -> None:
+    warning: dict[str, object] = {"code": code}
+    if params:
+        warning["params"] = params
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def _structured_limit_warnings(
+    *,
+    context_policy: str | None,
+    confidence: str | None,
+    max_context_known: bool,
+    max_input_known: bool,
+    max_output_known: bool,
+    raw_warnings: tuple[str, ...],
+) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+    if not max_context_known or not max_input_known or not max_output_known:
+        _append_limit_warning(
+            warnings,
+            "provider_limits.default_fallback",
+            params={
+                "max_context_known": max_context_known,
+                "max_input_known": max_input_known,
+                "max_output_known": max_output_known,
+            },
+        )
+    if context_policy == "local_runtime":
+        _append_limit_warning(warnings, "provider_limits.local_runtime")
+    if context_policy == "route_specific":
+        _append_limit_warning(warnings, "provider_limits.route_specific")
+    if confidence == "low":
+        _append_limit_warning(warnings, "provider_limits.low_confidence")
+    for _raw_warning in raw_warnings:
+        _append_limit_warning(warnings, "provider_limits.registry_warning")
+    return warnings
+
+
+def _public_limit_value(value: int | None, *, known: bool) -> int | None:
+    if not known:
+        return None
+    return value
+
+
+def _thinking_metadata(
+    provider_class: str,
+    model_name: str,
+    *,
+    base_url: str | None,
+    model_limits_name: str | None = None,
+) -> dict[str, object]:
+    policy = thinking_policy_for(
+        provider_class, model_name, base_url=base_url, model_limits_name=model_limits_name
+    )
+    supported = bool(policy["supported"])
+    minimums: dict[str, int] = {}
+    for level in policy["accepted_levels"]:
+        minimum = minimum_thinking_output_tokens(
+            provider_class, model_name, level, base_url=base_url
+        )
+        if minimum is not None:
+            minimums[level] = minimum
+    return {
+        **policy,
+        "supported": supported,
+        "minimum_output_tokens": minimums,
+    }
+
+
+def build_model_limits_response(
+    *,
+    alias: str | None,
+    provider_data: Mapping[str, Any],
+    model_name_override: str | None = None,
+) -> ModelLimitsResponse | None:
+    provider_snapshot = dict(provider_data)
+    if model_name_override is not None and model_name_override.strip():
+        provider_snapshot["model_name"] = model_name_override.strip()
+        provider_snapshot.pop("model_limits_name", None)
+    try:
+        config = _provider_config_for_limits(provider_snapshot)
+    except ValidationError:
+        return None
+    limits = resolve_model_limits(
+        config.provider_class,
+        config.model_name,
+        config,
+    )
+    return ModelLimitsResponse(
+        alias=alias,
+        provider_class=config.provider_class,
+        model_name=config.model_name,
+        max_context_tokens=_public_limit_value(
+            limits.max_context_tokens,
+            known=limits.max_context_known,
+        ),
+        max_input_tokens=_public_limit_value(
+            limits.max_input_tokens,
+            known=limits.max_input_known,
+        ),
+        max_output_tokens=_public_limit_value(
+            limits.max_output_tokens,
+            known=limits.max_output_known,
+        ),
+        max_context_known=limits.max_context_known,
+        max_input_known=limits.max_input_known,
+        max_output_known=limits.max_output_known,
+        context_policy=cast("Any", limits.context_policy),
+        source=limits.source,
+        confidence=cast("Any", limits.confidence),
+        warnings=_structured_limit_warnings(
+            context_policy=limits.context_policy,
+            confidence=limits.confidence,
+            max_context_known=limits.max_context_known,
+            max_input_known=limits.max_input_known,
+            max_output_known=limits.max_output_known,
+            raw_warnings=limits.warnings,
+        ),
+        thinking=_thinking_metadata(
+            config.provider_class,
+            config.model_name,
+            base_url=config.base_url,
+            model_limits_name=config.model_limits_name,
+        ),
+    )
+
+
+def _validate_provider_thinking(provider_data: Mapping[str, Any]) -> None:
+    try:
+        reject_unsupported_thinking(
+            str(provider_data.get("provider_class", "")),
+            provider_data.get("thinking_level"),
+            model_name=str(provider_data.get("model_name", "")),
+            base_url=provider_data.get("base_url"),
+            model_limits_name=provider_data.get("model_limits_name"),
+        )
+    except ProviderError as exc:
+        raise _ProviderFieldError(str(exc)) from exc
+    minimum = minimum_thinking_output_tokens(
+        str(provider_data.get("provider_class", "")),
+        str(provider_data.get("model_name", "")),
+        provider_data.get("thinking_level"),
+        base_url=provider_data.get("base_url"),
+    )
+    maximum = provider_data.get("max_output_tokens")
+    if minimum is not None and isinstance(maximum, int) and maximum < minimum:
+        raise _ProviderFieldError(
+            f"max_output_tokens must be at least {minimum} for the selected thinking budget"
+        )
+
+
+def _validate_provider_role_consumers(
+    state: ServeState, data: Mapping[str, Any], scope: ProviderScope
+) -> None:
+    from .routes_config import validate_role_thinking_update
+
+    repo_path = _config_path(state, "repo")
+    repo_data = (
+        data if scope == "repo" else (read_config_data(repo_path) if repo_path.exists() else {})
+    )
+    snapshot = config_module.preview_workspace_config(
+        state.state_dir.parent,
+        repo_data,
+        global_config_root=state.global_config_root,
+        global_config_data=data if scope == "global" else None,
+    )
+    try:
+        previous = config_module.load_workspace_config(
+            state.state_dir.parent, global_config_root=state.global_config_root
+        )
+    except ConfigError:
+        previous = None
+    for role in ("generate", "judge"):
+        error = validate_role_thinking_update(snapshot, {role})
+        previous_error = (
+            validate_role_thinking_update(previous, {role}) if previous is not None else None
+        )
+        # A legacy incompatible role must not prevent creating its replacement
+        # provider. Reject new breakage, while keeping the repair path available.
+        if error is not None and error != previous_error:
+            raise _ProviderFieldError(error)
+
+
+def _trusted_max_output_limit(limits: Any) -> int | None:
+    if not limits.max_output_known:
+        return None
+    if limits.max_output_tokens is None:
+        return None
+    if limits.context_policy in _UNTRUSTED_CLAMP_POLICIES:
+        return None
+    if limits.confidence == "low":
+        return None
+    return int(limits.max_output_tokens)
+
+
+def _apply_max_output_policy(provider_data: dict[str, Any]) -> list[dict[str, object]]:
+    requested = provider_data.get("max_output_tokens")
+    if requested is None:
+        return []
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        return []
+    try:
+        config = _provider_config_for_limits(provider_data)
+    except ValidationError:
+        return []
+    limits = resolve_model_limits(config.provider_class, config.model_name, config)
+    trusted_limit = _trusted_max_output_limit(limits)
+    if trusted_limit is not None:
+        if requested <= trusted_limit:
+            return []
+        provider_data["max_output_tokens"] = trusted_limit
+        return [
+            {
+                "code": "provider_limits.max_output_clamped",
+                "params": {
+                    "requested": requested,
+                    "clamped_to": trusted_limit,
+                    "source": limits.output_source,
+                    "max_output_known": limits.max_output_known,
+                },
+            }
+        ]
+    return [
+        {
+            "code": "provider_limits.unverified_override",
+            "params": {
+                "requested": requested,
+                "source": limits.output_source,
+                "max_output_known": limits.max_output_known,
+                "context_policy": limits.context_policy,
+                "confidence": limits.confidence,
+            },
+        }
+    ]
+
+
+def _probe_report_result(
+    *,
+    alias: str,
+    report: ProbeReport,
+    persisted: bool,
+    stale: bool,
+) -> dict[str, Any]:
+    rate_limits = asdict(report.rate_limits) if report.rate_limits is not None else None
+    notes = list(report.notes)
+    if stale:
+        notes.append("provider config changed before probe results could be persisted")
+    return {
+        "alias": alias,
+        "provider_name": report.provider_name,
+        "connectivity_ok": report.connectivity_ok,
+        "transport_target": report.transport_target,
+        "context_window_source": report.context_window_source,
+        "config": report.config.model_dump(mode="json"),
+        "capabilities": report.capabilities.model_dump(mode="json"),
+        "rate_limits": rate_limits,
+        "notes": notes,
+        "persisted": persisted,
+        "stale": stale,
+    }
+
+
+def _provider_probe_failed_result(alias: str) -> dict[str, Any]:
+    return {
+        "alias": alias,
+        "connectivity_ok": False,
+        "error_code": "provider_probe_failed",
+        "error": "provider probe failed",
+        "persisted": False,
+        "stale": False,
+        "notes": ["provider probe failed"],
+    }
+
+
+def _verification_from_provider_probe(
+    *,
+    alias: str,
+    provider_data: Mapping[str, Any],
+    api_key: str | None,
+    security_config: SecurityConfig,
+    workspace_root: Path,
+) -> dict[str, object] | None:
+    if api_key is None:
+        return None
+    try:
+        provider_class = _provider_required_str(provider_data, "provider_class")
+        model_name = _provider_required_str(provider_data, "model_name")
+        model_limits_name = _provider_optional_str(provider_data, "model_limits_name")
+        base_url = _provider_required_str(provider_data, "base_url")
+        api_key_env = _validate_provider_api_key_env(provider_data.get("api_key_env"))
+        report = probe_provider(
+            provider_name=alias,
+            provider_class=provider_class,
+            model_name=model_name,
+            model_limits_name=model_limits_name,
+            base_url=base_url,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            thinking_level=provider_data.get("thinking_level"),
+            max_output_tokens=provider_data.get("max_output_tokens"),
+            workspace_root=workspace_root,
+            security_config=security_config,
+            request_timeout_seconds=5,
+            persist_result=False,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "provider_probe_failed",
+            "detail": type(exc).__name__,
+        }
+    detail = next((note for note in report.notes if note), None)
+    if not report.connectivity_ok:
+        return {"ok": False, "error": "provider_probe_failed", "detail": detail}
+    return {"ok": True, "error": None, "detail": detail}
+
+
+def _persist_probe_result_if_current(
+    *,
+    state: ServeState,
+    config_path: Path,
+    scope: ProviderScope,
+    alias: str,
+    expected_fingerprint: str,
+    report: ProbeReport,
+) -> bool:
+    with _provider_scope_write_lock(state, scope, command="serve provider probe persist"):
+        data, providers = _read_providers_table(config_path)
+        current = providers.get(alias)
+        if not isinstance(current, dict):
+            return False
+        current_typed = cast("dict[str, Any]", current)
+        if provider_core_fingerprint(current_typed) != expected_fingerprint:
+            return False
+
+        updated_provider = dict(current_typed)
+        clear_provider_probe_fields(updated_provider)
+        for field_name in _PROBE_RESULT_FIELDS:
+            value = getattr(report.config, field_name)
+            if value is not None:
+                updated_provider[field_name] = value
+        providers[alias] = updated_provider
+        _write_scoped_config_data(config_path, data, scope=scope)
+        _append_provider_audit_event(
+            state,
+            event_type="provider_probe",
+            alias=alias,
+            provider_data=updated_provider,
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# POST /api/providers
+# ---------------------------------------------------------------------------
+
+
+async def create_provider(request: Request) -> JSONResponse:
+    require_write_token(request)
+    state = serve_state(request)
+
+    try:
+        raw_payload = cast("object", await request.json())
+    except Exception:
+        return _error("invalid_json", status=400)
+    if not isinstance(raw_payload, dict):
+        return _error("body_must_be_object", status=400)
+    payload = cast("dict[str, object]", raw_payload)
+    raw_alias = payload.get("alias")
+    if isinstance(raw_alias, str):
+        alias_error = _invalid_alias_response(raw_alias)
+        if alias_error is not None:
+            return alias_error
+    _drop_noop_api_key(payload)
+
+    try:
+        body = ProviderCreateRequest.model_validate(payload)
+    except ValidationError as exc:
+        return _validation_error(exc)
+    try:
+        model_limits_name = _clean_optional_provider_text(
+            body.model_limits_name,
+            field_name="model_limits_name",
+        )
+        plain_api_key = _validate_plain_api_key(body.api_key)
+        requested_api_key_env = (
+            None if plain_api_key is not None else _validate_provider_api_key_env(body.api_key_env)
+        )
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+
+    scope = body.scope
+    config_path = _config_path(state, scope)
+
+    def _persist() -> tuple[
+        bool,
+        dict[str, Any] | None,
+        list[dict[str, object]],
+        SecurityConfig | None,
+    ]:
+        with _provider_scope_write_lock(state, scope, command="serve provider create"):
+            data, providers = _read_providers_table(config_path)
+            if body.alias in providers:
+                return False, None, [], None
+            security_config = _security_config_for_provider_scope(state, scope, data)
+            previous_config_data = deepcopy(data)
+            previous_config_exists = config_path.exists()
+            normalized_base_url = _normalize_and_validate_base_url(
+                body.base_url,
+                provider_class=body.provider_class,
+                data=data,
+            )
+            _validate_provider_thinking(
+                {
+                    "provider_class": body.provider_class,
+                    "model_name": body.model_name,
+                    "base_url": normalized_base_url,
+                    "model_limits_name": model_limits_name,
+                    "thinking_level": body.thinking_level,
+                    "max_output_tokens": body.max_output_tokens,
+                }
+            )
+            env_path = _env_path(state, scope)
+            if plain_api_key is not None:
+                repo_env = load_repo_env_file(env_path)
+                api_key_env = _provider_key_env_name(
+                    body.alias,
+                    providers,
+                    occupied_env_names=_occupied_provider_key_env_names_for_scope(
+                        scope,
+                        repo_env,
+                        saved_global_value=plain_api_key,
+                    ),
+                    owned_repo_env_names=_owned_provider_env_names_for_scope(
+                        scope,
+                        repo_env,
+                        saved_global_value=plain_api_key,
+                    ),
+                )
+            else:
+                repo_env = {}
+                api_key_env = requested_api_key_env
+            if api_key_env is None:
+                raise _ProviderFieldError("api_key_env must be a non-empty string")
+            previous_process_value = os.environ.get(api_key_env)
+            previous_process_value_exists = api_key_env in os.environ
+            attempted_repo_env_value: str | None = None
+            config_committed = False
+            if plain_api_key is not None:
+                _write_scoped_provider_env_var(
+                    env_path,
+                    api_key_env,
+                    plain_api_key,
+                    scope=scope,
+                )
+                _apply_saved_repo_env_value(
+                    api_key_env,
+                    plain_api_key,
+                    previous_repo_env=repo_env,
+                    scope=scope,
+                )
+                attempted_repo_env_value = plain_api_key
+            try:
+                new_provider: dict[str, Any] = {
+                    "provider_class": body.provider_class,
+                    "model_name": body.model_name,
+                    "base_url": normalized_base_url,
+                    "api_key_env": api_key_env,
+                }
+                if body.max_output_tokens is not None:
+                    new_provider["max_output_tokens"] = body.max_output_tokens
+                if body.thinking_level is not None:
+                    new_provider["thinking_level"] = body.thinking_level
+                if model_limits_name is not None:
+                    new_provider["model_limits_name"] = model_limits_name
+                warnings = _apply_max_output_policy(new_provider)
+                _validate_provider_thinking(new_provider)
+                providers[body.alias] = new_provider
+                _validate_provider_role_consumers(state, data, scope)
+                _write_scoped_config_data(config_path, data, scope=scope)
+                config_committed = True
+                _append_provider_audit_event(
+                    state,
+                    event_type="provider_create",
+                    alias=body.alias,
+                    provider_data=new_provider,
+                )
+            except Exception:
+                if attempted_repo_env_value is not None:
+                    with suppress(Exception):
+                        _rollback_saved_repo_env_value(
+                            env_path,
+                            api_key_env,
+                            attempted_repo_env_value,
+                            previous_repo_env=repo_env,
+                            previous_process_value=previous_process_value,
+                            previous_process_value_exists=previous_process_value_exists,
+                            scope=scope,
+                        )
+                if config_committed:
+                    _restore_config_snapshot_best_effort(
+                        config_path,
+                        previous_config_data,
+                        existed=previous_config_exists,
+                        scope=scope,
+                    )
+                raise
+            return True, dict(new_provider), warnings, security_config
+
+    try:
+        created, persisted, warnings, security_config = await to_thread.run_sync(_persist)
+    except _ProviderBaseUrlError as exc:
+        return _error(f"base_url: {exc}", status=422)
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    except Exception:
+        return _error("provider_persist_failed", status=500)
+    if not created or persisted is None:
+        return _error("provider_alias_conflict", status=409)
+
+    summary = _build_summary(state, body.alias, persisted, scope=scope)
+    if summary is None:
+        return _error("provider_summary_unavailable", status=500)
+    verification = await to_thread.run_sync(
+        lambda: _verification_from_provider_probe(
+            alias=body.alias,
+            provider_data=persisted,
+            api_key=plain_api_key,
+            security_config=security_config or SecurityConfig(),
+            workspace_root=state.state_dir.parent,
+        )
+    )
+    return JSONResponse(
+        ProviderMutationResponse.model_validate(
+            {
+                "updated": True,
+                "provider": summary,
+                "warnings": warnings,
+                "verification": verification,
+            }
+        ).model_dump(mode="json"),
+        status_code=201,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/providers/{alias}/model-limits
+# POST /api/providers/model-limits/preview
+# ---------------------------------------------------------------------------
+
+
+async def get_provider_model_limits(request: Request) -> JSONResponse:
+    require_write_token(request)
+    state = serve_state(request)
+    alias = str(request.path_params.get("alias", ""))
+    if not alias:
+        return _error("alias_required", status=422)
+    alias_error = _invalid_alias_response(alias)
+    if alias_error is not None:
+        return alias_error
+
+    def _load_provider() -> dict[str, Any] | None:
+        loaded = _load_effective_provider_for_read(state, alias)
+        if loaded is None:
+            return None
+        provider_data, _data, _scope = loaded
+        return provider_data
+
+    try:
+        provider_data = await to_thread.run_sync(_load_provider)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    if provider_data is None:
+        return _error("provider_not_found", status=404)
+
+    response = build_model_limits_response(alias=alias, provider_data=provider_data)
+    if response is None:
+        return _error("provider_limits_unavailable", status=500)
+    return JSONResponse(response.model_dump(mode="json"))
+
+
+async def preview_provider_model_limits(request: Request) -> JSONResponse:
+    require_write_token(request)
+    try:
+        raw_payload = cast("object", await request.json())
+    except Exception:
+        return _error("invalid_json", status=400)
+    if not isinstance(raw_payload, dict):
+        return _error("body_must_be_object", status=400)
+    try:
+        body = ModelLimitsPreviewRequest.model_validate(raw_payload)
+    except ValidationError as exc:
+        return _validation_error(exc)
+    try:
+        model_limits_name = _clean_optional_provider_text(
+            body.model_limits_name,
+            field_name="model_limits_name",
+        )
+        preview_base_url = _clean_optional_provider_text(
+            body.base_url,
+            field_name="base_url",
+        )
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+
+    provider_data: dict[str, Any] = {
+        "provider_class": body.provider_class,
+        "model_name": body.model_name,
+    }
+    if preview_base_url is not None:
+        provider_data["base_url"] = preview_base_url
+    if model_limits_name is not None:
+        provider_data["model_limits_name"] = model_limits_name
+    response = build_model_limits_response(alias=None, provider_data=provider_data)
+    if response is None:
+        return _error("provider_limits_unavailable", status=500)
+    return JSONResponse(response.model_dump(mode="json"))
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/providers/{alias}
+# ---------------------------------------------------------------------------
+
+
+async def update_provider(request: Request) -> JSONResponse:
+    require_write_token(request)
+    state = serve_state(request)
+    alias = str(request.path_params.get("alias", ""))
+    if not alias:
+        return _error("alias_required", status=422)
+    alias_error = _invalid_alias_response(alias)
+    if alias_error is not None:
+        return alias_error
+
+    try:
+        raw_payload = cast("object", await request.json())
+    except Exception:
+        return _error("invalid_json", status=400)
+    if not isinstance(raw_payload, dict):
+        return _error("body_must_be_object", status=400)
+    payload = cast("dict[str, object]", raw_payload)
+    api_key_noop_requested = _drop_noop_api_key(payload)
+
+    try:
+        body = ProviderUpdateRequest.model_validate(payload)
+    except ValidationError as exc:
+        return _validation_error(exc)
+
+    scope = body.scope
+    fields_set = set(body.model_fields_set)
+    update_payload = body.model_dump(exclude_none=True, exclude={"scope"})
+    if "model_limits_name" in update_payload:
+        try:
+            update_payload["model_limits_name"] = _clean_optional_provider_text(
+                cast("str", update_payload["model_limits_name"]),
+                field_name="model_limits_name",
+            )
+        except _ProviderFieldError as exc:
+            return _error(str(exc), status=422)
+    clear_fields: set[str] = set()
+    if "max_output_tokens" in fields_set and body.max_output_tokens is None:
+        clear_fields.add("max_output_tokens")
+    if "thinking_level" in fields_set and body.thinking_level is None:
+        clear_fields.add("thinking_level")
+    if "model_limits_name" in fields_set and body.model_limits_name is None:
+        clear_fields.add("model_limits_name")
+    raw_plain_api_key = update_payload.pop("api_key", None)
+    try:
+        plain_api_key = (
+            _validate_plain_api_key(raw_plain_api_key)
+            if isinstance(raw_plain_api_key, str)
+            else None
+        )
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    if isinstance(plain_api_key, str):
+        update_payload.pop("api_key_env", None)
+    masked_key = update_payload.get("api_key_env")
+    if isinstance(masked_key, str) and "****" in masked_key:
+        del update_payload["api_key_env"]
+    elif "api_key_env" in update_payload:
+        try:
+            update_payload["api_key_env"] = _validate_provider_api_key_env(
+                update_payload["api_key_env"]
+            )
+        except _ProviderFieldError as exc:
+            return _error(str(exc), status=422)
+    if (
+        not update_payload
+        and not clear_fields
+        and not api_key_noop_requested
+        and plain_api_key is None
+    ):
+        return _error("at_least_one_field_required", status=422)
+
+    config_path = _config_path(state, scope)
+
+    def _persist() -> tuple[
+        bool,
+        dict[str, Any] | None,
+        list[dict[str, object]],
+        SecurityConfig | None,
+    ]:
+        with _provider_scope_write_lock(state, scope, command="serve provider update"):
+            data, providers = _read_providers_table(config_path)
+            existing = providers.get(alias)
+            if not isinstance(existing, dict):
+                return False, None, [], None
+            previous_config_data = deepcopy(data)
+            previous_config_exists = config_path.exists()
+            existing_typed = cast("dict[str, Any]", existing)
+            updated_provider: dict[str, Any] = dict(existing_typed)
+            env_path = _env_path(state, scope)
+            repo_env: Mapping[str, str] = {}
+            repo_env_loaded = False
+            api_key_env_for_rollback: str | None = None
+            attempted_repo_env_value: str | None = None
+            legacy_env_name_for_restore: str | None = None
+            previous_process_value: str | None = None
+            previous_process_value_exists = False
+            config_committed = False
+            if isinstance(plain_api_key, str):
+                repo_env = load_repo_env_file(env_path)
+                repo_env_loaded = True
+                api_key_env = _provider_key_env_name(
+                    alias,
+                    providers,
+                    existing_provider=existing_typed,
+                    occupied_env_names=_occupied_provider_key_env_names_for_scope(
+                        scope,
+                        repo_env,
+                        saved_global_value=plain_api_key,
+                    ),
+                    owned_repo_env_names=_owned_provider_env_names_for_scope(
+                        scope,
+                        repo_env,
+                        saved_global_value=plain_api_key,
+                    ),
+                )
+                update_payload["api_key_env"] = api_key_env
+                previous_process_value = os.environ.get(api_key_env)
+                previous_process_value_exists = api_key_env in os.environ
+                _write_scoped_provider_env_var(
+                    env_path,
+                    api_key_env,
+                    plain_api_key,
+                    scope=scope,
+                )
+                _apply_saved_repo_env_value(
+                    api_key_env,
+                    plain_api_key,
+                    previous_repo_env=repo_env,
+                    scope=scope,
+                )
+                api_key_env_for_rollback = api_key_env
+                attempted_repo_env_value = plain_api_key
+            requested_api_key_env = update_payload.get("api_key_env")
+            if isinstance(requested_api_key_env, str):
+                if not repo_env_loaded:
+                    repo_env = load_repo_env_file(env_path)
+                legacy_env_name_for_restore = _remove_previous_provider_repo_env_value(
+                    env_path,
+                    previous_name=existing_typed.get("api_key_env"),
+                    current_name=requested_api_key_env,
+                    repo_env=repo_env,
+                    providers=providers,
+                    alias=alias,
+                    scope=scope,
+                )
+            try:
+                safe_update = {
+                    k: v
+                    for k, v in update_payload.items()
+                    if not (k == "api_key_env" and isinstance(v, str) and "****" in v)
+                }
+                updated_provider.update(safe_update)
+                for field_name in clear_fields:
+                    updated_provider.pop(field_name, None)
+                updated_provider["api_key_env"] = _validate_provider_api_key_env(
+                    updated_provider.get("api_key_env")
+                )
+                # Recompute base_url normalization if either base_url or
+                # provider_class changed (so suffix stripping stays aligned).
+                if "base_url" in update_payload or "provider_class" in update_payload:
+                    provider_class = str(updated_provider.get("provider_class", ""))
+                    base_url = str(updated_provider.get("base_url", ""))
+                    if base_url:
+                        updated_provider["base_url"] = _normalize_and_validate_base_url(
+                            base_url,
+                            provider_class=provider_class,
+                            data=data,
+                        )
+                # Clear stale probe results when the provider identity or registry
+                # model override changes; old live probe limits belong to the old identity.
+                limit_identity_changed = any(
+                    field in update_payload or field in clear_fields
+                    for field in _LIMIT_IDENTITY_FIELDS
+                )
+                if limit_identity_changed:
+                    clear_provider_probe_fields(updated_provider)
+                warnings = _apply_max_output_policy(updated_provider)
+                _validate_provider_thinking(updated_provider)
+                providers[alias] = updated_provider
+                _validate_provider_role_consumers(state, data, scope)
+                _write_scoped_config_data(config_path, data, scope=scope)
+                config_committed = True
+                _append_provider_audit_event(
+                    state,
+                    event_type="provider_update",
+                    alias=alias,
+                    provider_data=updated_provider,
+                )
+            except Exception:
+                if api_key_env_for_rollback is not None and attempted_repo_env_value is not None:
+                    with suppress(Exception):
+                        _rollback_saved_repo_env_value(
+                            env_path,
+                            api_key_env_for_rollback,
+                            attempted_repo_env_value,
+                            previous_repo_env=repo_env,
+                            previous_process_value=previous_process_value,
+                            previous_process_value_exists=previous_process_value_exists,
+                            scope=scope,
+                        )
+                if legacy_env_name_for_restore is not None:
+                    _restore_repo_env_value_best_effort(
+                        env_path,
+                        legacy_env_name_for_restore,
+                        previous_repo_env=repo_env,
+                        scope=scope,
+                    )
+                if config_committed:
+                    _restore_config_snapshot_best_effort(
+                        config_path,
+                        previous_config_data,
+                        existed=previous_config_exists,
+                        scope=scope,
+                    )
+                raise
+            return (
+                True,
+                dict(updated_provider),
+                warnings,
+                _security_config_for_provider_scope(
+                    state,
+                    scope,
+                    data,
+                ),
+            )
+
+    try:
+        updated, persisted, warnings, security_config = await to_thread.run_sync(_persist)
+    except _ProviderBaseUrlError as exc:
+        return _error(f"base_url: {exc}", status=422)
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    except Exception:
+        return _error("provider_persist_failed", status=500)
+    if not updated or persisted is None:
+        return _error("provider_not_found", status=404)
+
+    summary = _build_summary(state, alias, persisted, scope=scope)
+    if summary is None:
+        return _error("provider_summary_unavailable", status=500)
+    verification = await to_thread.run_sync(
+        lambda: _verification_from_provider_probe(
+            alias=alias,
+            provider_data=persisted,
+            api_key=plain_api_key if isinstance(plain_api_key, str) else None,
+            security_config=security_config or SecurityConfig(),
+            workspace_root=state.state_dir.parent,
+        )
+    )
+    return JSONResponse(
+        ProviderMutationResponse.model_validate(
+            {
+                "updated": True,
+                "provider": summary,
+                "warnings": warnings,
+                "verification": verification,
+            }
+        ).model_dump(mode="json")
+    )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/providers/{alias}
+# ---------------------------------------------------------------------------
+
+
+async def delete_provider(request: Request) -> JSONResponse:
+    require_write_token(request)
+    state = serve_state(request)
+    alias = str(request.path_params.get("alias", ""))
+    if not alias:
+        return _error("alias_required", status=422)
+    alias_error = _invalid_alias_response(alias)
+    if alias_error is not None:
+        return alias_error
+
+    try:
+        raw_body = await request.body()
+    except Exception:
+        return _error("invalid_json", status=400)
+    scope: ProviderScope = "repo"
+    if raw_body.strip():
+        try:
+            raw_payload = cast("object", json.loads(raw_body.decode("utf-8")))
+        except Exception:
+            return _error("invalid_json", status=400)
+        if not isinstance(raw_payload, dict):
+            return _error("body_must_be_object", status=400)
+        payload = cast("dict[str, object]", raw_payload)
+        try:
+            scope = _validate_provider_scope(payload.get("scope", "repo"))
+        except _ProviderFieldError as exc:
+            return _error(str(exc), status=422)
+
+    config_path = _config_path(state, scope)
+
+    def _persist() -> tuple[bool, dict[str, Any] | None]:
+        with _provider_scope_write_lock(state, scope, command="serve provider delete"):
+            data, providers = _read_providers_table(config_path)
+            existing = providers.get(alias)
+            if not isinstance(existing, dict):
+                return False, None
+            previous_config_data = deepcopy(data)
+            previous_config_exists = config_path.exists()
+            existing_typed = cast("dict[str, Any]", existing)
+            env_path = _env_path(state, scope)
+            repo_env = load_repo_env_file(env_path)
+            api_key_env = existing_typed.get("api_key_env")
+            env_name_for_restore: str | None = None
+            config_committed = False
+            try:
+                providers.pop(alias)
+                if (
+                    isinstance(api_key_env, str)
+                    and api_key_env.startswith("AHADIFF_")
+                    and api_key_env in repo_env
+                    and api_key_env not in _provider_key_env_names_in_use(providers)
+                ):
+                    _remove_owned_repo_env_value(
+                        env_path,
+                        api_key_env,
+                        repo_env=repo_env,
+                        scope=scope,
+                    )
+                    env_name_for_restore = api_key_env
+                _write_scoped_config_data(config_path, data, scope=scope)
+                config_committed = True
+                _append_provider_audit_event(
+                    state,
+                    event_type="provider_delete",
+                    alias=alias,
+                    provider_data=existing_typed,
+                )
+            except Exception:
+                if env_name_for_restore is not None:
+                    _restore_repo_env_value_best_effort(
+                        env_path,
+                        env_name_for_restore,
+                        previous_repo_env=repo_env,
+                        scope=scope,
+                    )
+                if config_committed:
+                    _restore_config_snapshot_best_effort(
+                        config_path,
+                        previous_config_data,
+                        existed=previous_config_exists,
+                        scope=scope,
+                    )
+                raise
+            return True, dict(existing_typed)
+
+    try:
+        deleted, _persisted = await to_thread.run_sync(_persist)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    except Exception:
+        return _error("provider_persist_failed", status=500)
+    if not deleted:
+        return _error("provider_not_found", status=404)
+
+    return JSONResponse(
+        ProviderDeleteResponse.model_validate({"deleted": True, "alias": alias}).model_dump(
+            mode="json"
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/providers/{alias}/probe
+# ---------------------------------------------------------------------------
+
+
+async def probe_provider_route(request: Request) -> JSONResponse:
+    require_write_token(request)
+    state = serve_state(request)
+    alias = str(request.path_params.get("alias", ""))
+    if not alias:
+        return _error("alias_required", status=422)
+    alias_error = _invalid_alias_response(alias)
+    if alias_error is not None:
+        return alias_error
+
+    try:
+        raw_body = await request.body()
+    except Exception:
+        return _error("invalid_json", status=400)
+    if raw_body.strip():
+        try:
+            raw_payload = cast("object", json.loads(raw_body.decode("utf-8")))
+        except Exception:
+            return _error("invalid_json", status=400)
+        try:
+            body = ProviderProbeRequest.model_validate(raw_payload)
+        except ValidationError as exc:
+            return _validation_error(exc)
+    else:
+        body = ProviderProbeRequest()
+    scope = body.scope
+
+    runner = state.task_runner
+    if runner is None:
+        return error_response(
+            ErrorCode.INTERNAL_ERROR,
+            "task_runner_unavailable",
+            status=503,
+        )
+
+    config_path = _config_path(state, scope)
+    repo_config_path = _config_path(state, "repo")
+
+    def _load_provider() -> tuple[dict[str, Any], SecurityConfig] | None:
+        _data, providers = _read_providers_table(config_path)
+        candidate = providers.get(alias)
+        if not isinstance(candidate, dict):
+            return None
+        candidate_typed = cast("dict[str, Any]", candidate)
+        repo_data = read_config_data(repo_config_path) if repo_config_path.exists() else {}
+        return dict(candidate_typed), _security_config_from_data(repo_data)
+
+    try:
+        loaded = await to_thread.run_sync(_load_provider)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    if loaded is None:
+        return _error("provider_not_found", status=404)
+
+    provider_snapshot, security_config = loaded
+    try:
+        _validate_provider_api_key_env(provider_snapshot.get("api_key_env"))
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    start_fingerprint = provider_core_fingerprint(provider_snapshot)
+    workspace_root = state.state_dir.parent
+
+    async def _probe_task(_handle: TaskHandle) -> dict[str, Any]:
+        try:
+            provider_class = _provider_required_str(provider_snapshot, "provider_class")
+            model_name = _provider_required_str(provider_snapshot, "model_name")
+            model_limits_name = _provider_optional_str(provider_snapshot, "model_limits_name")
+            base_url = _provider_required_str(provider_snapshot, "base_url")
+            api_key_env = _validate_provider_api_key_env(provider_snapshot.get("api_key_env"))
+            validate_provider_base_url(
+                base_url,
+                allowed_local_hosts=(
+                    *local_hosts_for_privacy_mode(security_config, "explicit_remote"),
+                    *local_hosts_for_privacy_mode(security_config, "strict_local"),
+                    *_DEFAULT_LOCAL_HOSTS,
+                ),
+            )
+            api_key = resolve_provider_api_key(api_key_env)
+
+            report = await to_thread.run_sync(
+                lambda: probe_provider(
+                    provider_name=alias,
+                    provider_class=provider_class,
+                    model_name=model_name,
+                    model_limits_name=model_limits_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_key_env=api_key_env,
+                    thinking_level=provider_snapshot.get("thinking_level"),
+                    max_output_tokens=provider_snapshot.get("max_output_tokens"),
+                    workspace_root=workspace_root,
+                    security_config=security_config,
+                    persist_result=False,
+                )
+            )
+        except (ProviderError, ConfigError):
+            return _provider_probe_failed_result(alias)
+        except Exception:
+            return _provider_probe_failed_result(alias)
+
+        persisted = await to_thread.run_sync(
+            lambda: _persist_probe_result_if_current(
+                state=state,
+                config_path=config_path,
+                scope=scope,
+                alias=alias,
+                expected_fingerprint=start_fingerprint,
+                report=report,
+            )
+        )
+        return _probe_report_result(
+            alias=alias,
+            report=report,
+            persisted=persisted,
+            stale=not persisted,
+        )
+
+    global_probe_count = sum(
+        1
+        for info in runner.list_tasks()
+        if info.task_type.startswith("provider_probe:")
+        and info.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+    )
+    if global_probe_count >= _MAX_GLOBAL_PENDING_PROBE_TASKS:
+        return error_response(
+            ErrorCode.RATE_LIMITED,
+            "too_many_pending_provider_probe_tasks",
+            status=503,
+        )
+
+    task_id = runner.submit_if_capacity(
+        f"provider_probe:{alias}",
+        _probe_task,
+        max_pending=_MAX_PENDING_PROVIDER_PROBE_TASKS,
+        thread_backed=True,
+    )
+    if task_id is None:
+        return error_response(
+            ErrorCode.RATE_LIMITED,
+            "too_many_pending_provider_probe_tasks",
+            status=503,
+        )
+    return JSONResponse(
+        ProviderProbeSubmitResponse(
+            task_id=task_id,
+            alias=alias,
+            poll_url=f"/api/tasks/{task_id}",
+        ).model_dump(mode="json"),
+        status_code=202,
+    )
+
+
+async def _read_capped_models_response_body(response: httpx.Response) -> bytes:
+    body = bytearray()
+    total_bytes = 0
+    async for chunk in response.aiter_bytes(chunk_size=65_536):
+        total_bytes += len(chunk)
+        if total_bytes > _MODEL_DISCOVERY_RESPONSE_BYTE_CAP:
+            raise ProviderError(
+                "provider models response exceeded byte cap "
+                f"({_MODEL_DISCOVERY_RESPONSE_BYTE_CAP} bytes)"
+            )
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _fetch_provider_models_payload(
+    *,
+    base_url: str,
+    provider_class: str,
+    api_key: str | None,
+    allowed_local_hosts: tuple[str, ...] = (),
+) -> Any:
+    stripped_base_url = base_url.strip()
+    try:
+        validated_base_url = validate_provider_base_url(
+            stripped_base_url,
+            allowed_local_hosts=allowed_local_hosts,
+        )
+    except ConfigError as exc:
+        raise ValueError(
+            _provider_base_url_error("invalid provider base_url", stripped_base_url)
+        ) from exc
+
+    models_url = _build_models_url(validated_base_url, provider_class)
+    headers: dict[str, str] = {"Accept-Encoding": "identity"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request_url = models_url
+    stream_extensions: dict[str, Any] | None = None
+    try:
+        request_target = provider_module.transport_target_for_base_url(
+            models_url,
+            local_hosts=allowed_local_hosts,
+        )
+        if request_target == "remote":
+            pinned_ip = provider_module.validate_remote_url(models_url)
+            if pinned_ip is not None:
+                request_url, original_host, sni_hostname = provider_module._pin_url_to_ip(  # pyright: ignore[reportPrivateUsage]
+                    models_url,
+                    pinned_ip,
+                )
+                headers["Host"] = original_host
+                if sni_hostname is not None:
+                    stream_extensions = {"sni_hostname": sni_hostname.encode("ascii")}
+        elif request_target != "local":
+            raise SafetyError(f"unknown provider transport target {request_target!r}")
+    except SafetyError as exc:
+        raise ValueError(
+            _provider_base_url_error("provider base_url is not allowed", stripped_base_url)
+        ) from exc
+
+    async with (
+        httpx.AsyncClient(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=_MODEL_DISCOVERY_TIMEOUT_SECONDS,
+        ) as client,
+        client.stream(
+            "GET",
+            request_url,
+            headers=headers,
+            extensions=stream_extensions,
+        ) as response,
+    ):
+        if response.is_redirect:
+            raise ProviderError("provider redirects are not allowed")
+        response.raise_for_status()
+        raw_body = await _read_capped_models_response_body(response)
+        buffered_headers = httpx.Headers(
+            [
+                (key, value)
+                for key, value in response.headers.raw
+                if key.lower() not in (b"content-encoding", b"transfer-encoding")
+            ]
+        )
+        buffered_response = httpx.Response(
+            response.status_code,
+            headers=buffered_headers,
+            content=raw_body,
+            request=response.request,
+            extensions=response.extensions,
+        )
+    return buffered_response.json()
+
+
+async def discover_models(request: Request) -> JSONResponse:
+    """POST /api/providers/discover-models — discover models from any base_url + api_key."""
+    from .auth import require_write_token
+
+    require_write_token(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("invalid JSON", status=400)
+    if not isinstance(body, dict):
+        return _error("expected JSON object", status=400)
+    body_data = cast("dict[str, object]", body)
+
+    base_url = body_data.get("base_url", "")
+    api_key = body_data.get("api_key", "")
+    provider_class = body_data.get("provider_class", "openai")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return _error("base_url is required", status=400)
+
+    state = serve_state(request)
+    config_path = _config_path(state)
+
+    def _load_allowed_local_hosts() -> tuple[str, ...]:
+        data = read_config_data(config_path) if config_path.exists() else {}
+        return (*_provider_allowed_local_hosts(data), *_DEFAULT_LOCAL_HOSTS)
+
+    try:
+        allowed_local_hosts = await to_thread.run_sync(_load_allowed_local_hosts)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+
+    try:
+        payload = await _fetch_provider_models_payload(
+            base_url=base_url,
+            provider_class=str(provider_class),
+            api_key=api_key if isinstance(api_key, str) and api_key else None,
+            allowed_local_hosts=allowed_local_hosts,
+        )
+    except ValueError as exc:
+        return _error(f"Failed to fetch models: {exc}", status=400)
+    except Exception as exc:
+        return _error(f"Failed to fetch models: {type(exc).__name__}", status=502)
+
+    model_ids = _extract_model_ids(payload, str(provider_class))
+    return JSONResponse({"models": sorted(model_ids)})
+
+
+async def fetch_provider_models(request: Request) -> JSONResponse:
+    """GET /api/providers/{alias}/models — discover models from remote API."""
+    from .auth import require_write_token, serve_state
+
+    require_write_token(request)
+    alias = request.path_params["alias"]
+    state = serve_state(request)
+
+    def _load() -> tuple[dict[str, Any], tuple[str, ...]] | None:
+        loaded = _load_effective_provider_for_read(state, alias)
+        if loaded is None:
+            return None
+        provider_data, data, _scope = loaded
+        allowed_local_hosts = (*_provider_allowed_local_hosts(data), *_DEFAULT_LOCAL_HOSTS)
+        return provider_data, allowed_local_hosts
+
+    try:
+        loaded = await to_thread.run_sync(_load)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    if loaded is None:
+        return _error("provider_not_found", status=404)
+
+    provider_data, allowed_local_hosts = loaded
+    base_url = provider_data.get("base_url", "")
+    api_key_env = provider_data.get("api_key_env", "")
+    provider_class = provider_data.get("provider_class", "openai")
+
+    try:
+        api_key_env = _validate_provider_api_key_env(api_key_env)
+        api_key = resolve_provider_api_key(api_key_env)
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    except Exception:
+        return _error("Failed to resolve API key", status=400)
+
+    try:
+        payload = await _fetch_provider_models_payload(
+            base_url=str(base_url),
+            provider_class=str(provider_class),
+            api_key=api_key,
+            allowed_local_hosts=allowed_local_hosts,
+        )
+    except ValueError as exc:
+        return _error(f"Failed to fetch models: {exc}", status=400)
+    except httpx.HTTPStatusError as exc:
+        return _error(f"Models endpoint returned {exc.response.status_code}", status=502)
+    except Exception as exc:
+        return _error(f"Failed to fetch models: {type(exc).__name__}", status=502)
+
+    model_ids = _extract_model_ids(payload, str(provider_class))
+    return JSONResponse({"models": sorted(model_ids)})
+
+
+async def save_provider_models(request: Request) -> JSONResponse:
+    """PUT /api/providers/{alias}/models — save selected available_models."""
+    from .auth import require_write_token, serve_state
+
+    require_write_token(request)
+    alias = request.path_params["alias"]
+    state = serve_state(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("invalid JSON", status=400)
+    if not isinstance(body, dict):
+        return _error("expected JSON object", status=400)
+    body_data = cast("dict[str, object]", body)
+    try:
+        scope = _validate_provider_scope(body_data.get("scope", "repo"))
+    except _ProviderFieldError as exc:
+        return _error(str(exc), status=422)
+    config_path = _config_path(state, scope)
+    models = body_data.get("models")
+    if not isinstance(models, list):
+        return _error("models must be a list of non-empty strings", status=400)
+    model_items = cast("list[object]", models)
+    if not all(isinstance(item, str) and item.strip() for item in model_items):
+        return _error("models must be a list of non-empty strings", status=400)
+    if len(model_items) > 100:
+        return _error("too many models (max 100)", status=400)
+
+    cleaned = list(dict.fromkeys(cast("str", item).strip() for item in model_items))
+
+    def _persist() -> dict[str, Any] | None:
+        with _provider_scope_write_lock(state, scope, command="serve save-provider-models"):
+            data, providers = _read_providers_table(config_path)
+            raw = providers.get(alias)
+            if not isinstance(raw, dict):
+                return None
+            raw["available_models"] = tuple(cleaned)
+            _write_scoped_config_data(config_path, data, scope=scope)
+            return dict(cast("dict[str, Any]", raw))
+
+    try:
+        result = await to_thread.run_sync(_persist)
+    except ConfigError as exc:
+        return _error(str(exc), status=500)
+    if result is None:
+        return _error("provider_not_found", status=404)
+
+    summary = provider_summary_from_mapping(alias, result, scope=scope)
+    if summary is None:
+        return _error("failed to build summary", status=500)
+    return JSONResponse(summary.model_dump(mode="json"))
+
+
+def _build_models_url(base_url: str, provider_class: str) -> str:
+    """Build the /models endpoint URL for the given provider."""
+    url = base_url.rstrip("/")
+    if provider_class == "ollama":
+        return f"{url}/api/tags"
+    if url.endswith("/v1"):
+        return f"{url}/models"
+    return f"{url}/v1/models"
+
+
+def _extract_model_ids(payload: Any, provider_class: str) -> list[str]:
+    """Extract model IDs from provider-specific response format."""
+    if not isinstance(payload, dict):
+        return []
+    payload_mapping = cast("Mapping[str, object]", payload)
+    if provider_class == "ollama":
+        models = payload_mapping.get("models", [])
+        if not isinstance(models, list):
+            return []
+        model_items = cast("list[object]", models)
+        return [
+            str(model_mapping["name"])
+            for model in model_items
+            if isinstance(model, dict)
+            and isinstance((model_mapping := cast("Mapping[str, object]", model)).get("name"), str)
+            and model_mapping["name"]
+        ]
+    data = payload_mapping.get("data", [])
+    if not isinstance(data, list):
+        return []
+    data_items = cast("list[object]", data)
+    return [
+        str(model_mapping["id"])
+        for model in data_items
+        if isinstance(model, dict)
+        and isinstance((model_mapping := cast("Mapping[str, object]", model)).get("id"), str)
+        and model_mapping["id"]
+    ]
+
+
+__all__ = [
+    "build_model_limits_response",
+    "create_provider",
+    "delete_provider",
+    "discover_models",
+    "fetch_provider_models",
+    "get_provider_model_limits",
+    "preview_provider_model_limits",
+    "probe_provider_route",
+    "save_provider_models",
+    "update_provider",
+]

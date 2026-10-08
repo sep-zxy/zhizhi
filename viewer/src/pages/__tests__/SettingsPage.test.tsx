@@ -1,0 +1,471 @@
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import type { ConfigResponse, ProviderSummary } from '../../api/config';
+import { quizConfigSchema, configResponseSchema, configUpdateResponseSchema } from '../../api/schemas';
+import {
+  buildProviderConfigUpdatePayload,
+  clampQuizCountInput,
+  effectiveModelProvider,
+  isPreferencesFormDirty,
+  modelOptionsForProvider,
+  nextModelForProviderSelection,
+  providerFormFromConfig,
+  providerFormsEqual,
+  preferencesFormFromConfig,
+  type ProviderForm,
+} from '../SettingsPage';
+
+function makeProvider(overrides: Partial<ProviderSummary> = {}): ProviderSummary {
+  return {
+    alias: 'gpt',
+    provider_class: 'openai_responses',
+    provider_kind: 'openai_responses',
+    model_name: 'gpt-5.5',
+    base_url: 'https://api.openai.com/v1',
+    api_key_env: 'AHADIFF_PROVIDER_API_KEY',
+    key_status: 'configured',
+    probed: true,
+    probed_max_context: 1_000_000,
+    available_models: ['gpt-5.5', 'gpt-5.4-mini'],
+    ...overrides,
+  };
+}
+
+function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
+  return {
+    lang: 'zh-CN',
+    privacy_mode: 'strict_local',
+    generate_provider: '',
+    generate_model: 'gpt-5.4-mini',
+    judge_provider: '',
+    judge_model: 'gpt-5.4-mini',
+    serve_port: 8765,
+    key_status: {},
+    capture: {
+      max_files: 30,
+      hard_limit: 3000,
+      max_patch_bytes: 5_000_000,
+      file_ranking: 'learning_value',
+      symbol_extractor: 'auto',
+    },
+    llm: {
+      input_token_budget: 200_000,
+      output_token_budget: 50_000,
+      request_timeout_seconds: 30,
+      max_concurrent: 3,
+      retry_attempts: 3,
+      output_lang: 'auto',
+    },
+    learn: {
+      learnability_threshold: 0.3,
+      desired_retention: 0.9,
+    },
+    quiz: {
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'fixed',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 12,
+    },
+    ...overrides,
+  };
+}
+
+function formFromConfig(config: ConfigResponse, overrides: Partial<ProviderForm> = {}): ProviderForm {
+  return {
+    ...providerFormFromConfig(config),
+    ...overrides,
+  };
+}
+
+describe('SettingsPage provider/model helpers', () => {
+  it('keeps model limit keys inside the Settings_page namespace', () => {
+    const catalog = JSON.parse(
+      readFileSync(resolve(__dirname, '../../i18n/messages/en.json'), 'utf-8'),
+    ) as Record<string, unknown>;
+    const settings = catalog.Settings_page as Record<string, unknown>;
+
+    expect(settings.model_limits_title).toBe('Model Context Limits');
+    expect(catalog['Settings_page.model_limits_title']).toBeUndefined();
+  });
+
+  it('uses a single provider as the effective auto provider and exposes its models', () => {
+    const provider = makeProvider({
+      available_models: ['gpt-5.5', 'gpt-5.5', 'gpt-5.4-mini'],
+    });
+
+    expect(effectiveModelProvider([provider], '')?.alias).toBe('gpt');
+    expect(modelOptionsForProvider(provider)).toEqual(['gpt-5.5', 'gpt-5.4-mini']);
+    expect(nextModelForProviderSelection([provider], '', 'unknown-model')).toBe('gpt-5.5');
+    expect(nextModelForProviderSelection([provider], '', 'gpt-5.4-mini')).toBe('gpt-5.4-mini');
+  });
+
+  it('keeps auto provider ambiguous when multiple providers exist', () => {
+    const providers = [
+      makeProvider({ alias: 'gpt' }),
+      makeProvider({ alias: 'azure', provider_class: 'azure', model_name: 'gpt-5.5-azure' }),
+    ];
+
+    expect(effectiveModelProvider(providers, '')).toBeUndefined();
+    expect(nextModelForProviderSelection(providers, '', 'manual-model')).toBe('manual-model');
+    expect(effectiveModelProvider(providers, 'azure')?.model_name).toBe('gpt-5.5-azure');
+  });
+
+  it('does not persist default model fields when only LLM limits change', () => {
+    const config = makeConfig();
+    const form = formFromConfig(config, {
+      llm: { ...config.llm, max_concurrent: 4 },
+    });
+
+    expect(buildProviderConfigUpdatePayload(form, config)).toEqual({
+      llm: { max_concurrent: 4 },
+    });
+  });
+
+  it('can save generation and judge models without a provider alias for single-provider auto mode', () => {
+    const config = makeConfig();
+    const form = formFromConfig(config, {
+      generate_model: 'gpt-5.5',
+      judge_model: 'gpt-5.5-judge',
+    });
+
+    expect(buildProviderConfigUpdatePayload(form, config)).toEqual({
+      generate_model: 'gpt-5.5',
+      judge_model: 'gpt-5.5-judge',
+    });
+  });
+
+  it('compares provider form seed values by persisted config instead of object identity', () => {
+    const config = makeConfig();
+    const first = providerFormFromConfig(config);
+    const identityFresh = providerFormFromConfig({
+      ...config,
+      llm: { ...config.llm },
+      learn: { ...config.learn },
+      quiz: { ...config.quiz },
+    });
+
+    expect(providerFormsEqual(first, identityFresh)).toBe(true);
+    expect(providerFormsEqual(first, { ...identityFresh, generate_model: 'gpt-5.5' })).toBe(false);
+    expect(providerFormsEqual(first, {
+      ...identityFresh,
+      llm: { ...identityFresh.llm, max_concurrent: identityFresh.llm.max_concurrent + 1 },
+    })).toBe(false);
+  });
+
+  it('ProviderTab source guards config reseeding during locale-triggered refetches', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('const seededProviderConfigRef = useRef<ProviderForm | null>(null);');
+    expect(src).toContain('if (prev && providerFormsEqual(prev, next)) return;');
+    expect(src).toContain('setForm(next);');
+  });
+
+  it('guards integration actions against unmounting while async work is pending', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('mountedRef.current = true');
+    expect(src).toContain('mountedRef.current = false');
+    expect(src).toContain('copiedResetTimerRef.current !== null');
+    expect(src).toContain('actionAbortControllersRef.current');
+    expect(src).toContain('if (controller.signal.aborted || !mountedRef.current) return;');
+  });
+
+  it('moves focus to only the just-installed target usage panel', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('pendingUsageFocusRef.current = target.name');
+    expect(src).toContain("document.getElementById(`integration-usage-${targetName}`)");
+    expect(src).toContain('panel.focus({ preventScroll: true })');
+    expect(src).toContain('usageCollapsed: shouldFocusUsage ? false : true');
+    expect(src).toContain('usageCollapsed: true');
+    expect(src).toContain('tabIndex={-1}');
+    expect(src).toContain("aria-label={t('Settings_page.integration_usage_region_aria'");
+    expect(src).toContain('state.usageCollapsed === false');
+  });
+});
+
+describe('PreferencesTab quiz count adaptive mode', () => {
+  it('schema accepts new adaptive fields with valid defaults', () => {
+    const parsed = quizConfigSchema.parse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'fixed',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 12,
+    });
+    expect(parsed.quiz_question_count_mode).toBe('fixed');
+    expect(parsed.quiz_auto_range_min).toBe(3);
+    expect(parsed.quiz_auto_range_max).toBe(12);
+  });
+
+  it('schema accepts upper-bound values quiz_question_count=30 and quiz_auto_range_max=30', () => {
+    const parsed = quizConfigSchema.parse({
+      quiz_question_count: 30,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 30,
+    });
+    expect(parsed.quiz_question_count).toBe(30);
+    expect(parsed.quiz_auto_range_max).toBe(30);
+  });
+
+  it('schema accepts auto mode with custom range', () => {
+    const parsed = quizConfigSchema.parse({
+      quiz_question_count: 5,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 2,
+      quiz_auto_range_max: 7,
+    });
+    expect(parsed.quiz_question_count_mode).toBe('auto');
+    expect(parsed.quiz_auto_range_min).toBe(2);
+    expect(parsed.quiz_auto_range_max).toBe(7);
+  });
+
+  it('schema applies defaults when fields are omitted', () => {
+    const parsed = quizConfigSchema.parse({ quiz_question_count: 4 });
+    expect(parsed.quiz_question_count_mode).toBe('fixed');
+    expect(parsed.quiz_auto_range_min).toBe(3);
+    expect(parsed.quiz_auto_range_max).toBe(12);
+  });
+
+  it('schema rejects invalid mode values', () => {
+    const result = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'random',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 12,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('schema accepts quiz_auto_range_max=11 (within new max=30)', () => {
+    const parsed = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 11,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('schema rejects out-of-range auto bounds (>30 / <1)', () => {
+    const tooHigh = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 31,
+    });
+    expect(tooHigh.success).toBe(false);
+
+    const tooLow = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 0,
+      quiz_auto_range_max: 12,
+    });
+    expect(tooLow.success).toBe(false);
+  });
+
+  it('schema rejects min > max via refine guard', () => {
+    const inverted = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 12,
+      quiz_auto_range_max: 3,
+    });
+    expect(inverted.success).toBe(false);
+    if (!inverted.success) {
+      expect(inverted.error.issues.some(i => i.message.includes('<='))).toBe(true);
+    }
+  });
+
+  it('schema strict() rejects unknown extra fields', () => {
+    const withExtra = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'fixed',
+      quiz_auto_range_min: 3,
+      quiz_auto_range_max: 12,
+      unexpected_field: true,
+    });
+    expect(withExtra.success).toBe(false);
+  });
+
+  it('config response schema rejects unknown top-level fields', () => {
+    const withExtra = configResponseSchema.safeParse({
+      lang: 'en',
+      privacy_mode: 'strict_local',
+      generate_model: 'gpt-5.5',
+      judge_model: 'gpt-5.5',
+      serve_port: 8765,
+      capture: {
+        max_files: 30,
+        hard_limit: 3000,
+        max_patch_bytes: 5_000_000,
+        file_ranking: 'learning_value',
+      },
+      llm: {
+        input_token_budget: 200_000,
+        output_token_budget: 50_000,
+        request_timeout_seconds: 30,
+        max_concurrent: 3,
+        retry_attempts: 3,
+      },
+      learn: {},
+      quiz: {
+        quiz_question_count: 3,
+        quiz_question_count_mode: 'fixed',
+        quiz_auto_range_min: 3,
+        quiz_auto_range_max: 12,
+      },
+      unexpected_field: true,
+    });
+    expect(withExtra.success).toBe(false);
+  });
+
+  it('config update response schema rejects unknown top-level fields', () => {
+    expect(configUpdateResponseSchema.safeParse({
+      updated: true,
+      scope: 'session',
+      extra: true,
+    }).success).toBe(false);
+  });
+
+  it('schema accepts min == max as valid (boundary case)', () => {
+    const equal = quizConfigSchema.safeParse({
+      quiz_question_count: 3,
+      quiz_question_count_mode: 'auto',
+      quiz_auto_range_min: 5,
+      quiz_auto_range_max: 5,
+    });
+    expect(equal.success).toBe(true);
+  });
+
+  it('config response schema fills quiz adaptive defaults when quiz block is absent', () => {
+    const minimal = configResponseSchema.parse({
+      lang: 'en',
+      privacy_mode: 'strict_local',
+      generate_model: 'gpt-5.5',
+      judge_model: 'gpt-5.5',
+      serve_port: 8765,
+      capture: {
+        max_files: 30,
+        hard_limit: 3000,
+        max_patch_bytes: 5_000_000,
+        file_ranking: 'learning_value',
+      },
+      llm: {
+        input_token_budget: 200_000,
+        output_token_budget: 50_000,
+        request_timeout_seconds: 30,
+        max_concurrent: 3,
+        retry_attempts: 3,
+      },
+      learn: {},
+    });
+    expect(minimal.quiz.quiz_question_count_mode).toBe('fixed');
+    expect(minimal.quiz.quiz_auto_range_min).toBe(3);
+    expect(minimal.quiz.quiz_auto_range_max).toBe(12);
+  });
+
+  it('clamps quiz number inputs to integer range before saving', () => {
+    expect(clampQuizCountInput('2.5', 3)).toBe(3);
+    expect(clampQuizCountInput('2.4', 3)).toBe(2);
+    expect(clampQuizCountInput('', 12)).toBe(12);
+    expect(clampQuizCountInput('999', 3)).toBe(30);
+    expect(clampQuizCountInput('30', 3)).toBe(30);
+    expect(clampQuizCountInput('31', 3)).toBe(30);
+    expect(clampQuizCountInput('-2', 3)).toBe(1);
+    expect(clampQuizCountInput('NaN', 3)).toBe(3);
+  });
+
+  it('PreferencesTab source renders segmented mode buttons with ARIA semantics', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    // Toggle button group wrapper (W3C pattern: role="group" + aria-pressed buttons)
+    expect(src).toContain("role=\"group\"");
+    expect(src).toContain("aria-label={t('Settings_page.quiz_mode')}");
+
+    // Both mode buttons with aria-pressed
+    expect(src).toContain("aria-pressed={form.quiz_question_count_mode === 'fixed'}");
+    expect(src).toContain("aria-pressed={form.quiz_question_count_mode === 'auto'}");
+
+    // Mode toggle handlers
+    expect(src).toContain("setField('quiz_question_count_mode', 'fixed')");
+    expect(src).toContain("setField('quiz_question_count_mode', 'auto')");
+  });
+
+  it('PreferencesTab source conditionally renders fixed input vs auto-range UI', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    // Conditional render based on mode
+    expect(src).toContain("form.quiz_question_count_mode === 'fixed' ? (");
+
+    // Auto-range descriptor + min/max inputs
+    expect(src).toContain("settings-auto-range__desc");
+    expect(src).toContain("t('Settings_page.quiz_auto_min')");
+    expect(src).toContain("t('Settings_page.quiz_auto_max')");
+
+    // min/max inputs have aria-label (a11y)
+    expect(src).toContain("aria-label={t('Settings_page.quiz_auto_min')}");
+    expect(src).toContain("aria-label={t('Settings_page.quiz_auto_max')}");
+    expect(src).toContain('step={1}');
+  });
+
+  it('PreferencesTab source uses QUIZ_COUNT_MAX = 30 constant for inputs', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('const QUIZ_COUNT_MAX = 30;');
+    expect(src).toContain('max={QUIZ_COUNT_MAX}');
+  });
+
+  it('PreferencesTab source wires aria-describedby for fixed and auto inputs (a11y)', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    // Fixed input -> describedby quiz-fixed-help, with matching id element
+    expect(src).toContain('aria-describedby="quiz-fixed-help"');
+    expect(src).toContain('id="quiz-fixed-help"');
+    expect(src).toContain("t('Settings_page.quiz_fixed_range_help')");
+
+    // Auto inputs -> describedby quiz-auto-help, with matching id element
+    expect(src).toContain('aria-describedby="quiz-auto-help"');
+    expect(src).toContain('id="quiz-auto-help"');
+    expect(src).toContain("t('Settings_page.quiz_auto_range_help')");
+  });
+
+  it('PreferencesTab source clamps auto-range so min <= max bidirectionally', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    // Raising min above max bumps max
+    expect(src).toContain("if (v > form.quiz_auto_range_max)");
+    expect(src).toContain("setField('quiz_auto_range_max', v);");
+
+    // Lowering max below min drops min
+    expect(src).toContain("if (v < form.quiz_auto_range_min)");
+    expect(src).toContain("setField('quiz_auto_range_min', v);");
+  });
+
+  it('PreferencesTab source sends all 4 quiz fields in save payload', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('quiz_question_count: form.quiz_question_count');
+    expect(src).toContain('quiz_question_count_mode: form.quiz_question_count_mode');
+    expect(src).toContain('quiz_auto_range_min: form.quiz_auto_range_min');
+    expect(src).toContain('quiz_auto_range_max: form.quiz_auto_range_max');
+  });
+
+  it('PreferencesTab source includes new fields in dirty check', () => {
+    const src = readFileSync(resolve(__dirname, '../SettingsPage.tsx'), 'utf-8');
+
+    expect(src).toContain('isPreferencesFormDirty(form, config)');
+  });
+
+  it('marks preferences dirty when adaptive quiz fields change from defaults', () => {
+    const config = makeConfig();
+    const form = preferencesFormFromConfig(config);
+
+    expect(isPreferencesFormDirty(form, config)).toBe(false);
+    expect(isPreferencesFormDirty({ ...form, quiz_question_count_mode: 'auto' }, config)).toBe(true);
+    expect(isPreferencesFormDirty({ ...form, quiz_auto_range_min: 4 }, config)).toBe(true);
+    expect(isPreferencesFormDirty({ ...form, quiz_auto_range_max: 13 }, config)).toBe(true);
+  });
+});

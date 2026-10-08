@@ -1,0 +1,1020 @@
+"""Tests for core/watcher.py (Phase 6A)."""
+# pyright: reportPrivateUsage=false, reportUnknownLambdaType=false, reportUnknownArgumentType=false
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import time
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+from watchdog.events import (
+    DirMovedEvent,
+    FileClosedNoWriteEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+    FileOpenedEvent,
+)
+
+from ahadiff import cli as cli_module
+from ahadiff.core.errors import ConfigError
+from ahadiff.core.watcher import (
+    FileWatcher,
+    WatcherConfig,
+    WatchEvent,
+    is_watchdog_available,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+
+class TestIsWatchdogAvailable:
+    def test_returns_bool(self) -> None:
+        result = is_watchdog_available()
+        assert isinstance(result, bool)
+
+    def test_returns_false_when_import_fails(self) -> None:
+        with patch("importlib.util.find_spec", return_value=None):
+            assert is_watchdog_available() is False
+
+
+class TestWatcherConfig:
+    def test_defaults(self) -> None:
+        config = WatcherConfig()
+        assert config.debounce_seconds == 2.0
+        assert config.cooldown_seconds == 30.0
+        assert config.ignore_patterns == ()
+
+    def test_custom_values(self) -> None:
+        config = WatcherConfig(
+            debounce_seconds=0.5,
+            cooldown_seconds=10.0,
+            ignore_patterns=("*.log", "build"),
+        )
+        assert config.debounce_seconds == 0.5
+        assert config.cooldown_seconds == 10.0
+        assert config.ignore_patterns == ("*.log", "build")
+
+    def test_frozen(self) -> None:
+        config = WatcherConfig()
+        with pytest.raises(AttributeError):
+            config.debounce_seconds = 5.0  # type: ignore[misc]
+
+
+class TestWatchEvent:
+    def test_fields(self) -> None:
+        event = WatchEvent(
+            changed_paths=frozenset({"a.py", "b.py"}),
+            timestamp=123.456,
+        )
+        assert len(event.changed_paths) == 2
+        assert event.timestamp == 123.456
+
+    def test_frozen(self) -> None:
+        event = WatchEvent(changed_paths=frozenset(), timestamp=0.0)
+        with pytest.raises(AttributeError):
+            event.timestamp = 1.0  # type: ignore[misc]
+
+
+class TestFileWatcherInit:
+    def test_raises_when_watchdog_not_available(self, tmp_path: Path) -> None:
+        with (
+            patch("ahadiff.core.watcher.is_watchdog_available", return_value=False),
+            pytest.raises(ConfigError, match="watchdog is required for --watch"),
+        ):
+            FileWatcher(tmp_path, on_change=lambda _: None)
+
+    def test_raises_for_nonexistent_path(self, tmp_path: Path) -> None:
+        missing = tmp_path / "does_not_exist"
+        with (
+            patch("ahadiff.core.watcher.is_watchdog_available", return_value=True),
+            pytest.raises(ConfigError, match="not a directory"),
+        ):
+            FileWatcher(missing, on_change=lambda _: None)
+
+    def test_raises_for_file_path(self, tmp_path: Path) -> None:
+        filepath = tmp_path / "file.txt"
+        filepath.write_text("content")
+        with (
+            patch("ahadiff.core.watcher.is_watchdog_available", return_value=True),
+            pytest.raises(ConfigError, match="not a directory"),
+        ):
+            FileWatcher(filepath, on_change=lambda _: None)
+
+    def test_accepts_valid_directory(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert not watcher.is_running
+
+
+class TestFileWatcherIgnorePatterns:
+    def test_ignores_git_directory(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / ".git" / "objects" / "abc"))
+
+    def test_ignores_ahadiff_directory(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / ".ahadiff" / "review.sqlite"))
+
+    def test_ignores_graphify_out_directory(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / "graphify-out" / "graph.json"))
+
+    def test_ignores_watch_root_path(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path))
+
+    def test_ignores_pycache(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / "__pycache__" / "mod.pyc"))
+
+    def test_ignores_pyc_files(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / "module.pyc"))
+
+    def test_ignores_node_modules(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / "node_modules" / "pkg" / "index.js"))
+
+    def test_does_not_ignore_source_files(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert not watcher._should_ignore(str(tmp_path / "src" / "app.py"))
+
+    def test_custom_ignore_patterns(self, tmp_path: Path) -> None:
+        config = WatcherConfig(ignore_patterns=("*.log", "build"))
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None, config=config)
+            assert watcher._should_ignore(str(tmp_path / "output.log"))
+            assert watcher._should_ignore(str(tmp_path / "build" / "dist.js"))
+            assert not watcher._should_ignore(str(tmp_path / "src" / "main.py"))
+
+    def test_custom_nested_ignore_pattern_accepts_windows_separator(self, tmp_path: Path) -> None:
+        config = WatcherConfig(ignore_patterns=(r"src\generated\*",))
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None, config=config)
+            assert watcher._should_ignore(str(tmp_path / "src" / "generated" / "client.py"))
+            assert not watcher._should_ignore(str(tmp_path / "src" / "main.py"))
+
+    def test_ignores_path_outside_watch_root(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore("/some/other/path/file.py")
+
+    def test_ignores_ds_store(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / ".DS_Store"))
+
+    def test_ignores_venv(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            assert watcher._should_ignore(str(tmp_path / ".venv" / "lib" / "site.py"))
+
+
+class TestFileWatcherEventPaths:
+    def test_empty_src_path_is_filtered_when_cwd_is_watch_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(src_path="", dest_path=None)
+
+            assert watcher._changed_event_paths(event) == ()
+
+    def test_empty_src_path_is_filtered_when_cwd_is_not_watch_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        cwd = tmp_path / "cwd"
+        repo_root.mkdir()
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(repo_root, on_change=lambda _: None)
+            event = SimpleNamespace(src_path="", dest_path=None)
+
+            assert watcher._changed_event_paths(event) == ()
+
+    def test_whitespace_only_path_is_filtered_before_resolve(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(src_path="   ", dest_path=None)
+
+            assert watcher._changed_event_paths(event) == ()
+
+    def test_empty_dest_path_is_filtered(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(src_path=str(tmp_path / "src" / "main.py"), dest_path="")
+
+            assert watcher._changed_event_paths(event) == (str(tmp_path / "src" / "main.py"),)
+
+    def test_move_event_includes_dest_path(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(
+                src_path=str(tmp_path / "old.py"),
+                dest_path=str(tmp_path / "new.py"),
+            )
+            assert watcher._changed_event_paths(event) == (
+                str(tmp_path / "old.py"),
+                str(tmp_path / "new.py"),
+            )
+
+    def test_bytes_src_path_is_decoded_before_filtering(self, tmp_path: Path) -> None:
+        changed = tmp_path / "src" / "main.py"
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(
+                src_path=os.fsencode(changed),
+                dest_path=None,
+            )
+
+            assert watcher._changed_event_paths(event) == (str(changed),)
+
+    def test_move_event_keeps_non_ignored_dest_path(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            event = SimpleNamespace(
+                src_path=str(tmp_path / ".ahadiff" / "tmp.py"),
+                dest_path=str(tmp_path / "src" / "main.py"),
+            )
+            assert watcher._changed_event_paths(event) == (str(tmp_path / "src" / "main.py"),)
+
+    def test_directory_move_event_is_not_discarded(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda _: None,
+                config=WatcherConfig(debounce_seconds=60.0),
+            )
+            event = DirMovedEvent(str(tmp_path / "old_pkg"), str(tmp_path / "new_pkg"))
+
+            try:
+                watcher._handle_fs_event(event)
+
+                assert watcher._drain_pending() == frozenset(
+                    {
+                        str(tmp_path / "old_pkg"),
+                        str(tmp_path / "new_pkg"),
+                    }
+                )
+            finally:
+                watcher.stop()
+
+    @pytest.mark.parametrize("event_class", [FileOpenedEvent, FileClosedNoWriteEvent])
+    def test_read_events_do_not_schedule_learning(
+        self,
+        tmp_path: Path,
+        event_class: type[FileOpenedEvent | FileClosedNoWriteEvent],
+    ) -> None:
+        watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+        with patch.object(watcher, "_schedule_trigger") as schedule:
+            watcher._handle_fs_event(event_class(str(tmp_path / "source.py")))
+
+        assert watcher._drain_pending() == frozenset()
+        schedule.assert_not_called()
+
+    @pytest.mark.parametrize("event_class", [FileCreatedEvent, FileModifiedEvent, FileDeletedEvent])
+    def test_content_events_schedule_learning(
+        self,
+        tmp_path: Path,
+        event_class: type[FileCreatedEvent | FileModifiedEvent | FileDeletedEvent],
+    ) -> None:
+        source = str(tmp_path / "source.py")
+        watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+        with patch.object(watcher, "_schedule_trigger") as schedule:
+            watcher._handle_fs_event(event_class(source))
+
+        assert watcher._drain_pending() == frozenset({source})
+        schedule.assert_called_once()
+
+    def test_file_move_schedules_both_paths(self, tmp_path: Path) -> None:
+        source, dest = str(tmp_path / "old.py"), str(tmp_path / "new.py")
+        watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+        with patch.object(watcher, "_schedule_trigger") as schedule:
+            watcher._handle_fs_event(FileMovedEvent(source, dest))
+
+        assert watcher._drain_pending() == frozenset({source, dest})
+        schedule.assert_called_once()
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux inotify")
+    def test_reading_source_in_callback_does_not_trigger_another_learn(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "source.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        first_callback = threading.Event()
+        repeated_callback = threading.Event()
+
+        def read_changed_source(_event: WatchEvent) -> None:
+            source.read_text(encoding="utf-8")
+            if first_callback.is_set():
+                repeated_callback.set()
+            first_callback.set()
+
+        watcher = FileWatcher(
+            tmp_path,
+            on_change=read_changed_source,
+            config=WatcherConfig(debounce_seconds=0.05, cooldown_seconds=0.1),
+        )
+        watcher.start()
+        try:
+            source.write_text("value = 2\n", encoding="utf-8")
+            assert first_callback.wait(timeout=3)
+            assert not repeated_callback.wait(timeout=0.5)
+        finally:
+            watcher.stop()
+
+
+class TestFileWatcherDrainPending:
+    def test_drain_returns_and_clears(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            watcher._pending_paths.add("a.py")
+            watcher._pending_paths.add("b.py")
+            drained = watcher._drain_pending()
+            assert drained == frozenset({"a.py", "b.py"})
+            assert watcher._drain_pending() == frozenset()
+
+
+class TestFileWatcherTrigger:
+    def test_trigger_calls_on_change(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add(str(tmp_path / "file.py"))
+            watcher._trigger()
+            assert len(received) == 1
+            assert str(tmp_path / "file.py") in received[0].changed_paths
+
+    def test_trigger_empty_pending_does_nothing(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._trigger()
+            assert len(received) == 0
+
+    def test_trigger_respects_cooldown(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(cooldown_seconds=100.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._last_trigger_time = time.monotonic()
+            watcher._trigger()
+            assert len(received) == 0
+
+    def test_trigger_clears_pending(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda _: None,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._trigger()
+            assert len(watcher._pending_paths) == 0
+
+    def test_trigger_does_not_raise_on_callback_error(self, tmp_path: Path) -> None:
+        def bad_callback(_event: WatchEvent) -> None:
+            raise RuntimeError("boom")
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=bad_callback,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._trigger()
+
+    def test_failure_threshold_hit_after_consecutive_failures(self, tmp_path: Path) -> None:
+        from ahadiff.core.watcher import _FAILURE_LOG_THRESHOLD
+
+        def bad_callback(_event: WatchEvent) -> None:
+            raise RuntimeError("fail")
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=bad_callback,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            for i in range(_FAILURE_LOG_THRESHOLD):
+                watcher._pending_paths.add(f"file{i}.py")
+                watcher._trigger()
+            status = watcher.status()
+            assert status["failure_threshold_hit"] is True
+            assert status["consecutive_failures"] == _FAILURE_LOG_THRESHOLD
+            assert status["total_failures"] == _FAILURE_LOG_THRESHOLD
+            assert isinstance(status["last_error"], str)
+
+    def test_failure_counter_auto_resets_and_retries(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+
+        def callback(e: WatchEvent) -> None:
+            received.append(e)
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=callback,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            with watcher._lock:
+                watcher._failure_threshold_hit = True
+                watcher._consecutive_failures = 5
+            watcher._pending_paths.add("retry.py")
+            watcher._trigger()
+            assert len(received) == 1
+            assert watcher.status()["failure_threshold_hit"] is False
+            assert watcher.status()["consecutive_failures"] == 0
+
+    def test_failure_count_resets(self, tmp_path: Path) -> None:
+        def bad_callback(_event: WatchEvent) -> None:
+            raise RuntimeError("fail")
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=bad_callback,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._trigger()
+            assert watcher.status()["consecutive_failures"] == 1
+            watcher.reset_failure_count()
+            assert watcher.status()["consecutive_failures"] == 0
+            assert watcher.status()["failure_threshold_hit"] is False
+
+    def test_success_resets_consecutive_failures(self, tmp_path: Path) -> None:
+        call_count = 0
+
+        def mixed_callback(_event: WatchEvent) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise RuntimeError("fail")
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=mixed_callback,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._trigger()
+            watcher._pending_paths.add("b.py")
+            watcher._trigger()
+            assert watcher.status()["consecutive_failures"] == 2
+            watcher._pending_paths.add("c.py")
+            watcher._trigger()
+            assert watcher.status()["consecutive_failures"] == 0
+            assert watcher.status()["total_failures"] == 2
+            assert watcher.status()["total_triggers"] == 3
+
+    def test_status_includes_error_tracking_fields(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: None,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            status = watcher.status()
+            assert "consecutive_failures" in status
+            assert "total_triggers" in status
+            assert "total_failures" in status
+            assert "last_error" in status
+            assert "failure_threshold_hit" in status
+
+    def test_trigger_skipped_when_stopped(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._stopped.set()
+            watcher._trigger()
+            assert len(received) == 0
+
+    def test_stop_completes_after_callback_gate_released(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._callback_gate.acquire()
+
+            stop_done = threading.Event()
+
+            def do_stop() -> None:
+                watcher.stop(timeout=1.0)
+                stop_done.set()
+
+            stop_thread = threading.Thread(target=do_stop)
+            stop_thread.start()
+            time.sleep(0.05)
+
+            watcher._callback_gate.release()
+            assert stop_done.wait(timeout=3.0), "stop() did not complete"
+            stop_thread.join(timeout=1.0)
+
+            assert not stop_thread.is_alive()
+            assert received == []
+
+    def test_trigger_does_not_block_when_callback_gate_busy(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda e: received.append(e),
+                config=WatcherConfig(debounce_seconds=60.0, cooldown_seconds=0.0),
+            )
+            watcher._pending_paths.add("a.py")
+            watcher._callback_gate.acquire()
+
+            trigger_thread = threading.Thread(target=watcher._trigger)
+            trigger_thread.start()
+            trigger_thread.join(timeout=0.5)
+
+            assert not trigger_thread.is_alive()
+            assert watcher._drain_pending() == frozenset({"a.py"})
+            assert received == []
+
+            watcher.stop()
+            watcher._callback_gate.release()
+
+    def test_stop_does_not_block_indefinitely_when_callback_hangs(self, tmp_path: Path) -> None:
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(
+                tmp_path,
+                on_change=lambda _: None,
+                config=WatcherConfig(cooldown_seconds=0.0),
+            )
+            watcher._callback_gate.acquire()
+
+            stop_thread = threading.Thread(target=lambda: watcher.stop(timeout=0.3))
+            stop_thread.start()
+            stop_thread.join(timeout=2.0)
+
+            assert not stop_thread.is_alive(), "stop() blocked indefinitely"
+            watcher._callback_gate.release()
+
+
+class TestFileWatcherStartStop:
+    @pytest.mark.skipif(not is_watchdog_available(), reason="watchdog unavailable")
+    def test_start_and_stop(self, tmp_path: Path) -> None:
+        watcher = FileWatcher(
+            tmp_path,
+            on_change=lambda _: None,
+            config=WatcherConfig(debounce_seconds=0.1),
+        )
+        watcher.start()
+        assert watcher.is_running
+        watcher.stop()
+        assert not watcher.is_running
+
+    @pytest.mark.skipif(not is_watchdog_available(), reason="watchdog unavailable")
+    def test_double_start_raises(self, tmp_path: Path) -> None:
+        watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+        watcher.start()
+        try:
+            with pytest.raises(ConfigError, match="already running"):
+                watcher.start()
+        finally:
+            watcher.stop()
+
+    @pytest.mark.skipif(not is_watchdog_available(), reason="watchdog unavailable")
+    def test_detects_file_change(self, tmp_path: Path) -> None:
+        received: list[WatchEvent] = []
+        barrier = threading.Event()
+
+        def on_change(event: WatchEvent) -> None:
+            received.append(event)
+            barrier.set()
+
+        watcher = FileWatcher(
+            tmp_path,
+            on_change=on_change,
+            config=WatcherConfig(debounce_seconds=0.1, cooldown_seconds=0.0),
+        )
+        watcher.start()
+        try:
+            (tmp_path / "test_file.py").write_text("hello")
+            barrier.wait(timeout=5.0)
+            assert len(received) >= 1
+        finally:
+            watcher.stop()
+
+    def test_stop_timeout_marks_watcher_non_restartable(self, tmp_path: Path) -> None:
+        class _HungObserver:
+            def stop(self) -> None:
+                return None
+
+            def join(self, timeout: float | None = None) -> None:
+                return None
+
+            def is_alive(self) -> bool:
+                return True
+
+        with patch("ahadiff.core.watcher.is_watchdog_available", return_value=True):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            watcher._observer = _HungObserver()
+            watcher.stop()
+
+            status = watcher.status()
+            assert status["running"] is False
+            assert status["stop_timed_out"] is True
+            assert status["restartable"] is False
+
+            with pytest.raises(ConfigError, match="did not stop cleanly"):
+                watcher.start()
+
+    def test_dead_observer_is_not_reported_as_running_and_can_restart(self, tmp_path: Path) -> None:
+        class _DeadObserver:
+            def is_alive(self) -> bool:
+                return False
+
+        started_observers: list[object] = []
+
+        class _FakeObserver:
+            def schedule(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            def start(self) -> None:
+                started_observers.append(self)
+
+            def stop(self) -> None:
+                return None
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return False
+
+        def _fake_import_module(name: str) -> SimpleNamespace:
+            if name == "watchdog.events":
+                return SimpleNamespace(FileSystemEventHandler=object)
+            if name == "watchdog.observers":
+                return SimpleNamespace(Observer=_FakeObserver)
+            raise AssertionError(f"unexpected module import: {name}")
+
+        with (
+            patch("ahadiff.core.watcher.is_watchdog_available", return_value=True),
+            patch("ahadiff.core.watcher.importlib.import_module", _fake_import_module),
+        ):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+            watcher._observer = _DeadObserver()
+
+            status = watcher.status()
+            assert status["running"] is False
+            assert status["restartable"] is True
+            assert status["stop_timed_out"] is False
+
+            watcher.start()
+            assert len(started_observers) == 1
+            watcher.stop()
+
+    def test_fsevents_observer_falls_back_to_polling_observer(self, tmp_path: Path) -> None:
+        started_observers: list[object] = []
+
+        class _FseventsObserver:
+            __module__ = "watchdog.observers.fsevents"
+
+        class _PollingObserver:
+            def schedule(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            def start(self) -> None:
+                started_observers.append(self)
+
+            def stop(self) -> None:
+                return None
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return False
+
+        def _fake_import_module(name: str) -> SimpleNamespace:
+            if name == "watchdog.events":
+                return SimpleNamespace(FileSystemEventHandler=object)
+            if name == "watchdog.observers":
+                return SimpleNamespace(Observer=_FseventsObserver)
+            if name == "watchdog.observers.polling":
+                return SimpleNamespace(PollingObserver=_PollingObserver)
+            raise AssertionError(f"unexpected module import: {name}")
+
+        with (
+            patch("ahadiff.core.watcher.is_watchdog_available", return_value=True),
+            patch("ahadiff.core.watcher.importlib.import_module", _fake_import_module),
+        ):
+            watcher = FileWatcher(tmp_path, on_change=lambda _: None)
+
+            watcher.start()
+            watcher.stop()
+
+        assert len(started_observers) == 1
+        assert isinstance(started_observers[0], _PollingObserver)
+
+    def test_cli_stop_status_does_not_report_timeout_as_clean_stop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        messages: list[str] = []
+
+        class _Console:
+            def print(self, message: str) -> None:
+                messages.append(message)
+
+        monkeypatch.setattr(cli_module, "console", _Console())
+
+        cli_module._print_watcher_stop_status(
+            SimpleNamespace(status=lambda: {"stop_timed_out": True})
+        )
+
+        assert messages == [
+            "[yellow]Watcher stop timed out; observer may still be running[/yellow]"
+        ]
+
+
+class TestWatchLearnRunner:
+    def _wait_until(self, predicate: Callable[[], bool], *, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
+
+    def test_post_watch_learn_request_includes_changed_paths(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            status_code = 202
+
+        def fake_post(
+            url: str,
+            *,
+            json: object,
+            headers: dict[str, str],
+            timeout: float,
+        ) -> FakeResponse:
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr("httpx.post", fake_post)
+
+        status_code = cli_module._post_watch_learn_request(
+            "http://127.0.0.1:8765",
+            "test-token",
+            frozenset({"src/app.py", "tests/test_app.py"}),
+        )
+
+        assert status_code == 202
+        assert captured["url"] == "http://127.0.0.1:8765/api/learn"
+        payload = captured["json"]
+        assert isinstance(payload, dict)
+        assert set(payload["changed_paths"]) == {"src/app.py", "tests/test_app.py"}
+        assert payload["unstaged"] is True
+        assert payload["include_untracked"] is True
+        assert captured["headers"] == {
+            "X-AhaDiff-Token": "test-token",
+            "Origin": "http://127.0.0.1:8765",
+        }
+        assert captured["timeout"] == 5.0
+
+    def test_run_watch_learn_passes_changed_paths_to_request(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import ahadiff.core.orchestrator as orchestrator_module
+
+        captured: dict[str, Any] = {}
+
+        def fake_run_learn_pipeline(request: object, **kwargs: object) -> SimpleNamespace:
+            captured["request"] = request
+            captured["kwargs"] = kwargs
+            progress = kwargs.get("on_progress")
+            assert callable(progress)
+            progress(2, 10, "Capturing diff")
+            return SimpleNamespace(
+                status="completed",
+                overall=None,
+                recoverable_errors=(),
+                warnings=(),
+            )
+
+        monkeypatch.setattr(orchestrator_module, "run_learn_pipeline", fake_run_learn_pipeline)
+
+        ok = cli_module._run_watch_learn(
+            tmp_path,
+            True,
+            False,
+            None,
+            frozenset({"src/app.py"}),
+        )
+
+        assert ok is True
+        request = captured["request"]
+        assert request.changed_paths == ("src/app.py",)
+        assert request.unstaged is True
+        assert request.include_untracked is True
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert callable(kwargs["on_progress"])
+
+    def test_retriggers_after_change_queued_during_run(self) -> None:
+        first_started = threading.Event()
+        finish_first = threading.Event()
+        second_done = threading.Event()
+        run_lock = threading.Lock()
+        run_count = 0
+        seen_paths: list[frozenset[str]] = []
+
+        def run_learn(changed_paths: frozenset[str]) -> bool:
+            nonlocal run_count
+            with run_lock:
+                run_count += 1
+                current = run_count
+                seen_paths.append(changed_paths)
+            if current == 1:
+                first_started.set()
+                assert finish_first.wait(timeout=2.0)
+            else:
+                second_done.set()
+            return True
+
+        runner = cli_module._WatchLearnRunner(run_learn)
+        runner.request(WatchEvent(changed_paths=frozenset({"a.py"}), timestamp=1.0))
+        assert first_started.wait(timeout=2.0)
+
+        started = time.monotonic()
+        runner.request(WatchEvent(changed_paths=frozenset({"b.py"}), timestamp=2.0))
+        assert time.monotonic() - started < 0.5
+
+        finish_first.set()
+        assert second_done.wait(timeout=2.0)
+        runner.stop()
+        with run_lock:
+            assert run_count == 2
+            assert seen_paths == [frozenset({"a.py"}), frozenset({"b.py"})]
+
+    def test_stop_clears_running_state_when_learn_hangs(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def run_learn(_changed_paths: frozenset[str]) -> bool:
+            started.set()
+            release.wait()
+            return True
+
+        runner = cli_module._WatchLearnRunner(run_learn, run_timeout_seconds=10.0)
+        runner.request(WatchEvent(changed_paths=frozenset({"a.py"}), timestamp=1.0))
+        assert started.wait(timeout=2.0)
+
+        runner.stop()
+
+        assert self._wait_until(lambda: not runner._running)
+        assert runner._retrigger_pending is False
+        release.set()
+
+    def test_stop_during_retry_delay_clears_queued_retrigger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(cli_module, "_WATCH_RETRY_DELAYS", (5.0,))
+        started = threading.Event()
+        release = threading.Event()
+        run_lock = threading.Lock()
+        run_count = 0
+
+        def run_learn(_changed_paths: frozenset[str]) -> bool:
+            nonlocal run_count
+            with run_lock:
+                run_count += 1
+            started.set()
+            assert release.wait(timeout=2.0)
+            return False
+
+        runner = cli_module._WatchLearnRunner(run_learn)
+        runner.request(WatchEvent(changed_paths=frozenset({"a.py"}), timestamp=1.0))
+        assert started.wait(timeout=2.0)
+
+        runner.request(WatchEvent(changed_paths=frozenset({"b.py"}), timestamp=2.0))
+        assert self._wait_until(lambda: runner._retrigger_pending is True)
+
+        release.set()
+        assert self._wait_until(lambda: runner._consecutive_failures == 1 and runner._running)
+
+        runner.stop()
+
+        assert self._wait_until(lambda: not runner._running)
+        assert runner._retrigger_pending is False
+        with run_lock:
+            assert run_count == 1
+
+    def test_timeout_keeps_runner_busy_until_draining_learn_finishes(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        first_done = threading.Event()
+        run_lock = threading.Lock()
+        run_count = 0
+        active_count = 0
+        max_active = 0
+
+        def run_learn(_changed_paths: frozenset[str]) -> bool:
+            nonlocal active_count, max_active, run_count
+            with run_lock:
+                run_count += 1
+                active_count += 1
+                max_active = max(max_active, active_count)
+                current = run_count
+            try:
+                if current == 1:
+                    first_started.set()
+                    release_first.wait()
+                    first_done.set()
+                return True
+            finally:
+                with run_lock:
+                    active_count -= 1
+
+        runner = cli_module._WatchLearnRunner(run_learn, run_timeout_seconds=0.05)
+        runner.request(WatchEvent(changed_paths=frozenset({"a.py"}), timestamp=1.0))
+        assert first_started.wait(timeout=2.0)
+        time.sleep(0.15)
+
+        runner.request(WatchEvent(changed_paths=frozenset({"b.py"}), timestamp=2.0))
+
+        assert self._wait_until(lambda: runner._retrigger_pending is True)
+        assert runner._running is True
+        with run_lock:
+            assert run_count == 1
+            assert max_active == 1
+        release_first.set()
+        assert first_done.wait(timeout=2.0)
+        assert self._wait_until(lambda: not runner._running)
+        runner.stop()
+        with run_lock:
+            assert run_count == 2
+            assert max_active == 1

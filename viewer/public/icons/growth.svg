@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">知枝</title>
+  <desc id="desc">Git 分支长出新叶：从代码实践中长出自己的知识。</desc>
+  <rect width="128" height="128" rx="28" fill="#0F766E"/>
+  <g fill="none" stroke="#F4FAF8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M46 88V47M46 74H66C82 74 88 62 88 47"/>
+    <circle cx="46" cy="96" r="9"/>
+    <circle cx="46" cy="36" r="9"/>
+  </g>
+  <path d="M84 47C72 47 65 40 65 28C77 28 84 35 84 47ZM91 39C91 27 98 20 110 20C110 32 103 39 91 39Z" fill="#F4FAF8"/>
+</svg>

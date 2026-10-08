@@ -1,0 +1,30 @@
+{
+  "name": "知枝",
+  "short_name": "知枝",
+  "description": "从代码实践中长出自己的知识",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F4FAF8",
+  "theme_color": "#F4FAF8",
+  "icons": [
+    {
+      "src": "./icons/growth-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/growth-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/growth.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

@@ -1,0 +1,1193 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  startLearnTask,
+  estimateLearn,
+  getTask,
+  cancelTask,
+  listTasks,
+  subscribeTaskProgress,
+} from '../api/tasks';
+import { ApiError } from '../api/client';
+import { useRunsStore } from './runs-store';
+import { useLearnStore } from './learn-store';
+import type { LearnEstimateResponse, LearnSubmitPayload, TaskInfoResponse, TaskSubmitResponse } from '../api/types';
+
+const graphInvalidateMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../api/tasks', () => ({
+  startLearnTask: vi.fn(),
+  estimateLearn: vi.fn(),
+  getTask: vi.fn(),
+  cancelTask: vi.fn(),
+  listTasks: vi.fn(),
+  subscribeTaskProgress: vi.fn(),
+}));
+
+vi.mock('./graph-store', () => ({
+  useGraphStore: {
+    getState: () => ({ invalidate: graphInvalidateMock }),
+  },
+}));
+
+const mockedStartLearnTask = vi.mocked(startLearnTask);
+const mockedEstimateLearn = vi.mocked(estimateLearn);
+const mockedGetTask = vi.mocked(getTask);
+const mockedCancelTask = vi.mocked(cancelTask);
+const mockedListTasks = vi.mocked(listTasks);
+const mockedSubscribeTaskProgress = vi.mocked(subscribeTaskProgress);
+
+function makeTaskInfo(overrides: Partial<TaskInfoResponse> = {}): TaskInfoResponse {
+  return {
+    task_id: 'task-1',
+    task_type: 'learn',
+    status: 'running',
+    progress: { current: 0, total: 10, message: '', step_started_at: '' },
+    result_summary: null,
+    error: null,
+    error_code: null,
+    created_at: '2026-05-01T00:00:00Z',
+    started_at: null,
+    completed_at: null,
+    elapsed_seconds: null,
+    recovery_hint: null,
+    ...overrides,
+  };
+}
+
+function makeEstimate(overrides: Partial<LearnEstimateResponse> = {}): LearnEstimateResponse {
+  return {
+    patch_bytes: 32,
+    file_count: 1,
+    total_lines: 4,
+    estimated_tokens: 16,
+    provider_context_window: 8192,
+    provider_max_output: null,
+    risk_level: 'ok',
+    warnings: [],
+    ...overrides,
+  };
+}
+
+describe('learn store', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    useLearnStore.setState({
+      phase: 'idle',
+      taskId: null,
+      task: null,
+      estimate: null,
+      error: null,
+      errorCode: null,
+      lastPayload: null,
+      pendingPayload: null,
+      retryable: true,
+    });
+    useRunsStore.setState({ lastLoadedAt: Date.now() });
+    graphInvalidateMock.mockClear();
+    mockedSubscribeTaskProgress.mockReturnValue(null);
+    mockedEstimateLearn.mockResolvedValue(makeEstimate());
+  });
+
+  afterEach(() => {
+    useLearnStore.getState().dismiss();
+    vi.useRealTimers();
+  });
+
+  // ---------- submitLearn ----------
+
+  it('submitLearn transitions from idle to submitting then running', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' } satisfies TaskSubmitResponse);
+
+    const promise = useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('submitting');
+
+    await promise;
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('task-1');
+    expect(mockedStartLearnTask).toHaveBeenCalledWith({});
+  });
+
+  it('submitLearn streams task progress without polling while SSE is active', async () => {
+    const close = vi.fn();
+    let handlers: Parameters<typeof subscribeTaskProgress>[1] | null = null;
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' } satisfies TaskSubmitResponse);
+    mockedSubscribeTaskProgress.mockImplementation((taskId, nextHandlers) => {
+      expect(taskId).toBe('task-1');
+      handlers = nextHandlers;
+      return { close };
+    });
+
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    handlers!.onProgress(
+      makeTaskInfo({
+        progress: {
+          current: 4,
+          total: 10,
+          message: 'Generating quiz',
+          step_started_at: '2026-05-01T00:00:01Z',
+        },
+      }),
+    );
+    expect(useLearnStore.getState().task?.progress.current).toBe(4);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).not.toHaveBeenCalled();
+
+    handlers!.onProgress(
+      makeTaskInfo({
+        status: 'completed',
+        result_summary: {
+          run_id: 'run-1',
+          status: 'finalized',
+          overall: 91,
+          verdict: 'pass',
+          warnings: [],
+        },
+      }),
+    );
+    expect(useLearnStore.getState().phase).toBe('completed');
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(graphInvalidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('submitLearn falls back to polling when the progress stream errors', async () => {
+    const close = vi.fn();
+    let handlers: Parameters<typeof subscribeTaskProgress>[1] | null = null;
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' } satisfies TaskSubmitResponse);
+    mockedSubscribeTaskProgress.mockImplementation((_taskId, nextHandlers) => {
+      handlers = nextHandlers;
+      return { close };
+    });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ status: 'completed' }));
+
+    await useLearnStore.getState().submitLearn();
+    handlers!.onError(new Error('stream closed'));
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(mockedGetTask).toHaveBeenCalledWith('task-1');
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  it('network failure leaves submission outcome unknown and prevents duplicate retry', async () => {
+    mockedStartLearnTask.mockRejectedValue(new Error('network down'));
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().error).toBeNull();
+    expect(useLearnStore.getState().errorCode).toBe('submit_unknown');
+    expect(useLearnStore.getState().retryable).toBe(false);
+    await useLearnStore.getState().retryLearn();
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+  });
+
+  it('an HTTP AbortError cannot prove the server rejected the task', async () => {
+    mockedStartLearnTask.mockRejectedValue(
+      new DOMException('The operation was aborted.', 'AbortError'),
+    );
+
+    const promise = useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('submitting');
+
+    await promise;
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('submit_unknown');
+    expect(useLearnStore.getState().error).toBeNull();
+    expect(useLearnStore.getState().retryable).toBe(false);
+  });
+
+  it('dismiss while awaiting acknowledgement cannot discard a potentially accepted task', async () => {
+    let resolveStart: ((v: TaskSubmitResponse) => void) | null = null;
+    mockedStartLearnTask.mockImplementation(
+      () =>
+        new Promise<TaskSubmitResponse>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+
+    const promise = useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('submitting');
+
+    useLearnStore.getState().dismiss();
+    expect(useLearnStore.getState().phase).toBe('submitting');
+
+    resolveStart!({ task_id: 'task-stale' });
+    await promise;
+
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('task-stale');
+    expect(mockedSubscribeTaskProgress).toHaveBeenCalledOnce();
+  });
+
+  it('submitLearn is a no-op while already running', async () => {
+    useLearnStore.setState({ phase: 'running', taskId: 'task-existing' });
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('task-existing');
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+  });
+
+  it('submitLearn is a no-op while submitting', async () => {
+    useLearnStore.setState({ phase: 'submitting' });
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+  });
+
+  it('submitLearn is a no-op while cancelling', async () => {
+    useLearnStore.setState({ phase: 'cancelling', taskId: 'task-cancel' });
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+  });
+
+  it('submitLearn stores lastPayload', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    const payload = {
+      unstaged: true,
+      include_untracked: true,
+      changed_paths: ['src/app.py'],
+      lang: 'en',
+    } satisfies LearnSubmitPayload;
+
+    await useLearnStore.getState().submitLearn(payload);
+
+    expect(useLearnStore.getState().lastPayload).toEqual(payload);
+    expect(useLearnStore.getState().retryable).toBe(true);
+    expect(mockedStartLearnTask).toHaveBeenCalledWith(payload);
+  });
+
+  it('submitLearn defaults to empty payload when called with no args', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().lastPayload).toEqual({});
+    expect(useLearnStore.getState().retryable).toBe(true);
+    expect(mockedStartLearnTask).toHaveBeenCalledWith({});
+  });
+
+  // ---------- 503 too_many_tasks ----------
+
+  it('submitLearn detects 503 too_many_pending as too_many_tasks', async () => {
+    mockedStartLearnTask.mockRejectedValue(
+      new ApiError(503, { error: 'too_many_pending_learn_tasks', status: 503 }),
+    );
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('too_many_tasks');
+    expect(useLearnStore.getState().error).toBe('A learn task is already running');
+  });
+
+  it('a generic 503 leaves acceptance unknown and disables automatic retry', async () => {
+    mockedStartLearnTask.mockRejectedValue(
+      new ApiError(503, { error: 'service_unavailable', status: 503 }),
+    );
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().errorCode).toBe('submit_unknown');
+    expect(useLearnStore.getState().retryable).toBe(false);
+  });
+
+  it('submitLearn preserves backend API error codes for localization', async () => {
+    mockedStartLearnTask.mockRejectedValue(
+      new ApiError(400, { error_code: 'INPUT_BAD_FIELD', error: 'bad field', status: 400 }),
+    );
+
+    await useLearnStore.getState().submitLearn();
+
+    expect(useLearnStore.getState().errorCode).toBe('INPUT_BAD_FIELD');
+    expect(useLearnStore.getState().error).toBe('bad field');
+  });
+
+  // ---------- retryLearn ----------
+
+  it('retryLearn reuses lastPayload', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    const payload = { revision: 'abc123' };
+
+    await useLearnStore.getState().submitLearn(payload);
+    useLearnStore.getState().dismiss();
+    expect(useLearnStore.getState().lastPayload).toEqual(payload);
+
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-2' });
+    await useLearnStore.getState().retryLearn();
+
+    expect(mockedStartLearnTask).toHaveBeenLastCalledWith(payload);
+    expect(useLearnStore.getState().taskId).toBe('task-2');
+  });
+
+  it('retryLearn defaults to empty payload when no prior submit', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+
+    await useLearnStore.getState().retryLearn();
+
+    expect(mockedStartLearnTask).toHaveBeenCalledWith({});
+  });
+
+  it('retryLearn works after an explicit server rejection without dismiss', async () => {
+    const payload = { last: true };
+    mockedStartLearnTask.mockRejectedValueOnce(new ApiError(409, { error: 'run_in_progress', status: 409 }));
+    await useLearnStore.getState().submitLearn(payload);
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().lastPayload).toEqual({ last: true });
+
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-retry' });
+    await useLearnStore.getState().retryLearn();
+    expect(useLearnStore.getState().taskId).toBe('task-retry');
+    expect(mockedStartLearnTask).toHaveBeenLastCalledWith({ last: true });
+  });
+
+  it('lastPayload strips sensitive fields (patch, patch_url)', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    await useLearnStore.getState().submitLearn({ last: true, patch: 'secret-diff', patch_url: 'https://secret' });
+    expect(useLearnStore.getState().lastPayload).toEqual({ last: true });
+    expect(useLearnStore.getState().retryable).toBe(false);
+    expect(useLearnStore.getState().lastPayload).not.toHaveProperty('patch');
+    expect(useLearnStore.getState().lastPayload).not.toHaveProperty('patch_url');
+  });
+
+  it('retryLearn is a no-op for patch-backed submits', async () => {
+    mockedStartLearnTask.mockRejectedValueOnce(new Error('fail'));
+    await useLearnStore.getState().submitLearn({ patch: 'secret-diff' });
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    mockedStartLearnTask.mockClear();
+    await useLearnStore.getState().retryLearn();
+
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+    expect(useLearnStore.getState().phase).toBe('failed');
+  });
+
+  // ---------- requestLearn ----------
+
+  it('requestLearn passes abort signal to estimate and clears sensitive pending payload before submit', async () => {
+    const controller = new AbortController();
+    const payload = { patch: 'secret-diff', revision: 'abc123' };
+    mockedEstimateLearn.mockResolvedValue(makeEstimate());
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+
+    await useLearnStore.getState().requestLearn(payload, { signal: controller.signal });
+
+    expect(mockedEstimateLearn).toHaveBeenCalledWith(payload, { signal: controller.signal });
+    expect(mockedStartLearnTask).toHaveBeenCalledWith(payload);
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+    expect(useLearnStore.getState().lastPayload).toEqual({ revision: 'abc123' });
+  });
+
+  it('requestLearn keeps full sensitive payload only in the confirm handoff', async () => {
+    const payload = { patch: 'secret-diff', revision: 'abc123' };
+    mockedEstimateLearn.mockResolvedValue(makeEstimate({ risk_level: 'warn', warnings: ['large diff'] }));
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+
+    await useLearnStore.getState().requestLearn(payload);
+
+    expect(useLearnStore.getState().phase).toBe('confirming');
+    expect(useLearnStore.getState().pendingPayload).toEqual({ revision: 'abc123' });
+    expect(useLearnStore.getState().pendingPayload).not.toHaveProperty('patch');
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+
+    await useLearnStore.getState().confirmLearn();
+
+    expect(mockedStartLearnTask).toHaveBeenCalledWith(payload);
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+  });
+
+  it('requestLearn abort clears pending payload without falling through to submit', async () => {
+    const controller = new AbortController();
+    const payload = { patch: 'secret-diff' };
+    const abortError = new DOMException('aborted', 'AbortError');
+    mockedEstimateLearn.mockRejectedValue(abortError);
+    controller.abort();
+
+    await useLearnStore.getState().requestLearn(payload, { signal: controller.signal });
+
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+    expect(useLearnStore.getState().phase).toBe('idle');
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+  });
+
+  it('an estimate that resolves after cancellation never sends the POST', async () => {
+    let resolveEstimate: ((value: LearnEstimateResponse) => void) | null = null;
+    mockedEstimateLearn.mockImplementation(() => new Promise(resolve => { resolveEstimate = resolve; }));
+    const controller = new AbortController();
+    const promise = useLearnStore.getState().requestLearn({ last: true }, { signal: controller.signal });
+    controller.abort();
+    resolveEstimate!(makeEstimate());
+    await promise;
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+    expect(useLearnStore.getState().phase).toBe('idle');
+  });
+
+  it('cancellation after POST preserves its acknowledgement and cancels only that task', async () => {
+    let acknowledge: ((value: TaskSubmitResponse) => void) | null = null;
+    mockedStartLearnTask.mockImplementation(() => new Promise(resolve => { acknowledge = resolve; }));
+    mockedCancelTask.mockResolvedValue({ cancelled: true });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ task_id: 'accepted-task', status: 'cancelled' }));
+    const controller = new AbortController();
+    const promise = useLearnStore.getState().requestLearn({ last: true }, { signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockedStartLearnTask).toHaveBeenCalledWith({ last: true });
+
+    controller.abort();
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+    expect(useLearnStore.getState().taskId).toBeNull();
+    useLearnStore.getState().dismiss();
+    await useLearnStore.getState().retryLearn();
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+    expect(mockedCancelTask).not.toHaveBeenCalled();
+
+    acknowledge!({ task_id: 'accepted-task' });
+    await promise;
+    expect(mockedCancelTask).toHaveBeenCalledTimes(1);
+    expect(mockedCancelTask).toHaveBeenCalledWith('accepted-task');
+    expect(useLearnStore.getState().taskId).toBe('accepted-task');
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledWith('accepted-task');
+    expect(useLearnStore.getState().phase).toBe('cancelled');
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+  });
+
+  it('the cancel action can queue cancellation before a task id is returned', async () => {
+    let acknowledge: ((value: TaskSubmitResponse) => void) | null = null;
+    mockedStartLearnTask.mockImplementation(() => new Promise(resolve => { acknowledge = resolve; }));
+    mockedCancelTask.mockRejectedValue(new Error('cancel temporarily unavailable'));
+    const promise = useLearnStore.getState().submitLearn({ last: true });
+    await useLearnStore.getState().cancelLearn();
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+    acknowledge!({ task_id: 'known-task' });
+    await promise;
+    expect(mockedCancelTask).toHaveBeenCalledWith('known-task');
+    // A cancellation failure must keep the accepted run visible and tracked.
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('known-task');
+    expect(mockedSubscribeTaskProgress).toHaveBeenCalled();
+  });
+
+  it('a failed estimate never starts a learn task, and retry checks the source again', async () => {
+    mockedEstimateLearn.mockRejectedValueOnce(new Error('preview offline'));
+    await useLearnStore.getState().requestLearn({ last: true });
+
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('estimate_failed');
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'retry-after-preview' });
+    await useLearnStore.getState().retryLearn();
+    expect(mockedEstimateLearn).toHaveBeenCalledTimes(2);
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+  });
+
+  it('selected files remain private through confirmation and cannot be silently retried', async () => {
+    const payload: LearnSubmitPayload = {
+      compare_files: [
+        { name: 'query.sql', content: 'SELECT * FROM private_table;' },
+        { name: 'query.sql', content: 'SELECT id FROM private_table;' },
+      ],
+      force_learn: true,
+      active_practice: true,
+    };
+    mockedEstimateLearn.mockResolvedValue(makeEstimate({ risk_level: 'warn' }));
+    mockedStartLearnTask.mockRejectedValue(new Error('submit failed'));
+
+    await useLearnStore.getState().requestLearn(payload);
+    expect(useLearnStore.getState().pendingPayload).toEqual({ force_learn: true, active_practice: true });
+    expect(useLearnStore.getState().lastPayload).toEqual({ force_learn: true, active_practice: true });
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    await useLearnStore.getState().confirmLearn();
+    expect(mockedStartLearnTask).toHaveBeenCalledWith(payload);
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+    await useLearnStore.getState().retryLearn();
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+  });
+
+  // ---------- cancelLearn ----------
+
+  it.each<LearnSubmitPayload>([
+    { document: { name: 'private.md', content: '# Synthetic private document' } },
+    { snapshot_id: `snap_${'1'.repeat(32)}`, snapshot_hash: 'a'.repeat(64), snapshot_after: { name: 'private.md', content: 'Synthetic after content' } },
+    { last: true, review_context: 'Synthetic private reviewer notes' },
+  ])('keeps source and reviewer content out of observable pending and retry state', async (payload) => {
+    mockedEstimateLearn.mockResolvedValue(makeEstimate({ risk_level: 'warn' }));
+    mockedStartLearnTask.mockRejectedValue(new ApiError(400, { error_code: 'INPUT_BAD_FIELD' }));
+    await useLearnStore.getState().requestLearn(payload);
+    const beforeConfirmation = useLearnStore.getState();
+    for (const field of ['document', 'snapshot_after', 'review_context']) {
+      expect(beforeConfirmation.pendingPayload).not.toHaveProperty(field);
+      expect(beforeConfirmation.lastPayload).not.toHaveProperty(field);
+    }
+    expect(beforeConfirmation.retryable).toBe(false);
+    await useLearnStore.getState().confirmLearn();
+    expect(mockedStartLearnTask).toHaveBeenCalledWith(payload);
+    expect(useLearnStore.getState().pendingPayload).toBeNull();
+    await useLearnStore.getState().retryLearn();
+    expect(mockedStartLearnTask).toHaveBeenCalledOnce();
+  });
+
+  it('cancelLearn transitions from running to cancelling', async () => {
+    mockedCancelTask.mockResolvedValue({ cancelled: true });
+    useLearnStore.setState({ phase: 'running', taskId: 'task-1' });
+
+    const promise = useLearnStore.getState().cancelLearn();
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+
+    await promise;
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+    expect(mockedCancelTask).toHaveBeenCalledWith('task-1');
+  });
+
+  it('cancelLearn reverts to running on rejection', async () => {
+    mockedCancelTask.mockRejectedValue(new Error('cancel failed'));
+    useLearnStore.setState({ phase: 'running', taskId: 'task-1' });
+
+    await useLearnStore.getState().cancelLearn();
+
+    expect(useLearnStore.getState().phase).toBe('running');
+  });
+
+  it('cancelLearn rejection does not revert terminal state', async () => {
+    mockedCancelTask.mockRejectedValue(new Error('cancel failed'));
+    useLearnStore.setState({ phase: 'running', taskId: 'task-1' });
+
+    const promise = useLearnStore.getState().cancelLearn();
+    expect(useLearnStore.getState().phase).toBe('cancelling');
+
+    // Simulate poll completing before cancel rejects
+    useLearnStore.setState({ phase: 'completed' });
+    await promise;
+
+    // Phase should stay completed, not revert to running
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  it('cancelLearn is a no-op when not running', async () => {
+    useLearnStore.setState({ phase: 'idle', taskId: null });
+
+    await useLearnStore.getState().cancelLearn();
+
+    expect(mockedCancelTask).not.toHaveBeenCalled();
+  });
+
+  // ---------- dismiss ----------
+
+  it('dismiss resets all state to idle and stops polling', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ status: 'running' }));
+
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    useLearnStore.getState().dismiss();
+
+    expect(useLearnStore.getState().phase).toBe('idle');
+    expect(useLearnStore.getState().taskId).toBeNull();
+    expect(useLearnStore.getState().task).toBeNull();
+    expect(useLearnStore.getState().error).toBeNull();
+    expect(useLearnStore.getState().errorCode).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(mockedGetTask).not.toHaveBeenCalled();
+  });
+
+  // ---------- poll lifecycle ----------
+
+  it('stale poll response does not update state after dismiss', async () => {
+    let resolveGetTask: ((v: TaskInfoResponse) => void) | null = null;
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockImplementation(
+      () =>
+        new Promise<TaskInfoResponse>((resolve) => {
+          resolveGetTask = resolve;
+        }),
+    );
+
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+
+    useLearnStore.getState().dismiss();
+    expect(useLearnStore.getState().phase).toBe('idle');
+    expect(useLearnStore.getState().taskId).toBeNull();
+
+    resolveGetTask!(makeTaskInfo({ status: 'completed' }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(useLearnStore.getState().phase).toBe('idle');
+    expect(useLearnStore.getState().task).toBeNull();
+  });
+
+  it('poll transitions to completed and invalidates runs store', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+
+    const completedTask = makeTaskInfo({ task_id: 'task-1', status: 'completed' });
+    mockedGetTask
+      .mockResolvedValueOnce(makeTaskInfo({ task_id: 'task-1', status: 'running' }))
+      .mockResolvedValueOnce(completedTask);
+
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+    expect(useLearnStore.getState().phase).toBe('completed');
+    expect(useLearnStore.getState().task).toEqual(completedTask);
+
+    expect(useRunsStore.getState().lastLoadedAt).toBeNull();
+    expect(graphInvalidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('poll transitions to failed when task status is failed', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    const failedTask = makeTaskInfo({
+      task_id: 'task-1',
+      status: 'failed',
+      error: 'Out of memory',
+      error_code: 'internal_error',
+    });
+    mockedGetTask.mockResolvedValue(failedTask);
+
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().error).toBe('Out of memory');
+    expect(useLearnStore.getState().errorCode).toBe('internal_error');
+    expect(useLearnStore.getState().task).toEqual(failedTask);
+  });
+
+  it('poll disables retry when recovery_hint is not retry', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockResolvedValue(
+      makeTaskInfo({
+        task_id: 'task-1',
+        status: 'failed',
+        error: 'Configuration error. Check your provider settings.',
+        error_code: 'config_error',
+        recovery_hint: 'check_config',
+      }),
+    );
+
+    await useLearnStore.getState().submitLearn({ last: true });
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    mockedStartLearnTask.mockClear();
+    await useLearnStore.getState().retryLearn();
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+  });
+
+  it('poll keeps retry enabled when recovery_hint is retry', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockResolvedValue(
+      makeTaskInfo({
+        task_id: 'task-1',
+        status: 'failed',
+        error: 'Task timed out. Try again or increase the timeout.',
+        error_code: 'timeout',
+        recovery_hint: 'retry',
+      }),
+    );
+
+    await useLearnStore.getState().submitLearn({ last: true });
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().retryable).toBe(true);
+  });
+
+  it('poll transitions to cancelled without invalidating run or graph state', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    const cancelledTask = makeTaskInfo({ task_id: 'task-1', status: 'cancelled' });
+    mockedGetTask.mockResolvedValue(cancelledTask);
+    const previousLastLoadedAt = useRunsStore.getState().lastLoadedAt;
+
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('cancelled');
+    expect(useRunsStore.getState().lastLoadedAt).toBe(previousLastLoadedAt);
+    expect(graphInvalidateMock).not.toHaveBeenCalled();
+  });
+
+  // ---------- poll stale rejection guard ----------
+
+  it('stale poll rejection after dismiss does not corrupt next task backoff', async () => {
+    let rejectGetTask: ((err: Error) => void) | null = null;
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockImplementation(
+      () =>
+        new Promise<TaskInfoResponse>((_resolve, reject) => {
+          rejectGetTask = reject;
+        }),
+    );
+
+    // Start task-1, trigger poll
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+
+    // Dismiss while poll is in-flight
+    useLearnStore.getState().dismiss();
+    expect(useLearnStore.getState().phase).toBe('idle');
+
+    // Start task-2
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-2' });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ task_id: 'task-2', status: 'running' }));
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().taskId).toBe('task-2');
+
+    // Now the stale task-1 poll rejects
+    rejectGetTask!(new Error('stale network error'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // task-2's poll should fire at normal 1500ms (not backoff-delayed)
+    await vi.advanceTimersByTimeAsync(1500);
+    // 2 calls: 1 stale (from task-1) + 1 fresh poll (for task-2)
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+    expect(useLearnStore.getState().taskId).toBe('task-2');
+    expect(useLearnStore.getState().phase).toBe('running');
+  });
+
+  // ---------- poll exponential backoff ----------
+
+  it('poll uses exponential backoff on consecutive network errors', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().submitLearn();
+
+    // First poll at 1500ms - fails
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // Second poll should be at 3000ms (1500 * 2^1)
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+
+    // Third poll should be at 6000ms (1500 * 2^2)
+    await vi.advanceTimersByTimeAsync(5999);
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockedGetTask).toHaveBeenCalledTimes(3);
+  });
+
+  it('poll backoff resets on successful response', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValueOnce(makeTaskInfo({ task_id: 'task-1', status: 'running' }))
+      .mockResolvedValueOnce(makeTaskInfo({ task_id: 'task-1', status: 'completed' }));
+
+    await useLearnStore.getState().submitLearn();
+
+    // 1st poll at 1500ms - error
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+
+    // 2nd poll at 1500+3000=4500ms - error
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+
+    // 3rd poll at 4500+6000=10500ms - success
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(mockedGetTask).toHaveBeenCalledTimes(3);
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // 4th poll should be back at 1500ms (backoff reset)
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(4);
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  // ---------- consecutive poll error threshold ----------
+
+  it('poll surfaces error after MAX_CONSECUTIVE_POLL_ERRORS consecutive failures', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().submitLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // Drive 10 consecutive failures with backoff: 1500, 3000, 6000, 12000,
+    // 24000, then 30000 capped from the 6th onward.
+    for (let i = 0; i < 10; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+
+    expect(mockedGetTask).toHaveBeenCalledTimes(10);
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('poll_connection_lost');
+    expect(useLearnStore.getState().error).toBe('poll_connection_lost');
+    expect(useLearnStore.getState().retryable).toBe(true);
+    // taskId is preserved so retry can resume polling rather than resubmit.
+    expect(useLearnStore.getState().taskId).toBe('task-1');
+  });
+
+  it.each([401, 403])(
+    'poll fails immediately on auth status %i without waiting for the threshold',
+    async (status) => {
+      mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+      mockedGetTask.mockRejectedValue(new ApiError(status, { error: 'auth_failed' }));
+
+      await useLearnStore.getState().submitLearn();
+      await vi.advanceTimersByTimeAsync(1500);
+
+      expect(mockedGetTask).toHaveBeenCalledTimes(1);
+      expect(useLearnStore.getState().phase).toBe('failed');
+      expect(useLearnStore.getState().errorCode).toBe('poll_auth_error');
+      expect(useLearnStore.getState().retryable).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('poll fails immediately on 404 without waiting for the threshold', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new ApiError(404, { error: 'task_not_found' }));
+
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('poll_task_not_found');
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+  });
+
+  it('poll backs off on 429 using retry_after without consuming the error threshold', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask
+      .mockRejectedValueOnce(new ApiError(429, { error: 'rate_limited', retry_after: 2 }))
+      .mockResolvedValueOnce(makeTaskInfo({ task_id: 'task-1', status: 'completed' }));
+
+    await useLearnStore.getState().submitLearn();
+
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().errorCode).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(mockedGetTask).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockedGetTask).toHaveBeenCalledTimes(2);
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  it('poll uses poll_server_error code when backend returns retryable 5xx ApiError', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new ApiError(503, { error: 'service_unavailable' }));
+
+    await useLearnStore.getState().submitLearn();
+
+    for (let i = 0; i < 10; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('poll_server_error');
+  });
+
+  it('poll keeps polling silently below threshold', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().submitLearn();
+
+    // 9 failures should still leave phase=running.
+    for (let i = 0; i < 9; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+
+    expect(mockedGetTask).toHaveBeenCalledTimes(9);
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().errorCode).toBeNull();
+  });
+
+  it('poll resets error counter on a successful response', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    // Pattern: 9 errors -> 1 success -> many more errors.
+    // If the counter were not reset, the 1st post-success error (#10 total)
+    // would trip the threshold; with the reset it shouldn't until 10 more.
+    const responses: Array<() => Promise<TaskInfoResponse>> = [];
+    for (let i = 0; i < 9; i++) {
+      responses.push(() => Promise.reject(new Error('network error')));
+    }
+    responses.push(() =>
+      Promise.resolve(makeTaskInfo({ task_id: 'task-1', status: 'running' })),
+    );
+    for (let i = 0; i < 9; i++) {
+      responses.push(() => Promise.reject(new Error('network error')));
+    }
+    let call = 0;
+    mockedGetTask.mockImplementation(() => responses[call++]!());
+
+    await useLearnStore.getState().submitLearn();
+
+    // 9 failures
+    for (let i = 0; i < 9; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // 10th poll succeeds — resets the counter and returns to base interval.
+    const intervalAfter9 = Math.min(1500 * 2 ** 9, 30_000);
+    await vi.advanceTimersByTimeAsync(intervalAfter9);
+    expect(mockedGetTask).toHaveBeenCalledTimes(10);
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // Now 9 more errors should still keep phase=running.
+    for (let i = 0; i < 9; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+    expect(useLearnStore.getState().phase).toBe('running');
+
+    // The 10th post-reset failure trips the threshold.
+    const finalInterval = Math.min(1500 * 2 ** 9, 30_000);
+    await vi.advanceTimersByTimeAsync(finalInterval);
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('poll_connection_lost');
+  });
+
+  it('retryLearn from poll_connection_lost reconnects polling without resubmitting', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().submitLearn();
+    for (let i = 0; i < 10; i++) {
+      const interval = Math.min(1500 * 2 ** i, 30_000);
+      await vi.advanceTimersByTimeAsync(interval);
+    }
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('poll_connection_lost');
+
+    // Backend recovers; retry resumes polling with the existing taskId.
+    mockedStartLearnTask.mockClear();
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ task_id: 'task-1', status: 'completed' }));
+
+    await useLearnStore.getState().retryLearn();
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().errorCode).toBeNull();
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+
+    // First poll after reconnect.
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  it('poll backoff caps at 30 seconds', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().submitLearn();
+
+    // Run through several error cycles to reach cap
+    // 1500, 3000, 6000, 12000, 24000, 30000 (capped)
+    let totalTime = 0;
+    for (let i = 0; i < 6; i++) {
+      const expected = Math.min(1500 * 2 ** i, 30_000);
+      totalTime += expected;
+      await vi.advanceTimersByTimeAsync(expected);
+    }
+    const callsBefore = mockedGetTask.mock.calls.length;
+
+    // Next interval should still be 30000 (capped)
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(mockedGetTask).toHaveBeenCalledTimes(callsBefore);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockedGetTask).toHaveBeenCalledTimes(callsBefore + 1);
+  });
+
+  // ---------- backend-driven timeout (no frontend pseudo-timeout) ----------
+
+  it('keeps polling indefinitely while backend reports running (no frontend pseudo-timeout)', async () => {
+    // Regression: previously the frontend forced phase=failed after 660s of
+    // local polling, firing before the backend's 1800s timeout and showing
+    // "Learn run timed out" while the backend was still working. The
+    // frontend now defers entirely to backend status.
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ task_id: 'task-1', status: 'running' }));
+
+    await useLearnStore.getState().submitLearn();
+
+    // Advance well past the legacy 660s frontend timeout — to 720s.
+    const pollCount = Math.ceil(720_000 / 1500);
+    for (let i = 0; i < pollCount; i++) {
+      await vi.advanceTimersByTimeAsync(1500);
+    }
+
+    // Phase must remain `running`; backend hasn't said otherwise.
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().error).toBeNull();
+    expect(useLearnStore.getState().errorCode).toBeNull();
+  });
+
+  it('honors backend-driven timeout when status flips to failed with timeout code', async () => {
+    // The only way a learn run becomes "timed out" is via the backend
+    // surfacing error_code=timeout on the task; the frontend just relays it.
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    mockedGetTask.mockResolvedValue(
+      makeTaskInfo({
+        task_id: 'task-1',
+        status: 'failed',
+        error: 'Task exceeded its 1800s budget.',
+        error_code: 'timeout',
+        recovery_hint: 'retry',
+      }),
+    );
+
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().errorCode).toBe('timeout');
+    expect(useLearnStore.getState().error).toBe('Task exceeded its 1800s budget.');
+    expect(useLearnStore.getState().retryable).toBe(true);
+  });
+
+  it('passes through timeout_seconds and deadline_at fields from the task response', async () => {
+    mockedStartLearnTask.mockResolvedValue({ task_id: 'task-1' });
+    const runningTask = makeTaskInfo({
+      task_id: 'task-1',
+      status: 'running',
+      timeout_seconds: 1800,
+      deadline_at: '2026-05-07T01:00:00Z',
+    });
+    mockedGetTask.mockResolvedValue(runningTask);
+
+    await useLearnStore.getState().submitLearn();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    const stored = useLearnStore.getState().task;
+    expect(stored?.timeout_seconds).toBe(1800);
+    expect(stored?.deadline_at).toBe('2026-05-07T01:00:00Z');
+  });
+
+  // ---------- recoverExistingTask ----------
+
+  it('recoverExistingTask picks up a running task', async () => {
+    const runningTask = makeTaskInfo({ task_id: 'task-recovered', status: 'running' });
+    mockedListTasks.mockResolvedValue({ tasks: [runningTask] });
+    mockedGetTask.mockResolvedValue(makeTaskInfo({ task_id: 'task-recovered', status: 'completed' }));
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('task-recovered');
+    expect(useLearnStore.getState().task).toEqual(runningTask);
+    expect(useLearnStore.getState().lastPayload).toBeNull();
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    // Verify polling starts
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(mockedGetTask).toHaveBeenCalledWith('task-recovered');
+    expect(useLearnStore.getState().phase).toBe('completed');
+  });
+
+  it('recovered task failure cannot retry with an unknown payload', async () => {
+    const runningTask = makeTaskInfo({ task_id: 'task-recovered', status: 'running' });
+    mockedListTasks.mockResolvedValue({ tasks: [runningTask] });
+    mockedGetTask.mockResolvedValue(
+      makeTaskInfo({
+        task_id: 'task-recovered',
+        status: 'failed',
+        error: 'Recovered task failed',
+      }),
+    );
+
+    await useLearnStore.getState().recoverExistingTask();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(useLearnStore.getState().phase).toBe('failed');
+    expect(useLearnStore.getState().retryable).toBe(false);
+
+    mockedStartLearnTask.mockClear();
+    await useLearnStore.getState().retryLearn();
+    expect(mockedStartLearnTask).not.toHaveBeenCalled();
+  });
+
+  it('recoverExistingTask picks up a pending task', async () => {
+    const pendingTask = makeTaskInfo({ task_id: 'task-pending', status: 'pending' });
+    mockedListTasks.mockResolvedValue({ tasks: [pendingTask] });
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().phase).toBe('running');
+    expect(useLearnStore.getState().taskId).toBe('task-pending');
+  });
+
+  it('recoverExistingTask is a no-op when no active tasks', async () => {
+    mockedListTasks.mockResolvedValue({ tasks: [] });
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().phase).toBe('idle');
+  });
+
+  it('recoverExistingTask is a no-op when not idle', async () => {
+    useLearnStore.setState({ phase: 'running', taskId: 'task-existing' });
+    mockedListTasks.mockResolvedValue({
+      tasks: [makeTaskInfo({ task_id: 'task-other', status: 'running' })],
+    });
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().taskId).toBe('task-existing');
+    expect(mockedListTasks).not.toHaveBeenCalled();
+  });
+
+  it('recoverExistingTask ignores completed tasks', async () => {
+    mockedListTasks.mockResolvedValue({
+      tasks: [makeTaskInfo({ task_id: 'task-done', status: 'completed' })],
+    });
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().phase).toBe('idle');
+  });
+
+  it('recoverExistingTask silently ignores network errors', async () => {
+    mockedListTasks.mockRejectedValue(new Error('network error'));
+
+    await useLearnStore.getState().recoverExistingTask();
+
+    expect(useLearnStore.getState().phase).toBe('idle');
+  });
+});

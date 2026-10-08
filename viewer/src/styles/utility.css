@@ -1,0 +1,584 @@
+/* Small shared utilities for repeated token-backed view styles. */
+.u-muted-sm {
+  color: var(--muted);
+  font-size: var(--fs-base);
+}
+
+.u-muted-xs {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.u-text-sm-relaxed {
+  font-size: var(--fs-base);
+  line-height: 1.65;
+}
+
+.u-mt-1 {
+  margin-top: var(--sp-1);
+}
+
+.u-mb-2 {
+  margin-bottom: 6px;
+}
+
+.u-p-0 {
+  padding: 0;
+}
+
+.u-center-action-row {
+  display: flex;
+  justify-content: center;
+  padding: var(--sp-4) 0;
+}
+
+.u-display-contents {
+  display: contents;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cross-page component primitives (Phase 2G follow-up).
+ *
+ * Some component classes are rendered by multiple pages (e.g. RatchetPage
+ * + ReviewPage both ship the weakest-dimension mastery bars). With route
+ * code splitting, per-page CSS is no longer eagerly loaded, so any rule
+ * shared across routes must live in a globally-imported stylesheet to keep
+ * working when a user lands on the consumer route directly.
+ * ------------------------------------------------------------------------ */
+
+.mastery-grid {
+  display: grid;
+  grid-template-columns: 1fr 80px;
+  gap: var(--sp-2);
+  row-gap: 10px;
+  font-size: var(--fs-sm);
+  align-items: center;
+}
+
+.mastery-bar {
+  height: 6px;
+  background: var(--subtle);
+  border-radius: var(--r-full);
+  overflow: hidden;
+}
+
+.mastery-bar__fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--r-full);
+  transition: width var(--dur-base) var(--ease-out);
+}
+
+.mastery-bar__fill--warn {
+  background: var(--warning, #B4791F);
+}
+
+.mastery-bar__fill--danger {
+  background: var(--danger, #A33D2B);
+}
+
+/* Verdict badges — used by Dashboard + Ratchet pages.
+ * Moved here so direct navigation to /ratchet still styles them under
+ * route code splitting. Forced-colors variant lives in forced-colors.css. */
+.verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-2);
+  height: 22px;
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-radius: var(--r-full);
+  border: 1px solid var(--hair-strong);
+  background: var(--elevated);
+  color: var(--ink);
+}
+
+.verdict-badge--PASS {
+  background: var(--add-bg);
+  border-color: var(--add-fg);
+  color: var(--add-fg);
+}
+
+.verdict-badge--CAUTION {
+  background: var(--accent-softer);
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.verdict-badge--FAIL {
+  background: var(--del-bg);
+  border-color: var(--del-fg);
+  color: var(--del-fg);
+}
+
+/* Error banner / panel — consumed by Dashboard, Settings, Skills, Ratchet,
+ * Review pages. Centralised so the failure UI stays styled regardless of
+ * which lazy chunk the user lands on first. */
+.dashboard__error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  border: 1px solid var(--danger);
+  border-radius: var(--r-lg);
+  background: var(--subtle);
+  color: var(--danger);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  padding: var(--sp-6);
+  text-align: center;
+}
+
+.dashboard__error-banner {
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--r-md);
+  background: var(--subtle);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  margin-bottom: var(--sp-4);
+}
+
+/* Load-more pagination button — used by Dashboard + Ratchet pages. */
+.load-more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 36px;
+  padding: 0 var(--sp-6);
+  border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  border: 1px solid var(--hair-strong);
+  background: var(--elevated);
+  color: var(--ink);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+.load-more-btn:hover:not(:disabled) {
+  background: var(--accent-softer);
+  border-color: var(--accent-hair);
+  transform: translateY(-1px);
+  box-shadow: var(--sh-md);
+}
+
+.load-more-btn:active:not(:disabled) {
+  transform: translateY(0);
+  transition-duration: 0s;
+}
+
+.load-more-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Reduced-motion guard for cross-page primitives. Placed AFTER the base
+ * rules so source order favours the @media block at equal specificity
+ * (F-02). transform uses !important defensively because hover/active states
+ * also apply translateY. */
+@media (prefers-reduced-motion: reduce) {
+  .mastery-bar__fill,
+  .load-more-btn {
+    transition: none;
+  }
+  .load-more-btn {
+    transform: none !important;
+  }
+}
+
+/* Review-style eyebrow — distinct from .eyebrow because consumers expect
+ * NO line-height/margin/display reset. Five pages (Settings, Skills,
+ * Ratchet, Review, Onboarding) reference this class. */
+.review__eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * V6 typography utilities (Phase 0F)
+ * Direct ports from the Warm v6 typography system.
+ * Goal: any page can opt into V6 prose/eyebrow without duplicating CSS.
+ * ------------------------------------------------------------------------ */
+
+.serif {
+  font-family: var(--font-serif);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: "ss01" 1, "zero" 1, "cv11" 1;
+}
+
+/* Tabular numerals shorthand from the V6 pattern. Independent from .mono so
+ * KPI/serif numbers can stay on their inherited font while still aligning. */
+.num {
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  line-height: 1;
+  margin-bottom: var(--sp-3);
+  display: inline-block;
+}
+
+.prose {
+  font-family: var(--font-serif);
+  font-size: 17px; /* intentionally off-scale — V6 prose baseline */
+  line-height: 1.8;
+  color: var(--ink);
+}
+
+.prose h2 {
+  font-family: var(--font-serif);
+  font-size: var(--fs-3xl);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  margin: var(--sp-8) 0 var(--sp-3);
+  border-bottom: 1px solid var(--hair);
+  padding-bottom: var(--sp-2);
+}
+
+.prose h3 {
+  font-family: var(--font-serif);
+  font-size: var(--fs-xl);
+  font-weight: 500;
+  margin: var(--sp-6) 0 var(--sp-2);
+}
+
+.prose p {
+  margin: 0 0 14px;
+}
+
+.prose code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  background: var(--subtle);
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+}
+
+.prose ul {
+  padding-left: 22px;
+}
+
+.prose .highlight {
+  background: var(--accent-soft);
+  padding: 1px var(--sp-1);
+  border-radius: 3px;
+  cursor: pointer;
+  border-bottom: 1px dashed var(--accent);
+}
+
+@media print {
+  .prose {
+    font-family: var(--font-serif);
+    font-size: 12pt;
+    color: #111;
+  }
+  .prose h2 {
+    font-size: 16pt;
+    margin-top: 22pt;
+  }
+  .prose h3 {
+    font-size: 13pt;
+  }
+  .prose code,
+  .prose pre,
+  .mono {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9.5pt;
+    background: #f5f2ec;
+  }
+  .prose a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 9pt;
+    color: #555;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Phase 2D: V6 7-breakpoint responsive utilities
+ * Mirrors Warm v6 generic responsive polish.
+ * Source-of-truth breakpoints documented in tokens.css (--bp-xs .. --bp-xl).
+ * Design intent: page CSS handles structural breakpoints; these globals
+ * handle generic typography/spacing tuning at 540/900/1280.
+ * ------------------------------------------------------------------------ */
+
+/* Large-screen padding lift — gives prose room to breathe ≥1280 */
+@media (min-width: 1280px) {
+  .page,
+  .lesson,
+  .diff-page,
+  .review,
+  .quiz-page,
+  .ratchet-page,
+  .settings,
+  .dashboard,
+  .concepts {
+    padding-left: clamp(28px, 4vw, 56px);
+    padding-right: clamp(28px, 4vw, 56px);
+  }
+}
+
+/* Mid-screen typography clamp — heading sizes shrink fluidly < 900 */
+@media (max-width: 900px) {
+  h1,
+  .lesson__title,
+  .review__title,
+  .ratchet-page__title,
+  .settings__title,
+  .dashboard__title,
+  .quiz-page__title {
+    font-size: clamp(28px, 5.4vw, 36px);
+  }
+  h2 {
+    font-size: clamp(22px, 4vw, 28px);
+  }
+  h3 {
+    font-size: clamp(18px, 3.2vw, 22px);
+  }
+  .prose {
+    font-size: 16px;
+    line-height: 1.7;
+  }
+  .prose h2 {
+    font-size: 24px;
+  }
+  .prose h3 {
+    font-size: 18px;
+  }
+  .card,
+  .ratchet-card,
+  .settings-card,
+  .dashboard__card {
+    border-radius: 10px;
+  }
+}
+
+/* Small-screen body / button polish < 540 using the V6 pattern. */
+@media (max-width: 540px) {
+  body {
+    font-size: 15px;
+    line-height: 1.65;
+  }
+  .prose {
+    font-size: 15.5px;
+  }
+  .review__eyebrow,
+  .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+  }
+  .retry-btn,
+  .load-more-btn {
+    height: 38px;
+    padding: 0 14px;
+    font-size: 13px;
+  }
+}
+
+/* Hide / show utilities — deliberately keyed to V6 paradigm.
+ * `u-hide-mobile` removes element ≤ 1024 (drawer-paradigm mobile);
+ * `u-hide-desktop` removes element ≥ 1025;
+ * `u-hide-xs` removes element on phone-class screens ≤ 540. */
+@media (max-width: 1024px) {
+  .u-hide-mobile {
+    display: none !important;
+  }
+}
+@media (min-width: 1025px) {
+  .u-hide-desktop {
+    display: none !important;
+  }
+}
+@media (max-width: 540px) {
+  .u-hide-xs {
+    display: none !important;
+  }
+}
+
+/* BEGIN: surface-card + diag-row (Onboarding/Settings shared) */
+/* ---------------------------------------------------------------------------
+ * Cross-page surface primitives. Extracted from the original
+ * `.settings-card` / `.doctor-check` rules in Settings.css so that any page
+ * (Onboarding, Settings, future panels) can use them under route code
+ * splitting without depending on Settings.css being loaded first.
+ *
+ * Scope contract:
+ *   - All colors flow through tokens (var(--success), var(--warning), ...).
+ *   - No hex literals; no parent selectors, query containers, intrinsic
+ *     ratio shorthands, or balanced text wrapping (same-shape discipline).
+ *   - .settings-card and .doctor-check rules in Settings.css remain as
+ *     visual aliases; this block does not modify them.
+ * ------------------------------------------------------------------------ */
+
+.surface-card {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+  padding: 0;
+  margin-bottom: var(--sp-6);
+}
+
+.surface-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: 0 0 var(--sp-2);
+  border-bottom: 1px solid var(--hair-strong);
+  margin-bottom: var(--sp-4);
+}
+
+.surface-card__header h2 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 24px;
+  font-weight: 500;
+  color: var(--ink-blackletter);
+  letter-spacing: -0.01em;
+}
+
+.surface-card__body {
+  padding: 0;
+}
+
+.surface-card__body--flush {
+  padding: 0;
+}
+
+/* ---- Diagnostic row primitives (consumed by <DiagnosticRow />) ----
+ * Layout intent (fixes the historical "icon and text wrap onto two lines"
+ * collapse): icon and body live on the same flex row; icon never shrinks;
+ * body owns the remaining width and stacks text + details vertically. */
+.diag-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+}
+
+.diag-row__icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--subtle);
+  color: var(--muted);
+  transition:
+    background-color var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart);
+}
+
+.diag-row__icon--pass {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.diag-row__icon--warn {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.diag-row__icon--fail {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Info variant uses accent-softer because no `--info-soft` token exists;
+ * if the design system later defines `--info-soft`, swap in one line. */
+.diag-row__icon--info {
+  background: var(--accent-softer);
+  color: var(--accent);
+}
+
+.diag-row__icon--pending {
+  background: var(--subtle);
+  color: var(--muted);
+}
+
+.diag-row__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.diag-row__text {
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  line-height: var(--lh-snug);
+}
+
+.diag-row__details {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  line-height: var(--lh-snug);
+  word-break: break-word;
+}
+/* END: surface-card + diag-row */
+
+/* ---- V6 wiki tree (used in Guide/Skills pages) ---- */
+.tree {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--ink-2, var(--ink));
+}
+
+.tree .tr-dir {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.tree .tr-file {
+  color: var(--ink-2, var(--ink));
+  padding-inline-start: 14px;
+  display: block;
+}
+
+.tree .tr-sub {
+  padding-inline-start: 28px;
+  display: block;
+  color: var(--muted);
+}
+
+.tree .tr-new {
+  color: var(--success);
+  font-weight: 500;
+}

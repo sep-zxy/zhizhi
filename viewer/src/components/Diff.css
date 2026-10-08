@@ -1,0 +1,1066 @@
+/* ── DiffView ──────────────────────────────────────────────── */
+
+.diff-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 22px;
+  /* Printed-proof paper: warm cream wash over the diff surface so the code
+     column reads like a typeset galley rather than a flat white pane. The
+     accent-softest tint is the faintest warm token; layering it on
+     --surface-diff keeps light/dark parity (both resolve via tokens). */
+  background:
+    linear-gradient(var(--accent-softest), var(--accent-softest)),
+    var(--surface-diff);
+  border-radius: 10px;
+  border: 1px solid var(--hair);
+  position: relative;
+  /* Approximate height of the sticky `.diff-file-summary` toolbar. Used as
+     the sticky-offset for per-file headers so they stack *under* the
+     toolbar instead of behind it. Centralized as a custom property so a
+     single tweak adjusts every per-file header. The value is a fixed
+     estimate; if the summary bar wraps (long file names, RTL locales),
+     bump this value. */
+  --diff-summary-h: 52px;
+  /* Sticky-offset for per-file headers. Set to summary-bar height when
+     the summary bar is rendered (see :has() rule below). */
+  --diff-file-header-top: 0px;
+}
+
+/* When the file-summary toolbar is present, push per-file headers down so
+ * they stick *under* the toolbar instead of behind it. Browsers without
+ * :has() simply leave headers stacked under the toolbar. */
+.diff-view:has(.diff-file-summary) {
+  --diff-file-header-top: var(--diff-summary-h);
+}
+
+.diff-view__body {
+  /* container for stacked file sections */
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-view--split {
+  overflow-x: auto;
+}
+
+/* ── File summary bar (top toolbar) ──────────────────────── */
+
+.diff-file-summary {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-content-sticky-raised);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--elevated);
+  border-bottom: 1px solid var(--hair);
+  font-family: var(--font-sans, var(--font-mono));
+  font-size: var(--fs-xs);
+}
+
+.diff-file-summary__actions {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+}
+
+.diff-file-summary__action,
+.diff-file-summary__nav-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid var(--hair);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background var(--dur-micro) var(--ease-out-quart),
+    border-color var(--dur-micro) var(--ease-out-quart);
+}
+
+.diff-file-summary__action:hover,
+.diff-file-summary__nav-btn:hover:not(:disabled) {
+  background: var(--subtle);
+  border-color: var(--hair-strong);
+}
+
+.diff-file-summary__action:focus-visible,
+.diff-file-summary__nav-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.diff-file-summary__nav-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.diff-file-summary__count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-file-summary__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.diff-file-summary__item {
+  flex: 0 0 auto;
+}
+
+.diff-file-summary__chip {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid var(--hair-strong);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  padding: var(--sp-1) var(--sp-4);
+  border-radius: var(--r-full);
+  cursor: pointer;
+  display: inline-flex;
+  gap: var(--sp-2);
+  align-items: baseline;
+  white-space: nowrap;
+  max-width: 240px;
+  transition: all var(--dur-micro) var(--ease-out-quart);
+}
+
+.diff-file-summary__chip:hover {
+  background: var(--subtle);
+  border-color: var(--muted);
+}
+
+.diff-file-summary__chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.diff-file-summary__chip--active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
+}
+
+.diff-file-summary__chip--active .diff-file-summary__chip-add,
+.diff-file-summary__chip--active .diff-file-summary__chip-del {
+  color: currentColor;
+}
+
+.diff-file-summary__chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.diff-file-summary__chip-stats {
+  display: inline-flex;
+  gap: var(--sp-1);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-file-summary__chip-add {
+  color: var(--add-fg);
+}
+
+.diff-file-summary__chip-del {
+  color: var(--del-fg);
+}
+
+/* ── Touch targets: expand to 44x44 on coarse pointers ────── */
+@media (pointer: coarse) {
+  .diff-file-summary__chip,
+  .diff-file-summary__action,
+  .diff-file-summary__nav-btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* ── File section ─────────────────────────────────────────── */
+
+.diff-file-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--hair);
+}
+
+.diff-file-section:last-child {
+  border-bottom: 0;
+}
+
+/* ── File section header (sticky per file) ─────────────── */
+
+.diff-file-header {
+  position: sticky;
+  top: var(--diff-file-header-top, 0);
+  z-index: var(--z-content-sticky);
+  background: var(--elevated);
+  border-bottom: 1px solid var(--hair);
+  font-family: var(--font-sans, var(--font-mono));
+  font-size: var(--fs-sm);
+}
+
+.diff-file-header__toggle {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  font: inherit;
+  color: var(--ink-strong);
+  text-align: start;
+  cursor: pointer;
+  transition: background var(--dur-micro) var(--ease-out-quart);
+}
+
+.diff-file-header__toggle:hover {
+  background: var(--subtle);
+}
+
+.diff-file-header__toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.diff-file-header__chevron {
+  display: inline-block;
+  width: 12px;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  transition: transform var(--dur-micro) var(--ease-out-quart);
+  transform-origin: 50% 50%;
+  flex-shrink: 0;
+}
+
+.diff-file-section:not(.diff-file-section--collapsed) .diff-file-header__chevron {
+  transform: rotate(90deg);
+}
+
+.diff-file-header__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 18px;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-sm);
+  background: var(--subtle);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.diff-file-header__path {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.diff-file-header__path-old {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.diff-file-header__path-arrow {
+  color: var(--muted);
+}
+
+.diff-file-header__path-new {
+  color: var(--ink-strong);
+}
+
+.diff-file-header__stats {
+  display: inline-flex;
+  gap: var(--sp-2);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
+}
+
+.diff-file-header__stat-add {
+  color: var(--add-fg);
+  font-weight: 600;
+}
+
+.diff-file-header__stat-del {
+  color: var(--del-fg);
+  font-weight: 600;
+}
+
+/* ── File section body (collapsible content) ───────────── */
+
+.diff-file-section__body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* `hidden` already removes from layout; this is a defensive backstop. */
+.diff-file-section--collapsed .diff-file-section__body[hidden] {
+  display: none;
+}
+
+/* ── Large file truncation banner ─────────────────────────── */
+/* Rendered at the bottom of a section's body when the file exceeds
+ * LARGE_FILE_THRESHOLD lines and the user has not opted to render the
+ * full file. Styled like a soft footer; the action button is the
+ * single opt-in to mount the remaining rows. */
+.diff-file-section__truncation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: flex-start;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--subtle);
+  border-top: 1px dashed var(--hair);
+  font-family: var(--font-sans, var(--font-mono));
+}
+
+.diff-file-section__truncation-msg {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.diff-file-section__truncation-action {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid var(--hair);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-xs);
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background var(--dur-micro) var(--ease-out-quart),
+    border-color var(--dur-micro) var(--ease-out-quart);
+}
+
+.diff-file-section__truncation-action:hover {
+  background: var(--subtle);
+  border-color: var(--hair-strong);
+}
+
+.diff-file-section__truncation-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (pointer: coarse) {
+  .diff-file-section__truncation-action {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* ── Line row ─────────────────────────────────────────────── */
+
+.diff-line {
+  display: flex;
+  align-items: stretch;
+  min-height: 22px;
+  padding: 0;
+  /* Anchor for the absolutely-positioned `.diff-line__claim-dot`. The
+     existing `.diff-line--hunk` rule already sets `position: relative`
+     for the marker glyph; making this universal keeps the dot in the
+     gutter without affecting layout. */
+  position: relative;
+}
+
+button.diff-line {
+  width: 100%;
+  border: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.diff-line--add {
+  background: var(--add-bg);
+  color: var(--add-fg);
+}
+
+.diff-line--del {
+  background: var(--del-bg);
+  color: var(--del-fg);
+}
+
+.diff-line--hunk {
+  position: relative;
+  /* Section break in the galley: a warm hairline-bounded band with the
+     @@ range set in serif italic, like a typeset sub-head. */
+  background: var(--accent-softer);
+  color: var(--accent-ink);
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 13.5px;
+  letter-spacing: 0.01em;
+  border-block: 1px solid var(--accent-hair);
+}
+
+.diff-line--hunk[data-hunk-mark]::before {
+  content: attr(data-hunk-mark);
+  position: absolute;
+  left: -22px;
+  top: 14px;
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 22px;
+  color: var(--accent);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  pointer-events: none;
+}
+
+.diff-line--meta {
+  background: var(--subtle);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.diff-line--ctx {
+  background: transparent;
+  color: var(--ink);
+}
+
+.diff-line--claim-linked {
+  transition: filter var(--dur-micro) var(--ease-out-quart);
+}
+
+.diff-line--claim-linked:hover {
+  filter: brightness(0.97);
+  outline: 1px solid var(--accent);
+}
+
+.diff-line--claim-linked:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: -2px;
+}
+
+/* Selected claim: soft warm editorial band rather than a harsh ring. A
+   thin accent rail in the gutter marks the annotated line like a margin
+   note; the warm wash (accent-soft) continues the "soft row band" idiom. */
+.diff-line--claim-selected {
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--accent-soft);
+  scroll-margin-top: 64px;
+}
+
+.diff-line--add.diff-line--claim-selected {
+  background: color-mix(in srgb, var(--add-bg) 76%, var(--accent-soft));
+}
+
+.diff-line--del.diff-line--claim-selected {
+  background: color-mix(in srgb, var(--del-bg) 76%, var(--accent-soft));
+}
+
+.diff-split-cell--add.diff-line--claim-selected {
+  background: color-mix(in srgb, var(--add-bg) 76%, var(--accent-soft));
+}
+
+.diff-split-cell--del.diff-line--claim-selected {
+  background: color-mix(in srgb, var(--del-bg) 76%, var(--accent-soft));
+}
+
+@keyframes diff-claim-pulse {
+  0% { box-shadow: inset 3px 0 0 var(--accent); }
+  40% { box-shadow: inset 3px 0 0 var(--accent-ink), 0 0 0 1px var(--accent-soft); }
+  100% { box-shadow: inset 3px 0 0 var(--accent); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .diff-line--claim-selected {
+    animation: diff-claim-pulse 1s ease-out;
+  }
+}
+
+/* ── Change indicator (+/−) ────────────────────────────────── */
+
+.diff-line__change-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  box-sizing: border-box;
+  width: 32px;
+  min-width: 32px;
+  padding-inline-end: 6px;
+  /* Heavy inky +/− that prints like a proofreader's mark. */
+  font-weight: 800;
+  font-size: 0.875rem;
+  line-height: 1;
+  user-select: none;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+.diff-line--add .diff-line__change-indicator { color: var(--add-fg); }
+.diff-line--del .diff-line__change-indicator { color: var(--del-fg); }
+
+.diff-line__marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  min-width: 16px;
+  font-weight: 800;
+  font-size: 0.8125rem;
+  user-select: none;
+  pointer-events: none;
+  color: var(--muted);
+}
+.diff-split-cell--add .diff-line__marker { color: var(--add-fg); }
+.diff-split-cell--del .diff-line__marker { color: var(--del-fg); }
+
+/* ── Line numbers ─────────────────────────────────────────── */
+
+.diff-line__lineno {
+  display: inline-block;
+  box-sizing: border-box;
+  width: 52px;
+  min-width: 52px;
+  padding: 0 var(--sp-2);
+  text-align: end;
+  color: var(--muted-strong);
+  font-variant-numeric: tabular-nums;
+  -webkit-user-select: none;
+  user-select: none;
+  /* Dashed gutter rule — archival ledger feel, distinct from the solid
+     section borders so the line-number column reads as a margin. */
+  border-inline-end: 1px dashed var(--hair-strong);
+  flex-shrink: 0;
+}
+
+/* ── Claim dot (gutter indicator) ─────────────────────────── */
+
+/* Single aggregated dot per line. Color = worst verdict across all claims
+   on this line. A count badge appears beside the dot when ≥2 claims. */
+.diff-line__claim-indicator {
+  position: absolute;
+  inset-inline-start: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  pointer-events: none;
+}
+
+.diff-line__claim-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+  background: var(--muted);
+  box-shadow: 0 0 0 1px var(--paper);
+  transition: transform var(--dur-xfast) var(--ease-out-quart),
+    box-shadow var(--dur-xfast) var(--ease-out-quart);
+}
+
+.diff-line__claim-count {
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+button.diff-line:hover .diff-line__claim-dot,
+button.diff-line:focus-visible .diff-line__claim-dot,
+button.diff-split-cell:hover .diff-line__claim-dot,
+button.diff-split-cell:focus-visible .diff-line__claim-dot {
+  transform: scale(1.25);
+  box-shadow: 0 0 0 1.5px var(--paper), 0 0 3px 0 currentColor;
+}
+
+.diff-line__claim-dot--verified {
+  color: var(--success);
+  background: var(--success);
+}
+.diff-line__claim-count--verified {
+  color: var(--success);
+}
+
+.diff-line__claim-dot--weak {
+  color: var(--warning);
+  background: var(--warning);
+}
+.diff-line__claim-count--weak {
+  color: var(--warning);
+}
+
+.diff-line__claim-dot--not_proven {
+  color: var(--muted);
+  background: var(--muted);
+}
+
+.diff-line__claim-dot--rejected,
+.diff-line__claim-dot--contradicted {
+  color: var(--danger);
+  background: var(--danger);
+}
+.diff-line__claim-count--rejected,
+.diff-line__claim-count--contradicted {
+  color: var(--danger);
+}
+
+@media (forced-colors: active) {
+  .diff-line__claim-dot {
+    forced-color-adjust: none;
+    background: LinkText;
+    box-shadow: 0 0 0 1px Canvas;
+  }
+  .diff-line__claim-count {
+    color: LinkText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diff-line__claim-dot {
+    transition: none;
+  }
+  button.diff-line:hover .diff-line__claim-dot,
+  button.diff-line:focus-visible .diff-line__claim-dot,
+  button.diff-split-cell:hover .diff-line__claim-dot,
+  button.diff-split-cell:focus-visible .diff-line__claim-dot {
+    transform: none;
+  }
+}
+
+.diff-line--hunk .diff-line__lineno,
+.diff-line--meta .diff-line__lineno {
+  visibility: hidden;
+}
+
+/* ── Line text ────────────────────────────────────────────── */
+
+.diff-line__text {
+  flex: 1 1 auto;
+  padding: 0 var(--sp-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.diff-line__text code {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* ── Split diff rows ───────────────────────────────────────── */
+
+.diff-split-row {
+  min-width: 0;
+}
+
+.diff-split-row--pair {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(240px, 1fr);
+  border-bottom: 1px solid var(--hair);
+}
+
+.diff-split-row--span {
+  display: block;
+}
+
+.diff-split-row--span .diff-line {
+  border-bottom: 1px solid var(--hair);
+}
+
+.diff-split-cell {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  min-height: 22px;
+  position: relative;
+}
+
+button.diff-split-cell {
+  width: 100%;
+  border: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.diff-split-cell--old {
+  border-inline-end: 1px dashed var(--hair-strong);
+}
+
+.diff-split-cell--ctx {
+  background: transparent;
+  color: var(--ink);
+}
+
+.diff-split-cell--add {
+  background: var(--add-bg);
+  color: var(--add-fg);
+  border-inline-start: 4px solid var(--add-fg);
+}
+
+.diff-split-cell--del {
+  background: var(--del-bg);
+  color: var(--del-fg);
+  border-inline-start: 4px solid var(--del-fg);
+}
+
+.diff-split-cell--empty {
+  background: var(--subtle);
+  opacity: 0.68;
+}
+
+.diff-page__view-chip {
+  font: inherit;
+  border: 1px solid var(--hair);
+}
+
+/* ── Diff page layout ─────────────────────────────────────── */
+
+.diff-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: var(--sp-8) var(--sp-10) 88px;
+  gap: 18px;
+  animation: fadeUp 0.28s ease-out;
+  overflow: visible;
+}
+
+.diff-page__header {
+  flex-shrink: 0;
+}
+
+.diff-page__header .right {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: flex-end;
+}
+
+.diff-page__header h1 {
+  font-family: var(--font-serif);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--ink-strong);
+  margin: 0;
+}
+
+.diff-page__header-stats {
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 0.75em;
+  font-weight: 400;
+}
+
+.diff-page__split {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  gap: 18px;
+  scroll-margin-top: 80px;
+}
+
+.diff-page__body {
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-page__claims-warning {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--warning-hair);
+  border-radius: var(--r-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--fs-sm);
+}
+
+.diff-page__claims-warning strong {
+  color: var(--ink-strong);
+}
+
+.diff-page__loading,
+.diff-page__error,
+.diff-page__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.diff-page__error {
+  color: var(--danger);
+}
+
+/* ── BottomMiniPanel ──────────────────────────────────────── */
+
+.mini-panel {
+  display: flex;
+  gap: var(--sp-4);
+  align-items: center;
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-base);
+  box-shadow: var(--sh-lg);
+
+  /* Desktop: fixed overlay at bottom-right */
+  position: fixed;
+  inset-inline-end: var(--sp-6);
+  bottom: var(--sp-6);
+  z-index: var(--z-floating);
+}
+
+.mini-panel__item {
+  display: flex;
+  gap: var(--sp-1);
+  align-items: baseline;
+}
+
+.mini-panel__label {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.mini-panel__value {
+  color: var(--ink-strong);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* ── Mobile layout ────────────────────────────────────────── */
+
+/* ── Desktop narrow: shrink padding (V6 §2D, --bp-lg2 1024px) ────── */
+@media (max-width: 1024px) {
+  .diff-page {
+    padding: var(--sp-5) var(--sp-5) 80px;
+  }
+}
+
+/* ── Tablet: pull inspector below diff (V6 §2D, --bp-lg 900px) ───── */
+@media (max-width: 900px) {
+  .diff-page__split {
+    grid-template-columns: 1fr;
+    gap: var(--sp-3);
+  }
+}
+
+@media (max-width: 767px) {
+  .diff-page {
+    padding: var(--sp-3) var(--sp-3);
+    gap: var(--sp-2);
+  }
+
+  .diff-page__split {
+    grid-template-columns: 1fr;
+  }
+
+  .diff-line__lineno {
+    width: 36px;
+    min-width: 36px;
+    padding: 0 var(--sp-1);
+    font-size: 11px;
+  }
+
+  .diff-line__text {
+    padding: 0 var(--sp-2);
+  }
+
+  .diff-split-row--pair {
+    grid-template-columns: minmax(190px, 1fr) minmax(190px, 1fr);
+  }
+
+  .mini-panel {
+    position: sticky;
+    inset-inline-end: auto;
+    bottom: 0;
+    inset-inline-start: 0;
+    border-radius: 0;
+    box-shadow: var(--sh-md);
+    justify-content: center;
+    z-index: var(--z-floating);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+}
+
+/* ── Small phones (V6 §2D, --bp-xs 540px) ─────────────────── */
+@media (max-width: 540px) {
+  .diff-page {
+    padding: var(--sp-2) 10px;
+  }
+
+  .diff-line__lineno {
+    width: 30px;
+    min-width: 30px;
+    font-size: 10px;
+  }
+
+  .diff-line__change-indicator {
+    width: 26px;
+    min-width: 26px;
+    padding-inline-end: 4px;
+  }
+
+  .diff-line__text {
+    font-size: 12px;
+  }
+}
+
+/* ── Accessibility ────────────────────────────────────────── */
+
+@media (forced-colors: active) {
+  /* In forced colors the warm add/del background washes collapse to the
+     system Canvas, so the only differentiator left is the +/− glyph and
+     the row edge. Outline each changed row and lean on a heavier,
+     system-colored marker so add vs del stays legible without color. */
+  .diff-line--add,
+  .diff-line--del,
+  .diff-line--hunk,
+  .diff-line--meta {
+    border: 1px solid CanvasText;
+  }
+
+  /* Keep the +/− marks vivid and non-overridable; CanvasText guarantees a
+     readable foreground against the forced Canvas. A leading edge on the
+     row reinforces add (start rail) vs del (dashed start rail). */
+  .diff-line__change-indicator,
+  .diff-line__marker {
+    forced-color-adjust: none;
+    color: CanvasText;
+    font-weight: 800;
+  }
+
+  .diff-line--add {
+    border-inline-start: 3px solid CanvasText;
+  }
+
+  .diff-line--del {
+    border-inline-start: 3px dashed CanvasText;
+  }
+
+  .diff-line--claim-linked:focus-visible,
+  .diff-line--claim-selected {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+
+  /* Re-assert the claim band's gutter rail in high contrast. */
+  .diff-line--claim-selected {
+    box-shadow: inset 3px 0 0 Highlight;
+  }
+
+  .mini-panel {
+    border: 1px solid CanvasText;
+  }
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diff-page,
+  .diff-view,
+  .diff-line--claim-linked,
+  .mini-panel {
+    animation: none;
+    transition: none;
+  }
+}
+
+/* ── Print ───────────────────────────────────────────────── */
+
+@media print {
+  .diff-page {
+    padding: 0;
+  }
+
+  .diff-page__split {
+    grid-template-columns: 1fr;
+  }
+
+  .diff-view {
+    overflow: visible;
+  }
+
+  .diff-line {
+    break-inside: avoid;
+  }
+
+  .diff-file-summary {
+    display: none;
+  }
+
+  .diff-file-header {
+    position: static;
+  }
+
+  .mini-panel {
+    display: none;
+  }
+}
+.document-view__header,
+.document-view__navigation {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+}
+
+.document-view__note { padding: var(--sp-4); color: var(--muted-strong); }
+.document-view__text { overflow: auto; margin: 0; padding: var(--sp-3); font-size: var(--fs-sm); line-height: var(--lh-relaxed); }
+.document-view__line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.document-view__number { display: inline-block; width: 5ch; margin-inline-end: var(--sp-3); color: var(--muted-strong); user-select: none; }
+.document-view__line--selected { background: var(--subtle); box-shadow: inset 3px 0 var(--accent-ink); }
+.diff-page__review-context { padding: var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-lg); margin-bottom: var(--sp-4); }
+.diff-page__review-context pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; }
+
+@media (forced-colors: active) {
+  .document-view__line--selected { outline: 1px solid Highlight; }
+  .diff-page__review-context { border-color: CanvasText; }
+}

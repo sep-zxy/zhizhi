@@ -1,0 +1,144 @@
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
+import type { ClientRequest, IncomingMessage } from 'node:http';
+
+const DEV_API_ORIGIN = process.env.AHADIFF_DEV_API_ORIGIN ?? 'http://127.0.0.1:8765';
+const DEV_API_HOST = new URL(DEV_API_ORIGIN).host;
+
+function rewriteLoopbackProxyHeaders(proxyReq: ClientRequest, _req: IncomingMessage): void {
+  proxyReq.setHeader('Host', DEV_API_HOST);
+  proxyReq.setHeader('Origin', DEV_API_ORIGIN);
+  proxyReq.setHeader('Referer', DEV_API_ORIGIN);
+}
+
+// Keep page-only dependencies in async chunks. The build script reports shell
+// and first-Growth transfer sizes and validates their local asset references.
+const GRAPH_RENDERER_VENDOR_MARKERS = [
+  'node_modules/@tweenjs/tween.js',
+  'node_modules/accessor-fn',
+  'node_modules/bezier-js',
+  'node_modules/canvas-color-tracker',
+  'node_modules/d3-',
+  'node_modules/float-tooltip',
+  'node_modules/force-graph',
+  'node_modules/index-array-by',
+  'node_modules/internmap',
+  'node_modules/jerrypick',
+  'node_modules/kapsule',
+  'node_modules/lodash-es',
+  'node_modules/react-force-graph-2d',
+  'node_modules/react-kapsule',
+];
+
+export default defineConfig({
+  plugins: [
+    react(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      injectRegister: 'script-defer',
+      manifest: false,
+      devOptions: {
+        enabled: false,
+      },
+      workbox: {
+        cleanupOutdatedCaches: true,
+        skipWaiting: true,
+        clientsClaim: true,
+        navigateFallback: './index.html',
+        globPatterns: ['**/*.{js,css,html,svg,png,json,webmanifest,woff2}'],
+      },
+    }),
+  ],
+  base: './',
+  server: {
+    port: 5173,
+    strictPort: false,
+    proxy: {
+      '/api': {
+        target: DEV_API_ORIGIN,
+        changeOrigin: true,
+        secure: false,
+        configure: (proxy) => {
+          proxy.on('proxyReq', rewriteLoopbackProxyHeaders);
+        },
+      },
+    },
+  },
+  build: {
+    target: ['es2022', 'chrome111', 'edge111', 'firefox121', 'safari16.4', 'ios16.4'],
+    outDir: 'dist',
+    sourcemap: false,
+    emptyOutDir: true,
+    manifest: true,
+    chunkSizeWarningLimit: 250,
+    /**
+     * Phase 4F: Strip page-only async dependencies (zod, graph renderer,
+     * future prismjs) from the synchronous modulepreload set. Without this,
+     * any vendor chunk imported transitively by a single lazy page would be
+     * preloaded on initial HTML and included in the initial transfer size.
+     * These chunks load on the first route
+     * navigation that needs them.
+     *
+     * `resolveDependencies` runs per-chunk; it controls modulepreload tag
+     * emission, not actual chunking — `manualChunks` below is the source of
+     * truth for chunk graph.
+     */
+    modulePreload: {
+      resolveDependencies: (
+        _filename: string,
+        deps: string[],
+        _ctx: { hostId: string; hostType: 'js' | 'html' },
+      ): string[] => {
+        return deps.filter((dep) => {
+          // Keep core shell + routing chunks in modulepreload — they're
+          // required before any route can render.
+          if (dep.includes('vendor-react')) return true;
+          if (dep.includes('vendor-router')) return true;
+          if (dep.endsWith('.css')) return true;
+          // vendor-page-deps holds zod + any other page-only async deps.
+          // Skip preloading; first navigation pays the latency.
+          if (dep.includes('vendor-page-deps')) return false;
+          if (dep.includes('vendor-graph')) return false;
+          return true;
+        });
+      },
+    },
+    rollupOptions: {
+      output: {
+        manualChunks: (id: string): string | undefined => {
+          if (!id.includes('node_modules')) return undefined;
+          // React core lives in its own vendor chunk so the initial route
+          // payload only carries it once.
+          if (
+            id.includes('node_modules/react/') ||
+            id.includes('node_modules/react-dom/') ||
+            id.includes('node_modules/scheduler/')
+          ) {
+            return 'vendor-react';
+          }
+          // Routing + state are also part of the shell, but smaller; keep
+          // them together so route-level chunks don't duplicate them.
+          if (
+            id.includes('node_modules/react-router') ||
+            id.includes('node_modules/zustand')
+          ) {
+            return 'vendor-router';
+          }
+          // Page-only deps (zod runtime validation, graph renderer,
+          // future prismjs) are excluded from modulepreload above so they
+          // don't enter the shell's modulepreload set. Add new lazy-only
+          // dependencies here and review the reported build transfer sizes.
+          if (id.includes('node_modules/zod')) {
+            return 'vendor-page-deps';
+          }
+          if (GRAPH_RENDERER_VENDOR_MARKERS.some((marker) => id.includes(marker))) {
+            return 'vendor-graph';
+          }
+          // Anything else from node_modules still bucketed for stability.
+          return 'vendor-misc';
+        },
+      },
+    },
+  },
+});

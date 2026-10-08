@@ -1,0 +1,178 @@
+@media (forced-colors: active) {
+  :root {
+    --paper: Canvas;
+    --subtle: Canvas;
+    --elevated: Canvas;
+    --ink: CanvasText;
+    --ink-strong: CanvasText;
+    --muted: CanvasText;
+    --muted-strong: CanvasText;
+    --accent: LinkText;
+    --accent-ink: LinkText;
+    --on-accent: HighlightText;
+    --hair: CanvasText;
+    --hair-strong: CanvasText;
+    /* Diff / semantic foregrounds collapse to CanvasText; the system renders
+       its own contrasting palette. Keep backgrounds transparent so the OS
+       paints them correctly. */
+    --add-fg: CanvasText;
+    --del-fg: CanvasText;
+    --success: CanvasText;
+    --warning: CanvasText;
+    --danger: CanvasText;
+    --info: CanvasText;
+    --add-bg: Canvas;
+    --del-bg: Canvas;
+    --danger-soft: Canvas;
+    --accent-softest: Canvas;
+
+    /* Editorial overlay tokens (newspaper rules, folio crumb, ornament,
+       display ink). Without remapping, consumers that use these directly
+       would paint a literal dark hex in forced-colors mode instead of the
+       system palette. Map structure to CanvasText, the verified stamp to
+       LinkText, so contrast stays correct everywhere. */
+    --folio-line: CanvasText;
+    --ornament-ink: CanvasText;
+    --ink-display: CanvasText;
+    --ink-blackletter: CanvasText;
+    --stamp-verified: LinkText;
+    --stamp-verified-ink: LinkText;
+    --stamp-verified-frame: CanvasText;
+    --stamp-verified-tint: Canvas;
+    --stamp-verified-shadow: CanvasText;
+    --stamp-red: CanvasText;
+    --stamp-red-ink: CanvasText;
+  }
+
+  button,
+  a {
+    border-color: CanvasText;
+  }
+
+  .brand-mark {
+    color: HighlightText;
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+
+  .srs-card__btn--primary {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+    forced-color-adjust: none;
+  }
+
+  /* Claim verdict + diff badges keep their text + glyph; rely on OS palette.
+     The pill-family glyph is normally a CSS dot (font-size:0) — in
+     forced-colors mode we restore the character so the verdict stays
+     distinguishable when semantic color collapses to CanvasText. */
+  .claim-badge {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .claim-badge__glyph {
+    width: auto;
+    height: auto;
+    border-radius: 0;
+    background: transparent;
+    font-size: 11px;
+    color: CanvasText;
+    line-height: 1;
+  }
+
+  /* Rejected: keep the strike-through under forced colors so the verdict
+     reads as "rejected" even when the danger hue is unavailable. */
+  .claim-badge--rejected {
+    text-decoration: line-through;
+    text-decoration-color: CanvasText;
+  }
+
+  /* SRS rating buttons: distinguish Good/Hard/Again via system palette. */
+  .srs-card__rating-btn {
+    border: 2px solid CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .srs-card__rating-btn--good {
+    border-color: LinkText;
+  }
+
+  .srs-card__rating-btn--hard {
+    border-color: Highlight;
+  }
+
+  .srs-card__rating-btn--wrong {
+    border-color: CanvasText;
+  }
+
+  .srs-card__secondary-btn {
+    border: 1px solid CanvasText;
+  }
+
+  /* Scaffolding tabs: active tab gets Highlight background. */
+  .scaffolding-tab[aria-selected="true"] {
+    color: HighlightText;
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+
+  /* KPI cards in forced-colors. */
+  .kpi-card {
+    border: 1px solid CanvasText;
+  }
+
+  /* Verdict badges in forced-colors (moved from Dashboard.css alongside the
+   * cross-page extraction in utility.css). */
+  .verdict-badge {
+    border: 1px solid CanvasText;
+  }
+  .verdict-badge--PASS {
+    color: LinkText;
+    border-color: LinkText;
+    background: Canvas;
+  }
+  /* CAUTION distinguished from default badge via Highlight (system accent) —
+   * without this rule it collapsed to the same look as a default badge in
+   * forced-colors mode (R2-04). */
+  .verdict-badge--CAUTION {
+    color: Highlight;
+    border-color: Highlight;
+    background: Canvas;
+  }
+  .verdict-badge--FAIL {
+    color: CanvasText;
+    border-color: CanvasText;
+    background: Canvas;
+  }
+
+  .dashboard__weak-chip {
+    border: 1px solid CanvasText !important;
+    background: Canvas !important;
+    color: CanvasText !important;
+    forced-color-adjust: none;
+  }
+
+  .quiz-page__mode-badge {
+    border: 1px solid CanvasText;
+  }
+
+  .quiz-page__card-wrap--srs .srs-card,
+  .quiz-page__card-wrap--socratic .srs-card {
+    border-left: 3px solid CanvasText;
+  }
+
+  .review__summary {
+    border: 1px solid CanvasText;
+  }
+
+  .review__summary-toggle {
+    border-bottom: 1px solid CanvasText;
+  }
+
+  .judge-note-card {
+    border: 1px solid CanvasText;
+    background: Canvas;
+  }
+}

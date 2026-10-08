@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+from ahadiff.core.errors import InputError
+from ahadiff.core.ids import make_hunk_id
+
+from .hunk_hash import compute_hunk_hash
+from .path_tokens import normalize_diff_path_token, parse_diff_git_header_paths
+
+DiffChangeKind = Literal["modified", "added", "deleted", "renamed", "binary"]
+DiffLineKind = Literal["context", "add", "delete"]
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)$")
+_FORMAT_PATCH_FROM_RE = re.compile(r"^From [0-9a-fA-F]{7,64}(?:\s|$)")
+_GIT_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}(?:[.\w-]*)?$")
+_MAX_LINE_LEN = 1_000_000
+_COMBINED_DIFF_ERROR = (
+    "combined diff format is not supported; provide a standard unified diff patch"
+)
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DiffLineRecord:
+    kind: DiffLineKind
+    content: str
+    old_line: int | None
+    new_line: int | None
+
+
+@dataclass(frozen=True)
+class HunkRecord:
+    path: str
+    change_kind: DiffChangeKind
+    header: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    section_header: str | None
+    hunk_id: str
+    hunk_hash: str
+    raw_lines: tuple[str, ...]
+    lines: tuple[DiffLineRecord, ...]
+
+    @property
+    def old_end(self) -> int:
+        if self.old_count == 0:
+            return self.old_start - 1
+        return self.old_start + self.old_count - 1
+
+    @property
+    def new_end(self) -> int:
+        if self.new_count == 0:
+            return self.new_start - 1
+        return self.new_start + self.new_count - 1
+
+    @property
+    def added_lines(self) -> tuple[int, ...]:
+        return tuple(
+            line.new_line for line in self.lines if line.kind == "add" and line.new_line is not None
+        )
+
+    @property
+    def deleted_lines(self) -> tuple[int, ...]:
+        return tuple(
+            line.old_line
+            for line in self.lines
+            if line.kind == "delete" and line.old_line is not None
+        )
+
+    @property
+    def context_old_lines(self) -> tuple[int, ...]:
+        return tuple(
+            line.old_line
+            for line in self.lines
+            if line.kind == "context" and line.old_line is not None
+        )
+
+    @property
+    def context_new_lines(self) -> tuple[int, ...]:
+        return tuple(
+            line.new_line
+            for line in self.lines
+            if line.kind == "context" and line.new_line is not None
+        )
+
+
+@dataclass(frozen=True)
+class ChangedFileRecord:
+    old_path: str | None
+    new_path: str | None
+    display_path: str
+    change_kind: DiffChangeKind
+    is_binary: bool
+    headers: tuple[str, ...]
+    hunks: tuple[HunkRecord, ...]
+
+    @property
+    def path(self) -> str:
+        return self.display_path
+
+
+@dataclass(frozen=True)
+class _ParsedHunkBody:
+    lines: tuple[DiffLineRecord, ...]
+    consumed_old: int
+    consumed_new: int
+
+
+def parse_unified_diff(patch_text: str) -> tuple[ChangedFileRecord, ...]:
+    lines = patch_text.splitlines()
+    segments = split_unified_diff_segments(lines)
+    return tuple(_parse_segment(segment) for segment in segments)
+
+
+def iter_changed_files(patch_text: str) -> tuple[ChangedFileRecord, ...]:
+    return parse_unified_diff(patch_text)
+
+
+def iter_hunks(patch_text: str) -> tuple[HunkRecord, ...]:
+    return tuple(
+        hunk for changed_file in parse_unified_diff(patch_text) for hunk in changed_file.hunks
+    )
+
+
+def split_unified_diff_segments(
+    lines: list[str],
+    *,
+    include_preamble: bool = False,
+) -> list[list[str]]:
+    lines = _strip_git_format_patch_framing(lines)
+    segments: list[list[str]] = []
+    current: list[str] = []
+    current_has_diff_header = False
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.removeprefix("\ufeff") if index == 0 else raw_line
+        plain_start = (
+            line.startswith("--- ")
+            and index + 1 < len(lines)
+            and lines[index + 1].removeprefix("\ufeff").startswith("+++ ")
+        )
+        if line.startswith("diff --git ") or (plain_start and not current_has_diff_header):
+            if current:
+                segments.append(current)
+            current = [line]
+            current_has_diff_header = line.startswith("diff --git ")
+            continue
+        if not current and not include_preamble:
+            continue
+        current.append(line)
+
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strip_git_format_patch_framing(lines: list[str]) -> list[str]:
+    if not _looks_like_git_format_patch(lines):
+        return lines
+
+    stripped: list[str] = []
+    in_diff = False
+    for index, raw_line in enumerate(lines):
+        line = raw_line.removeprefix("\ufeff") if index == 0 else raw_line
+        if _is_diff_segment_start(lines, index, line):
+            in_diff = True
+            stripped.append(raw_line)
+            continue
+        if not in_diff:
+            continue
+        if _is_git_format_patch_boundary(lines, index, line):
+            in_diff = False
+            continue
+        stripped.append(raw_line)
+    return stripped
+
+
+def _looks_like_git_format_patch(lines: list[str]) -> bool:
+    for index, raw_line in enumerate(lines[:8]):
+        line = raw_line.removeprefix("\ufeff") if index == 0 else raw_line
+        stripped = _line_text(line).strip()
+        if not stripped:
+            continue
+        return _FORMAT_PATCH_FROM_RE.match(stripped) is not None
+    return False
+
+
+def _is_diff_segment_start(lines: list[str], index: int, line: str) -> bool:
+    del lines, index
+    return line.startswith("diff --git ")
+
+
+def _is_git_format_patch_boundary(lines: list[str], index: int, line: str) -> bool:
+    stripped = _line_text(line).strip()
+    if _FORMAT_PATCH_FROM_RE.match(stripped):
+        return True
+    return (
+        _line_text(line) == "-- "
+        and index + 1 < len(lines)
+        and _GIT_VERSION_RE.match(_line_text(lines[index + 1]).strip()) is not None
+    )
+
+
+def _line_text(line: str) -> str:
+    return line.rstrip("\r\n")
+
+
+def _parse_segment(lines: list[str]) -> ChangedFileRecord:
+    old_path: str | None = None
+    new_path: str | None = None
+    change_kind: DiffChangeKind = "modified"
+    is_binary = False
+    headers: list[str] = []
+
+    for line in lines:
+        if line.startswith("@@@"):
+            raise InputError(_COMBINED_DIFF_ERROR)
+        if line.startswith("@@ "):
+            break
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            is_binary = True
+            if change_kind == "modified":
+                change_kind = "binary"
+            break
+        headers.append(line)
+        if line.startswith("diff --git "):
+            parsed_paths = parse_diff_git_header_paths(line)
+            if parsed_paths is not None:
+                old_path, new_path = parsed_paths
+        elif line.startswith("--- "):
+            old_path = _normalize_diff_path(line.removeprefix("--- ").strip(), prefix="a/")
+        elif line.startswith("+++ "):
+            new_path = _normalize_diff_path(line.removeprefix("+++ ").strip(), prefix="b/")
+        elif line.startswith("rename from "):
+            old_path = _normalize_diff_path(line.removeprefix("rename from ").strip())
+            change_kind = "renamed"
+        elif line.startswith("rename to "):
+            new_path = _normalize_diff_path(line.removeprefix("rename to ").strip())
+            change_kind = "renamed"
+        elif line.startswith("new file mode "):
+            change_kind = "added"
+        elif line.startswith("deleted file mode "):
+            change_kind = "deleted"
+
+    display_path = new_path or old_path or "__unknown__"
+    hunks = _parse_hunks(display_path, change_kind, lines)
+    return ChangedFileRecord(
+        old_path=old_path,
+        new_path=new_path,
+        display_path=display_path,
+        change_kind=change_kind,
+        is_binary=is_binary,
+        headers=tuple(headers),
+        hunks=tuple(hunks),
+    )
+
+
+def _parse_hunks(path: str, change_kind: DiffChangeKind, lines: list[str]) -> list[HunkRecord]:
+    hunks: list[HunkRecord] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("@@@"):
+            raise InputError(_COMBINED_DIFF_ERROR)
+        if not line.startswith("@@ "):
+            index += 1
+            continue
+        header = line
+        body: list[str] = []
+        index += 1
+        while index < len(lines):
+            body_line = lines[index]
+            if body_line.startswith("@@@"):
+                raise InputError(_COMBINED_DIFF_ERROR)
+            if (
+                body_line.startswith("@@ ")
+                or body_line.startswith("diff --git ")
+                or body_line.startswith("Binary files ")
+                or body_line.startswith("GIT binary patch")
+            ):
+                break
+            body.append(body_line)
+            index += 1
+        hunks.append(_build_hunk(path, change_kind, header, body))
+    return hunks
+
+
+def _normalize_diff_path(candidate: str, *, prefix: str = "") -> str | None:
+    return normalize_diff_path_token(candidate, prefix=prefix)
+
+
+def _build_hunk(
+    path: str,
+    change_kind: DiffChangeKind,
+    header: str,
+    body_lines: list[str],
+) -> HunkRecord:
+    match = _HUNK_HEADER_RE.match(header)
+    if match is None:
+        raise InputError(f"invalid unified diff hunk header (line length={len(header)})")
+    old_start = int(match.group(1))
+    old_count = int(match.group(2) or "1")
+    new_start = int(match.group(3))
+    new_count = int(match.group(4) or "1")
+    section_header = match.group(5).strip() or None
+
+    has_truncated_marker = any(line == "[truncated]" for line in body_lines)
+    normalized_body_lines: list[str] = []
+
+    for raw_line in body_lines:
+        if len(raw_line) > _MAX_LINE_LEN:
+            log.warning(
+                "truncating overlong unified diff hunk line in %s from %d to %d characters",
+                path,
+                len(raw_line),
+                _MAX_LINE_LEN,
+            )
+            raw_line = raw_line[:_MAX_LINE_LEN]
+        normalized_body_lines.append(raw_line)
+
+    parsed_body = _parse_hunk_body(
+        body_lines=normalized_body_lines,
+        old_start=old_start,
+        new_start=new_start,
+        skip_leaked_metadata=False,
+    )
+
+    if not has_truncated_marker and (
+        parsed_body.consumed_old != old_count or parsed_body.consumed_new != new_count
+    ):
+        fallback_body = _parse_hunk_body(
+            body_lines=normalized_body_lines,
+            old_start=old_start,
+            new_start=new_start,
+            skip_leaked_metadata=True,
+        )
+        if fallback_body.consumed_old == old_count and fallback_body.consumed_new == new_count:
+            parsed_body = fallback_body
+
+    if not has_truncated_marker and (
+        parsed_body.consumed_old != old_count or parsed_body.consumed_new != new_count
+    ):
+        raise InputError(
+            "unified diff hunk body does not match header counts: "
+            f"{header} (expected old={old_count}, new={new_count}; "
+            f"parsed old={parsed_body.consumed_old}, new={parsed_body.consumed_new})"
+        )
+
+    return HunkRecord(
+        path=path,
+        change_kind=change_kind,
+        header=header,
+        old_start=old_start,
+        old_count=old_count,
+        new_start=new_start,
+        new_count=new_count,
+        section_header=section_header,
+        hunk_id=make_hunk_id(path, old_start, new_start, section_header),
+        hunk_hash=compute_hunk_hash(header=header, body_lines=normalized_body_lines),
+        raw_lines=tuple(normalized_body_lines),
+        lines=parsed_body.lines,
+    )
+
+
+def _parse_hunk_body(
+    *,
+    body_lines: list[str],
+    old_start: int,
+    new_start: int,
+    skip_leaked_metadata: bool,
+) -> _ParsedHunkBody:
+    old_cursor = old_start
+    new_cursor = new_start
+    consumed_old = 0
+    consumed_new = 0
+    parsed_lines: list[DiffLineRecord] = []
+
+    seen_body_line = False
+    for index, raw_line in enumerate(body_lines):
+        if raw_line.startswith("\\ "):
+            continue
+        if raw_line == "[truncated]":
+            continue
+        if skip_leaked_metadata and _should_skip_leaked_hunk_metadata(
+            body_lines=body_lines,
+            index=index,
+            seen_body_line=seen_body_line,
+        ):
+            continue
+        prefix = raw_line[:1]
+        if prefix not in {" ", "+", "-"}:
+            if _is_leaked_hunk_metadata(raw_line):
+                continue
+            raise InputError(
+                f"unified diff hunk line is missing prefix (line length={len(raw_line)})"
+            )
+        content = raw_line[1:]
+        if prefix == " ":
+            parsed_lines.append(DiffLineRecord("context", content, old_cursor, new_cursor))
+            old_cursor += 1
+            new_cursor += 1
+            consumed_old += 1
+            consumed_new += 1
+        elif prefix == "-":
+            parsed_lines.append(DiffLineRecord("delete", content, old_cursor, None))
+            old_cursor += 1
+            consumed_old += 1
+        else:
+            parsed_lines.append(DiffLineRecord("add", content, None, new_cursor))
+            new_cursor += 1
+            consumed_new += 1
+        seen_body_line = True
+
+    return _ParsedHunkBody(
+        lines=tuple(parsed_lines),
+        consumed_old=consumed_old,
+        consumed_new=consumed_new,
+    )
+
+
+def _should_skip_leaked_hunk_metadata(
+    *,
+    body_lines: list[str],
+    index: int,
+    seen_body_line: bool,
+) -> bool:
+    raw_line = body_lines[index]
+    if not _is_leaked_hunk_metadata(raw_line):
+        return False
+    if raw_line[:1] not in {" ", "+", "-"}:
+        return True
+    if seen_body_line:
+        return False
+    return _is_leaked_file_header_pair_line(body_lines, index)
+
+
+def _is_leaked_file_header_pair_line(body_lines: list[str], index: int) -> bool:
+    raw_line = body_lines[index]
+    if _is_old_file_header_line(raw_line):
+        return index + 1 < len(body_lines) and _is_new_file_header_line(body_lines[index + 1])
+    if _is_new_file_header_line(raw_line):
+        return index > 0 and _is_old_file_header_line(body_lines[index - 1])
+    return False
+
+
+def _is_old_file_header_line(raw_line: str) -> bool:
+    return raw_line.startswith("--- ") and _looks_like_diff_header_path(
+        raw_line.removeprefix("--- "),
+        prefixes=("a/", "a\\"),
+    )
+
+
+def _is_new_file_header_line(raw_line: str) -> bool:
+    return raw_line.startswith("+++ ") and _looks_like_diff_header_path(
+        raw_line.removeprefix("+++ "),
+        prefixes=("b/", "b\\"),
+    )
+
+
+def _looks_like_diff_header_path(candidate: str, *, prefixes: tuple[str, ...]) -> bool:
+    token = candidate.strip()
+    if token == "/dev/null":
+        return True
+    if token.startswith('"'):
+        token = token[1:]
+    return token.startswith(prefixes)
+
+
+def _is_leaked_hunk_metadata(raw_line: str) -> bool:
+    return (
+        raw_line.startswith("index ")
+        or raw_line.startswith("--- ")
+        or raw_line.startswith("+++ ")
+        or raw_line.startswith("old mode ")
+        or raw_line.startswith("new mode ")
+        or raw_line.startswith("new file mode ")
+        or raw_line.startswith("deleted file mode ")
+        or raw_line.startswith("similarity index ")
+        or raw_line.startswith("dissimilarity index ")
+        or raw_line.startswith("rename from ")
+        or raw_line.startswith("rename to ")
+        or raw_line.startswith("copy from ")
+        or raw_line.startswith("copy to ")
+        or raw_line.startswith("diff --git ")
+    )
+
+
+__all__ = [
+    "ChangedFileRecord",
+    "DiffChangeKind",
+    "DiffLineKind",
+    "DiffLineRecord",
+    "HunkRecord",
+    "iter_changed_files",
+    "iter_hunks",
+    "parse_unified_diff",
+    "split_unified_diff_segments",
+]

@@ -1,0 +1,735 @@
+/* ==========================================================================
+   Ratchet standalone page styles.
+   Based on v6 template data-page="ratchet".
+   ========================================================================== */
+
+.ratchet-page {
+  max-width: var(--mw-page);
+  margin: 0 auto;
+  padding: 0 0 var(--sp-10);
+}
+
+/* ---- Header ---- */
+.ratchet-page__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-6);
+  padding-bottom: 22px;
+  margin-bottom: 28px;
+  /* Annual-report masthead: heavy classic double rule under the title block,
+     echoing the bound-ledger / financial-almanac feel. */
+  border-bottom: 4px double var(--hair-strong);
+  flex-wrap: wrap;
+}
+
+.ratchet-page__head-left { flex: 1 1 0; }
+
+.ratchet-page__head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.ratchet-page__spec-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--elevated);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.ratchet-page__spec-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.ratchet-page__spec-score,
+.ratchet-page__spec-trend {
+  white-space: nowrap;
+}
+
+.ratchet-page__title {
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: var(--fs-h1);
+  letter-spacing: var(--ls-h1);
+  margin: 0;
+  line-height: var(--lh-h1);
+  color: var(--ink-blackletter);
+  text-wrap: balance;
+}
+
+@supports not (text-wrap: balance) {
+  .ratchet-page__title {
+    text-wrap: initial;
+  }
+}
+
+.ratchet-page__sub {
+  color: var(--muted);
+  font-size: 14px;
+  margin-top: var(--sp-2);
+  line-height: 1.65;
+}
+
+/* ---- 2-column grid ---- */
+.ratchet-page__grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr;
+  gap: var(--sp-6);
+  margin-bottom: var(--sp-6);
+}
+
+/* ---- Card wrapper ---- */
+.ratchet-card {
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.ratchet-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px var(--sp-5);
+  border-bottom: 1px solid var(--hair);
+}
+
+.ratchet-card__header h2 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: var(--fs-lg);
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  color: var(--ink-blackletter);
+}
+
+.ratchet-card__meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.ratchet-card__body {
+  padding: var(--sp-5);
+}
+
+/* ---- Results table ---- */
+.ratchet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.ratchet-table thead th {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 10px var(--sp-3);
+  border-bottom: 1px solid var(--hair);
+  text-align: left;
+  font-weight: 500;
+}
+
+.ratchet-table tbody td {
+  padding: 10px var(--sp-3);
+  border-bottom: 1px solid var(--hair);
+  vertical-align: middle;
+}
+
+.ratchet-table tbody tr:hover {
+  background: var(--subtle);
+}
+
+.ratchet-table .mono {
+  font-family: var(--font-mono);
+}
+
+.ratchet-table .num {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum", "lnum";
+  letter-spacing: -0.005em;
+}
+
+.ratchet-table__empty {
+  color: var(--muted);
+  text-align: center;
+}
+
+.ratchet-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--hair);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.ratchet-status--kept {
+  color: var(--success);
+  background: var(--add-bg);
+  border-color: var(--success);
+}
+
+.ratchet-status--discarded {
+  color: var(--danger);
+  background: var(--del-bg);
+  border-color: var(--danger);
+}
+
+.ratchet-status--other {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: var(--warning);
+}
+
+.ratchet-note-summary {
+  max-width: 260px;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* ---- Phase 4G: strict-ratchet transparency banner ----
+ * V6 demo-banner pattern: pull the
+ * rule out of the table copy and into a visible note so users understand
+ * why "discard" rows aren't bugs. */
+.ratchet-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px var(--sp-4);
+  margin: 14px 0 18px;
+  padding: 10px 14px;
+  background: var(--accent-softer);
+  border: 1px solid var(--accent-hair, var(--hair));
+  border-radius: 10px;
+  border-left: 3px solid var(--accent);
+}
+
+.ratchet-banner__tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.ratchet-banner__text {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+
+.ratchet-note-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: var(--sp-6);
+  padding: var(--sp-4) 18px;
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+}
+
+.ratchet-note-card__tag {
+  display: inline-block;
+  margin-bottom: var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.ratchet-note-card h2 {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 500;
+}
+
+.ratchet-note-card p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ratchet-note-card__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.ratchet-note-card__facts div {
+  padding: 10px var(--sp-3);
+  background: var(--subtle);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+}
+
+.ratchet-note-card__facts dt {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.ratchet-note-card__facts dd {
+  margin: var(--sp-1) 0 0;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.phase25-readout {
+  margin-bottom: var(--sp-6);
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.phase25-readout__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(240px, 0.9fr);
+  gap: var(--sp-4);
+}
+
+.phase25-readout__code {
+  min-width: 0;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.phase25-readout__facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.phase25-readout__facts div {
+  padding: 10px var(--sp-3);
+  background: var(--subtle);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+}
+
+.phase25-readout__facts dt {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.phase25-readout__facts dd {
+  margin: var(--sp-1) 0 0;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+/* ---- Benchmark transparency ---- */
+.ratchet-page .benchmark-transparency {
+  display: grid;
+  gap: var(--sp-4);
+}
+
+.ratchet-page .benchmark-transparency__warning {
+  margin: 0;
+}
+
+.ratchet-page .benchmark-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-3);
+}
+
+.ratchet-page .benchmark-card {
+  padding: var(--sp-4);
+  background: var(--subtle);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  min-width: 0;
+}
+
+.ratchet-page .benchmark-card__value {
+  margin-top: var(--sp-2);
+  font-family: var(--font-serif);
+  font-size: 28px;
+  line-height: 1.05;
+  color: var(--ink-blackletter);
+  overflow-wrap: anywhere;
+}
+
+.ratchet-page .benchmark-card__delta {
+  margin-top: var(--sp-2);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ratchet-page .benchmark-entry-list {
+  display: grid;
+  gap: 1px;
+  overflow-x: auto;
+}
+
+.ratchet-page .benchmark-entry-list__row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(90px, 0.7fr) auto minmax(70px, 0.5fr) minmax(120px, 0.8fr);
+  gap: var(--sp-3);
+  align-items: center;
+  min-width: 720px;
+  padding: 9px var(--sp-3);
+  background: var(--subtle);
+  font-size: 12px;
+}
+
+/* ---- Benchmark rubric grid ---- */
+.rubric-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr 44px;
+  gap: 6px var(--sp-2);
+  align-items: center;
+}
+
+.rubric-grid__row {
+  display: contents;
+}
+
+.rubric-grid__label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: var(--sp-1);
+  font-size: 13px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.rubric-grid__label-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rubric-grid__fraction {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+}
+
+@media (max-width: 540px) {
+  .rubric-grid {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .rubric-grid__label {
+    font-weight: 600;
+  }
+  .rubric-grid__fraction {
+    text-align: left;
+    font-size: 11px;
+  }
+}
+
+/* ---- Judge notes ---- */
+.judge-notes {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.judge-note-card {
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+}
+
+.judge-note-card__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0 0 var(--sp-2);
+}
+
+.judge-note-card__meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--sp-2);
+}
+
+.judge-note-card__dim {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.judge-note-card__score {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.judge-note-card__reason {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  margin: 0;
+}
+
+.judge-note-card__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+@media (forced-colors: active) {
+  .ratchet-banner,
+  .ratchet-note-card,
+  .ratchet-note-card__facts div {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+}
+
+/* ---- Responsive: tablet collapse (V6 §2D, --bp-md2 780px) ----
+ * Chart + rubric grid drops to single column at 780 so the rubric card
+ * doesn't squeeze the chart on narrow tablets. Table uses overflow-x
+ * with a min-width to keep columns readable; scroll-shadow hint via
+ * background-attachment + linear-gradient (V6 pattern). */
+@media (max-width: 780px) {
+  .ratchet-page__grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .ratchet-card__body--table {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+    background:
+      linear-gradient(to right, var(--elevated), transparent) left center / var(--sp-4) 100% no-repeat local,
+      linear-gradient(to left, var(--elevated), transparent) right center / var(--sp-4) 100% no-repeat local,
+      radial-gradient(farthest-side at 0 50%, rgba(0, 0, 0, 0.08), transparent) left center / var(--sp-3) 100% no-repeat scroll,
+      radial-gradient(farthest-side at 100% 50%, rgba(0, 0, 0, 0.08), transparent) right center / var(--sp-3) 100% no-repeat scroll;
+  }
+
+  .ratchet-table {
+    min-width: 760px;
+  }
+
+  .ratchet-table thead th,
+  .ratchet-table tbody td {
+    scroll-snap-align: start;
+  }
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 767px) {
+  .ratchet-page__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ratchet-page__title {
+    font-size: 28px;
+  }
+
+  .ratchet-table {
+    font-size: 12px;
+    min-width: 500px;
+  }
+
+  .ratchet-note-card {
+    grid-template-columns: 1fr;
+  }
+
+  .phase25-readout__body,
+  .phase25-readout__facts,
+  .ratchet-page .benchmark-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Tab bar (V6 Ratchet Results/Rubric/Benchmark/Judge chips) ---- */
+
+.ratchet-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.ratchet-tabs__tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 14px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+
+.ratchet-page__export-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.ratchet-tabs__tab:hover {
+  background: var(--subtle);
+  color: var(--ink);
+}
+
+.ratchet-tabs__tab--active {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+.ratchet-tabs__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 780px) and (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .ratchet-card__body--table {
+    background:
+      linear-gradient(to right, var(--elevated), transparent) left center / var(--sp-4) 100% no-repeat local,
+      linear-gradient(to left, var(--elevated), transparent) right center / var(--sp-4) 100% no-repeat local,
+      radial-gradient(farthest-side at 0 50%, rgba(255, 255, 255, 0.06), transparent) left center / var(--sp-3) 100% no-repeat scroll,
+      radial-gradient(farthest-side at 100% 50%, rgba(255, 255, 255, 0.06), transparent) right center / var(--sp-3) 100% no-repeat scroll;
+  }
+}
+
+@media (max-width: 780px) {
+  :root[data-theme="dark"] .ratchet-card__body--table {
+    background:
+      linear-gradient(to right, var(--elevated), transparent) left center / var(--sp-4) 100% no-repeat local,
+      linear-gradient(to left, var(--elevated), transparent) right center / var(--sp-4) 100% no-repeat local,
+      radial-gradient(farthest-side at 0 50%, rgba(255, 255, 255, 0.06), transparent) left center / var(--sp-3) 100% no-repeat scroll,
+      radial-gradient(farthest-side at 100% 50%, rgba(255, 255, 255, 0.06), transparent) right center / var(--sp-3) 100% no-repeat scroll;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .ratchet-tabs__tab--active {
+    background: var(--accent);
+    color: var(--paper);
+    border-color: var(--accent);
+  }
+}
+
+@media (forced-colors: active) {
+  .ratchet-tabs__tab--active {
+    background: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ratchet-tabs__tab {
+    transition: none;
+  }
+}
+
+/* ---- Responsive: small phones (V6 §2D, --bp-xs 540px) ----
+ * Data tables stay readable via horizontal scroll with edge-fade shadow
+ * affordances (background-attachment local+scroll trick): the gradients
+ * pinned to the scroll container fade in/out as the user scrolls,
+ * signalling that more columns exist. Words must NOT break inside cells.
+ * Inherits scroll-snap from the 780 breakpoint. */
+@media (max-width: 540px) {
+  .ratchet-page__title {
+    font-size: 24px;
+  }
+
+  .ratchet-card__body--table {
+    overflow-x: auto;
+    background:
+      linear-gradient(90deg, var(--elevated) 30%, transparent) left / 40px 100%,
+      linear-gradient(-90deg, var(--elevated) 30%, transparent) right / 40px 100%,
+      radial-gradient(farthest-side at 0 50%, rgba(0, 0, 0, 0.12), transparent) left / 12px 100%,
+      radial-gradient(farthest-side at 100% 50%, rgba(0, 0, 0, 0.12), transparent) right / 12px 100%;
+    background-repeat: no-repeat;
+    background-attachment: local, local, scroll, scroll;
+  }
+
+  .ratchet-table {
+    font-size: 12px;
+    min-width: 760px;
+  }
+
+  .ratchet-table thead th,
+  .ratchet-table tbody td {
+    padding: var(--sp-2) var(--sp-2);
+  }
+
+  .ratchet-table thead th {
+    font-size: var(--fs-2xs, 10px);
+    letter-spacing: 0.04em;
+  }
+
+  .ratchet-card {
+    padding: var(--sp-3) var(--sp-3) var(--sp-3);
+  }
+}
+
+/* ---- Forced colors ---- */
+@media (forced-colors: active) {
+  .ratchet-card {
+    border: 1px solid CanvasText;
+  }
+
+  .ratchet-status,
+  .phase25-readout,
+  .phase25-readout__facts div,
+  .ratchet-page .benchmark-card,
+  .ratchet-page .benchmark-entry-list__row {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+}

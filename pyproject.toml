@@ -1,0 +1,153 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ahadiff"
+version = "1.4.0"
+description = "Local analysis and knowledge-learning backend for Zhizhi, based on AhaDiff."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AhaDiff" }]
+keywords = ["diff", "learning", "srs", "code-review", "llm", "local-first"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
+dependencies = [
+  # Security floors also apply to published installs, not only the uv lock.
+  "click>=8.3.3,<9",
+  "cryptography>=50.0.1,<51",
+  "fsrs>=6.3.1,<7",
+  "genanki>=0.13,<1",
+  "httpx>=0.28,<1",
+  "idna>=3.15,<4",
+  "jinja2>=3.1,<4",
+  "mcp>=1.28.1,<2",
+  "portalocker>=3.1,<4",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.14.2,<3",
+  "pyjwt>=2.13.0,<3",
+  "python-multipart>=0.0.31,<1",
+  "pyyaml>=6,<7",
+  "rich>=14,<15",
+  "starlette>=1.3.1,<2",
+  "tree-sitter>=0.24,<1",
+  "tree-sitter-c-sharp>=0.23,<1",
+  "tree-sitter-go>=0.25,<1",
+  "tree-sitter-javascript>=0.25,<1",
+  "tree-sitter-java>=0.23,<1",
+  "tree-sitter-php>=0.24,<1",
+  "tree-sitter-rust>=0.24,<1",
+  "tree-sitter-ruby>=0.23,<1",
+  "tree-sitter-typescript>=0.23,<1",
+  "typer>=0.16,<1",
+  "uvicorn>=0.38,<1",
+  "watchdog>=6,<7",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[project.scripts]
+ahadiff = "ahadiff.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sep-zxy/zhizhi"
+Repository = "https://github.com/sep-zxy/zhizhi"
+Documentation = "https://github.com/sep-zxy/zhizhi/blob/main/docs/USER_GUIDE.md"
+Issues = "https://github.com/sep-zxy/zhizhi/issues"
+
+[project.optional-dependencies]
+anki = []
+# Optional advanced FSRS parameter auto-tuning; requires torch and is not core.
+optimizer = [
+  "fsrs[optimizer]>=6.3.1,<7",
+  "setuptools>=83,<84",
+  "torch>=2.13,<3",
+]
+watchdog = []
+tree-sitter = []
+
+[dependency-groups]
+desktop = [
+    "pyinstaller>=6.16,<7",
+]
+dev = [
+  # Starlette 1.x TestClient uses httpx2; production adapters retain httpx.
+  "httpx2>=2.12,<3",
+  "pyright>=1.1.400,<2",
+  "pytest>=9.0.3,<10",
+  "pytest-cov>=7,<8",
+  "ruff>=0.12,<0.13",
+  "tree-sitter>=0.24,<1",
+  "tree-sitter-c-sharp>=0.23,<1",
+  "tree-sitter-go>=0.25,<1",
+  "tree-sitter-javascript>=0.25,<1",
+  "tree-sitter-java>=0.23,<1",
+  "tree-sitter-php>=0.24,<1",
+  "tree-sitter-rust>=0.24,<1",
+  "tree-sitter-ruby>=0.23,<1",
+  "tree-sitter-typescript>=0.23,<1",
+  "watchdog>=6,<7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ahadiff"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"viewer/dist" = "ahadiff/_webui"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/ahadiff",
+  "/pyproject.toml",
+  "/README.md",
+  "/README.zh.md",
+  "/LICENSE",
+]
+exclude = [
+  "/docs/video/output",
+  "/viewer/coverage",
+  "/viewer/playwright-report",
+  "/viewer/playwright-report-real-serve",
+  "/viewer/test-results",
+  "/viewer/node_modules",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"viewer/dist" = "viewer/dist"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "pinned: deterministic pinned integration fixtures",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "C4", "SIM", "RET", "PTH", "TC", "FA"]
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+reportMissingTypeStubs = false
+typeCheckingMode = "strict"
+venv = ".venv"
+venvPath = "."

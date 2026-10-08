@@ -1,0 +1,2600 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from typer.testing import CliRunner
+
+from ahadiff import cli as cli_module
+from ahadiff.cli import app
+from ahadiff.contracts import QuizChoice, ResultEvent, ReviewCard
+from ahadiff.core.errors import InputError, MigrationError, StorageError
+from ahadiff.core.paths import is_wsl2_mnt, lock_file_path, review_db_path
+from ahadiff.llm import usage as usage_module
+from ahadiff.quiz import QuizArtifactPaths
+from ahadiff.review import database as review_database_module
+from ahadiff.review.database import (
+    CURRENT_SCHEMA_VERSION,
+    check_review_db,
+    checkpoint_review_db,
+    connect_review_db,
+    finalize_targeted_verify_event,
+    import_cards_from_jsonl,
+    import_cards_from_runs,
+    import_results_tsv_lossy,
+    initialize_review_db,
+    insert_learning_signal,
+    list_due_cards,
+    load_result_events_from_db,
+    record_card_review,
+    record_card_review_once,
+    resolve_sqlite_journal_mode,
+    select_result_tsv_rows_readonly,
+    set_card_queue_state,
+    sync_result_event,
+    upgrade_review_db,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+_RUNNER = CliRunner()
+
+
+def _write_minimal_result_events_db(db_path: Path, *, run_id: str) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE result_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                base_ref TEXT,
+                prompt_version TEXT NOT NULL,
+                eval_bundle_version TEXT NOT NULL,
+                rubric_version TEXT,
+                overall REAL NOT NULL,
+                verdict TEXT NOT NULL,
+                status TEXT NOT NULL,
+                weakest_dim TEXT NOT NULL,
+                note_json TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO result_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"{run_id}-event",
+                run_id,
+                "targeted_verify",
+                "2026-01-01T00:00:00Z",
+                "HEAD",
+                None,
+                "prompt",
+                "eval",
+                None,
+                1.0,
+                "PASS",
+                "counted",
+                "",
+                None,
+            ),
+        )
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(
+        ["git", "init"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+
+def _review_card(card_id: str = "card-1") -> ReviewCard:
+    return ReviewCard(
+        card_id=card_id,
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+
+
+def _quiz_choices(
+    correct_text: str = "It retries transient failures before giving up.",
+) -> list[QuizChoice]:
+    return [
+        QuizChoice(label="A", text=correct_text, is_correct=True),
+        QuizChoice(label="B", text="It removes all exception handling.", is_correct=False),
+        QuizChoice(label="C", text="It disables retry behavior entirely.", is_correct=False),
+        QuizChoice(label="D", text="It changes the public function name.", is_correct=False),
+    ]
+
+
+def _multiple_choice_review_card(card_id: str = "card-mc") -> ReviewCard:
+    answer = "It retries transient failures before giving up."
+    return _review_card(card_id).model_copy(
+        update={
+            "answer": answer,
+            "answer_mode": "multiple_choice",
+            "choices": _quiz_choices(answer),
+        }
+    )
+
+
+def _write_cards_jsonl(path: Path, cards: tuple[ReviewCard, ...]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(card.model_dump(mode="json")) + "\n" for card in cards),
+        encoding="utf-8",
+    )
+
+
+def _create_v1_review_db_without_stale_reason(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );
+            INSERT INTO schema_version (id, version) VALUES (1, 1);
+
+            CREATE TABLE scheduler_presets (
+                preset_id TEXT PRIMARY KEY,
+                weights TEXT NOT NULL,
+                desired_retention REAL NOT NULL DEFAULT 0.9,
+                scheduler_version TEXT NOT NULL,
+                total_reviews INTEGER NOT NULL DEFAULT 0,
+                last_optimized_utc TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+
+            CREATE TABLE cards (
+                id TEXT PRIMARY KEY,
+                concept TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                fsrs_state TEXT NOT NULL,
+                card_state TEXT NOT NULL DEFAULT 'active',
+                scheduler_preset_id TEXT NOT NULL DEFAULT 'default'
+                    REFERENCES scheduler_presets(preset_id),
+                scheduler_version TEXT NOT NULL,
+                desired_retention REAL NOT NULL DEFAULT 0.9,
+                due_date TEXT NOT NULL,
+                stability REAL NOT NULL,
+                difficulty REAL NOT NULL,
+                reps INTEGER NOT NULL DEFAULT 0,
+                lapses INTEGER NOT NULL DEFAULT 0,
+                scaffolding_level TEXT NOT NULL DEFAULT 'full',
+                last_rating INTEGER,
+                last_review_utc TEXT,
+                source_ref TEXT,
+                file_id TEXT,
+                display_path TEXT,
+                hunk_id TEXT,
+                hunk_hash TEXT,
+                symbol TEXT,
+                change_kind TEXT,
+                created_at_utc TEXT NOT NULL,
+                archived_at_utc TEXT,
+                suspended_at_utc TEXT
+            );
+
+            CREATE TABLE review_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_id TEXT NOT NULL REFERENCES cards(id),
+                rating INTEGER NOT NULL,
+                reviewed_at_utc TEXT NOT NULL,
+                elapsed_days REAL NOT NULL,
+                scheduled_days REAL NOT NULL,
+                state TEXT NOT NULL
+            );
+
+            CREATE TABLE result_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                base_ref TEXT,
+                prompt_version TEXT NOT NULL,
+                eval_bundle_version TEXT NOT NULL,
+                rubric_version TEXT,
+                overall REAL NOT NULL,
+                verdict TEXT NOT NULL,
+                status TEXT NOT NULL,
+                weakest_dim TEXT NOT NULL,
+                note_json TEXT
+            );
+
+            CREATE TABLE learning_signals (
+                event_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                signal_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+
+def _create_v8_review_db_without_choice_columns(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            PRAGMA user_version=8;
+
+            CREATE TABLE scheduler_presets (
+                preset_id TEXT PRIMARY KEY,
+                weights TEXT NOT NULL,
+                desired_retention REAL NOT NULL DEFAULT 0.9,
+                scheduler_version TEXT NOT NULL,
+                total_reviews INTEGER NOT NULL DEFAULT 0,
+                last_optimized_utc TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+            INSERT INTO scheduler_presets (
+                preset_id,
+                weights,
+                desired_retention,
+                scheduler_version,
+                created_at_utc
+            ) VALUES ('default', '[0.0]', 0.9, 'fsrs-v1', '2026-04-24T00:00:00Z');
+
+            CREATE TABLE cards (
+                id TEXT PRIMARY KEY,
+                concept TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                fsrs_state TEXT NOT NULL,
+                card_state TEXT NOT NULL DEFAULT 'active'
+                    CHECK (card_state IN ('active', 'stale', 'archived', 'suspended')),
+                scheduler_preset_id TEXT NOT NULL DEFAULT 'default',
+                scheduler_version TEXT NOT NULL,
+                desired_retention REAL NOT NULL DEFAULT 0.9,
+                due_date TEXT NOT NULL,
+                stability REAL NOT NULL,
+                difficulty REAL NOT NULL,
+                reps INTEGER NOT NULL DEFAULT 0,
+                lapses INTEGER NOT NULL DEFAULT 0,
+                scaffolding_level TEXT NOT NULL DEFAULT 'full',
+                last_rating INTEGER,
+                last_review_utc TEXT,
+                source_ref TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                display_path TEXT NOT NULL,
+                hunk_id TEXT NOT NULL,
+                hunk_hash TEXT NOT NULL,
+                symbol TEXT,
+                change_kind TEXT,
+                question TEXT,
+                answer TEXT,
+                stale_reason TEXT,
+                created_at_utc TEXT NOT NULL,
+                archived_at_utc TEXT,
+                suspended_at_utc TEXT
+            );
+            INSERT INTO cards (
+                id,
+                concept,
+                run_id,
+                fsrs_state,
+                scheduler_version,
+                due_date,
+                stability,
+                difficulty,
+                source_ref,
+                file_id,
+                display_path,
+                hunk_id,
+                hunk_hash,
+                symbol,
+                question,
+                answer,
+                created_at_utc
+            ) VALUES (
+                'legacy-card',
+                'retry loop',
+                'run-legacy',
+                '{}',
+                'fsrs-v1',
+                '2026-04-25T00:00:00Z',
+                1.0,
+                2.0,
+                'abc1234',
+                'file-app',
+                'src/app.py',
+                'hunk-1',
+                'deadbeefcafe',
+                'retry_once',
+                'Why did retry_once change?',
+                'It retries transient failures before giving up.',
+                '2026-04-24T00:00:00Z'
+            );
+            """
+        )
+
+
+def _insert_v1_review_data(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO scheduler_presets (
+                preset_id,
+                weights,
+                desired_retention,
+                scheduler_version,
+                created_at_utc
+            ) VALUES ('default', '[0.0]', 0.9, 'fsrs-v1', '2026-04-24T00:00:00Z')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO cards (
+                id,
+                concept,
+                run_id,
+                fsrs_state,
+                scheduler_version,
+                due_date,
+                stability,
+                difficulty,
+                source_ref,
+                file_id,
+                display_path,
+                hunk_id,
+                hunk_hash,
+                symbol,
+                created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-card",
+                "retry loop",
+                "run-legacy",
+                "{}",
+                "fsrs-v1",
+                "2026-04-25T00:00:00Z",
+                1.0,
+                2.0,
+                "abc1234",
+                "file-app",
+                "src/app.py",
+                "hunk-1",
+                "deadbeefcafe",
+                "retry_once",
+                "2026-04-24T00:00:00Z",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO result_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-event",
+                "run-legacy",
+                "learn",
+                "2026-04-24T00:00:00Z",
+                "abc1234",
+                None,
+                "prompt-v1",
+                "eval-v1",
+                "rubric-v1",
+                82.0,
+                "PASS",
+                "baseline",
+                "evidence",
+                '{"legacy": true}',
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO learning_signals VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-signal",
+                "legacy-key",
+                "mark_wrong",
+                '{"claim_id": "claim-1"}',
+                "2026-04-24T00:00:00Z",
+            ),
+        )
+
+
+def _result_event(
+    event_id: str = "018f0f52-91c0-7abc-8123-000000000101",
+    *,
+    status: str = "baseline",
+    event_type: str = "learn",
+    timestamp: str = "2026-04-24T00:00:00Z",
+) -> ResultEvent:
+    return ResultEvent(
+        event_id=event_id,
+        run_id="run-1",
+        event_type=event_type,
+        timestamp=timestamp,
+        source_ref="abc1234",
+        base_ref=None,
+        prompt_version="prompt123",
+        eval_bundle_version="eval123",
+        rubric_version="rubric-v1",
+        overall=88.0,
+        verdict="PASS",
+        status=cast("Any", status),
+        weakest_dim="evidence",
+        note_json=None,
+    )
+
+
+def test_initialize_review_db_creates_full_schema_and_pragmas(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    db_path = review_db_path(repo_root)
+
+    initialize_review_db(db_path)
+
+    with connect_review_db(db_path) as connection:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        index_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+
+    assert schema_version == CURRENT_SCHEMA_VERSION
+    assert {"cards", "scheduler_presets", "review_logs", "result_events", "learning_signals"} <= (
+        table_names
+    )
+    assert "ux_result_events_run_type_ts" in index_names
+    assert "ix_cards_weak_active_stability" in index_names
+    assert busy_timeout == 5000
+    assert journal_mode == "wal"
+    assert quick_check == "ok"
+
+    with connect_review_db(db_path) as connection:
+        card_info = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA table_info(cards)").fetchall()
+        }
+        cards_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+        ).fetchone()[0]
+    assert "stale_reason" in card_info
+    assert "answer_mode" in card_info
+    assert "choices_json" in card_info
+    assert schema_version == 10
+    assert str(card_info["answer_mode"]["dflt_value"]) == "'open'"
+    assert int(card_info["answer_mode"]["notnull"]) == 1
+    assert "CHECK (answer_mode IN ('open', 'multiple_choice'))" in str(cards_sql)
+    assert "CHECK (card_state IN ('active', 'stale', 'archived', 'suspended'))" in str(cards_sql)
+    for column in ("source_ref", "file_id", "display_path", "hunk_id", "hunk_hash"):
+        assert int(card_info[column]["notnull"]) == 1
+
+
+def test_initialize_review_db_rolls_back_partial_fresh_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+
+    def fail_cards_schema(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TABLE should_not_survive (id TEXT)")
+        raise sqlite3.DatabaseError("boom")
+
+    monkeypatch.setattr(review_database_module, "_ensure_cards_schema", fail_cards_schema)
+
+    with pytest.raises(sqlite3.DatabaseError, match="boom"):
+        initialize_review_db(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert user_version == 0
+    assert "scheduler_presets" not in tables
+    assert "should_not_survive" not in tables
+
+
+def test_is_wsl2_mnt_detects_only_linux_wsl_mount_paths() -> None:
+    wsl_env = {"WSL_DISTRO_NAME": "Ubuntu", "WSL_INTEROP": "/run/WSL/1_interop"}
+
+    assert is_wsl2_mnt(Path("/mnt/c/project"), platform="linux", env=wsl_env) is True
+    assert is_wsl2_mnt(Path("/mnt/c/project"), platform="darwin", env=wsl_env) is False
+    assert is_wsl2_mnt(Path("/home/user/project"), platform="linux", env=wsl_env) is False
+    assert is_wsl2_mnt(Path("/mnt"), platform="linux", env=wsl_env) is False
+    assert is_wsl2_mnt(Path("/mnt/c/project"), platform="linux", env={}) is False
+
+
+@pytest.mark.parametrize(
+    ("is_wsl2_mount", "expected_mode"),
+    ((False, "WAL"), (True, "DELETE")),
+)
+def test_connect_review_db_applies_resolved_journal_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_wsl2_mount: bool,
+    expected_mode: str,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+
+    def fake_is_wsl2_mnt(_path: Path) -> bool:
+        return is_wsl2_mount
+
+    monkeypatch.setattr(review_database_module, "is_wsl2_mnt", fake_is_wsl2_mnt)
+
+    assert resolve_sqlite_journal_mode(db_path) == expected_mode
+    initialize_review_db(db_path)
+
+    with connect_review_db(db_path) as connection:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+
+    assert journal_mode == expected_mode.lower()
+
+
+@pytest.mark.parametrize(
+    ("is_wsl2_mount", "expected_mode"),
+    ((False, "WAL"), (True, "DELETE")),
+)
+def test_connect_review_db_maintenance_passes_resolved_journal_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_wsl2_mount: bool,
+    expected_mode: str,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    original_connect = review_database_module.safe_sqlite_connect
+    seen_kwargs: dict[str, object] = {}
+
+    def fake_is_wsl2_mnt(_path: Path) -> bool:
+        return is_wsl2_mount
+
+    def recording_connect(path: Path, **kwargs: Any) -> sqlite3.Connection:
+        seen_kwargs.update(kwargs)
+        return original_connect(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(review_database_module, "is_wsl2_mnt", fake_is_wsl2_mnt)
+    monkeypatch.setattr(review_database_module, "safe_sqlite_connect", recording_connect)
+
+    with review_database_module._connect_review_db_maintenance(  # pyright: ignore[reportPrivateUsage]
+        db_path,
+        create_parent=True,
+    ) as connection:
+        connection.execute("CREATE TABLE t(x)")
+
+    assert seen_kwargs["journal_mode"] == expected_mode
+
+
+def test_restore_review_db_checkpoints_before_after_and_removes_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    backup_path = tmp_path / "manual.bak"
+    initialize_review_db(db_path)
+    sync_result_event(db_path, _result_event())
+    review_database_module.backup_review_db(db_path, backup_path)
+    sync_result_event(
+        db_path,
+        _result_event(event_id="018f0f52-91c0-7abc-8123-000000000102"),
+    )
+    for suffix in ("-wal", "-shm", "-journal"):
+        db_path.with_name(f"{db_path.name}{suffix}").write_text("stale sidecar", encoding="utf-8")
+    checkpointed_paths: list[Path] = []
+
+    def recording_checkpoint(path: Path) -> None:
+        checkpointed_paths.append(path)
+
+    monkeypatch.setattr(review_database_module, "checkpoint_review_db", recording_checkpoint)
+
+    review_database_module.restore_review_db(db_path=db_path, backup_path=backup_path)
+
+    assert checkpointed_paths == [backup_path, db_path, db_path]
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not db_path.with_name(f"{db_path.name}{suffix}").exists()
+    assert [event.event_id for event in load_result_events_from_db(db_path)] == [
+        "018f0f52-91c0-7abc-8123-000000000101"
+    ]
+
+
+def test_restore_review_db_removes_real_stale_sidecars_without_mocked_checkpoint(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    backup_path = tmp_path / "manual.bak"
+    initialize_review_db(db_path)
+    sync_result_event(db_path, _result_event())
+    review_database_module.backup_review_db(db_path, backup_path)
+    sync_result_event(
+        db_path,
+        _result_event(event_id="018f0f52-91c0-7abc-8123-000000000102"),
+    )
+    for suffix in ("-wal", "-shm", "-journal"):
+        db_path.with_name(f"{db_path.name}{suffix}").write_text("stale sidecar", encoding="utf-8")
+
+    review_database_module.restore_review_db(db_path=db_path, backup_path=backup_path)
+
+    for base_path in (db_path, backup_path):
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not base_path.with_name(f"{base_path.name}{suffix}").exists()
+    assert [event.event_id for event in load_result_events_from_db(db_path)] == [
+        "018f0f52-91c0-7abc-8123-000000000101"
+    ]
+
+
+def test_checkpoint_review_db_ignores_missing_database(tmp_path: Path) -> None:
+    checkpoint_review_db(tmp_path / "missing.sqlite")
+
+
+def test_connect_review_db_does_not_create_missing_parent_directory(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-parent" / "review.sqlite"
+
+    with pytest.raises(InputError, match="review DB parent directory does not exist"):
+        connect_review_db(db_path)
+
+    assert not db_path.parent.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_connect_review_db_wraps_symlink_permission_error(tmp_path: Path) -> None:
+    target = tmp_path / "target.sqlite"
+    target.touch()
+    db_path = tmp_path / "review.sqlite"
+    db_path.symlink_to(target)
+
+    with pytest.raises(StorageError, match="failed to open review\\.sqlite safely") as caught:
+        connect_review_db(db_path)
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_connect_review_db_maintenance_wraps_symlink_permission_error(tmp_path: Path) -> None:
+    target = tmp_path / "target.sqlite"
+    target.touch()
+    db_path = tmp_path / "review.sqlite"
+    db_path.symlink_to(target)
+
+    with pytest.raises(StorageError, match="failed to open review\\.sqlite safely") as caught:
+        review_database_module._connect_review_db_maintenance(  # pyright: ignore[reportPrivateUsage]
+            db_path
+        )
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_connect_usage_db_wraps_symlink_permission_error(tmp_path: Path) -> None:
+    target = tmp_path / "target.sqlite"
+    target.touch()
+    db_path = tmp_path / "usage.sqlite"
+    db_path.symlink_to(target)
+
+    with pytest.raises(StorageError, match="failed to open usage DB safely") as caught:
+        usage_module.connect_usage_db(db_path)
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_select_result_tsv_rows_readonly_rejects_leaf_swap_after_lstat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    attacker_path = tmp_path / "attacker.sqlite"
+    _write_minimal_result_events_db(db_path, run_id="victim-run")
+    _write_minimal_result_events_db(attacker_path, run_id="swapped-run")
+    real_lstat = review_database_module.os.lstat
+    swapped = False
+
+    def swapping_lstat(path: str | Path) -> os.stat_result:
+        nonlocal swapped
+        resolved = Path(path)
+        stat_result = real_lstat(path)
+        if resolved == db_path and not swapped:
+            db_path.unlink()
+            db_path.symlink_to(attacker_path)
+            swapped = True
+        return stat_result
+
+    monkeypatch.setattr(review_database_module.os, "lstat", swapping_lstat)
+
+    with pytest.raises(StorageError, match=r"review\.sqlite read-only open failed"):
+        select_result_tsv_rows_readonly(db_path)
+
+    assert swapped is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_doctor_reports_review_db_symlink_as_project_error_without_traceback(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    state_dir = repo_root / ".ahadiff"
+    state_dir.mkdir()
+    target = tmp_path / "target.sqlite"
+    target.touch()
+    (state_dir / "review.sqlite").symlink_to(target)
+
+    result = _RUNNER.invoke(
+        app(),
+        ["doctor", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert "Error:" in result.stderr
+    assert "Unexpected error" not in result.stderr
+    assert "review.sqlite could not be opened safely" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_initialize_review_db_creates_missing_parent_directory(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-parent" / "review.sqlite"
+
+    initialize_review_db(db_path)
+
+    assert db_path.exists()
+    assert db_path.parent.exists()
+
+
+def test_initialize_review_db_migrates_legacy_result_events_only_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    event = _result_event()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE result_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                base_ref TEXT,
+                prompt_version TEXT NOT NULL,
+                eval_bundle_version TEXT NOT NULL,
+                rubric_version TEXT,
+                overall REAL NOT NULL,
+                verdict TEXT NOT NULL,
+                status TEXT NOT NULL,
+                weakest_dim TEXT NOT NULL,
+                note_json TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO result_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.run_id,
+                event.event_type,
+                event.timestamp,
+                event.source_ref,
+                event.base_ref,
+                event.prompt_version,
+                event.eval_bundle_version,
+                event.rubric_version,
+                event.overall,
+                event.verdict,
+                event.status,
+                event.weakest_dim,
+                event.note_json,
+            ),
+        )
+
+    initialize_review_db(db_path)
+
+    rows = load_result_events_from_db(db_path)
+    check = check_review_db(db_path)
+    assert len(rows) == 1
+    assert rows[0].event_id == event.event_id
+    assert check.schema_version == CURRENT_SCHEMA_VERSION
+
+
+def test_migration_v1_to_v2_preserves_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    _create_v1_review_db_without_stale_reason(db_path)
+    _insert_v1_review_data(db_path)
+
+    outcome = upgrade_review_db(db_path)
+
+    with connect_review_db(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        card_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cards)")}
+        legacy_schema_table = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'schema_version'
+            """
+        ).fetchone()
+        card = connection.execute(
+            """
+            SELECT id, concept, run_id, source_ref, file_id, display_path, hunk_hash, stale_reason
+            FROM cards
+            WHERE id = 'legacy-card'
+            """
+        ).fetchone()
+        event = connection.execute(
+            "SELECT event_id, run_id, note_json FROM result_events WHERE event_id = 'legacy-event'"
+        ).fetchone()
+        signal = connection.execute(
+            """
+            SELECT event_id, idempotency_key, signal_type, payload_json
+            FROM learning_signals
+            WHERE event_id = 'legacy-signal'
+            """
+        ).fetchone()
+
+    assert outcome.schema_version == CURRENT_SCHEMA_VERSION
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert legacy_schema_table is None
+    assert "stale_reason" in card_columns
+    assert tuple(card) == (
+        "legacy-card",
+        "retry loop",
+        "run-legacy",
+        "abc1234",
+        "file-app",
+        "src/app.py",
+        "deadbeefcafe",
+        None,
+    )
+    assert tuple(event) == ("legacy-event", "run-legacy", '{"legacy": true}')
+    assert tuple(signal) == (
+        "legacy-signal",
+        "legacy-key",
+        "mark_wrong",
+        '{"claim_id": "claim-1"}',
+    )
+
+
+def test_migration_v8_to_v9_defaults_legacy_cards_to_open_answer_mode(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    _create_v8_review_db_without_choice_columns(db_path)
+
+    initialize_review_db(db_path)
+
+    with connect_review_db(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        card_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cards)")}
+        legacy_card = connection.execute(
+            "SELECT answer_mode, choices_json FROM cards WHERE id = 'legacy-card'"
+        ).fetchone()
+
+    assert user_version == 10
+    assert {"answer_mode", "choices_json"} <= card_columns
+    assert legacy_card is not None
+    assert tuple(legacy_card) == ("open", None)
+
+
+def test_migration_v8_to_v9_rolls_back_partial_choice_column_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    _create_v8_review_db_without_choice_columns(db_path)
+
+    def failing_v8_to_v9(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            ALTER TABLE cards ADD COLUMN answer_mode TEXT NOT NULL DEFAULT 'open'
+                CHECK (answer_mode IN ('open', 'multiple_choice'))
+            """
+        )
+        connection.execute("ALTER TABLE cards ADD COLUMN choices_json TEXT")
+        raise RuntimeError("boom during v9 migration")
+
+    migrations = cast(
+        "dict[int, Callable[[sqlite3.Connection], None]]",
+        vars(review_database_module)["_MIGRATIONS"],
+    )
+    monkeypatch.setitem(migrations, 8, failing_v8_to_v9)
+
+    with pytest.raises(RuntimeError, match="boom during v9 migration"):
+        initialize_review_db(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
+
+    assert user_version == 8
+    assert "answer_mode" not in card_columns
+    assert "choices_json" not in card_columns
+
+
+def test_legacy_schema_version_newer_than_supported_is_rejected(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    _create_v1_review_db_without_stale_reason(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE schema_version SET version = ? WHERE id = 1", (999,))
+
+    with pytest.raises(MigrationError, match="legacy schema version 999 is newer than supported"):
+        initialize_review_db(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
+    assert user_version == 0
+    assert "stale_reason" not in card_columns
+
+
+def test_newer_version_friendly_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initialize_review_db(db_path)
+    with connect_review_db(db_path) as connection:
+        connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION + 1}")
+
+    with pytest.raises(MigrationError, match="newer than supported"):
+        initialize_review_db(db_path)
+
+
+def test_partial_migration_rollback(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    _create_v1_review_db_without_stale_reason(db_path)
+    _insert_v1_review_data(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE review_logs")
+        connection.execute("CREATE INDEX review_logs ON cards(id)")
+
+    with pytest.raises(MigrationError, match="rolled back"):
+        upgrade_review_db(db_path)
+
+    with connect_review_db(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        card_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cards)")}
+        leftover = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_not_survive'"
+        ).fetchone()
+        conflict = connection.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'review_logs'"
+        ).fetchone()
+        legacy_card = connection.execute("SELECT id FROM cards WHERE id = 'legacy-card'").fetchone()
+    assert user_version == 0
+    assert "stale_reason" not in card_columns
+    assert leftover is None
+    assert conflict["type"] == "index"
+    assert legacy_card["id"] == "legacy-card"
+
+
+def test_cards_schema_rejects_invalid_state_and_null_core_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initialize_review_db(db_path)
+
+    insert_sql = """
+        INSERT INTO cards (
+            id,
+            concept,
+            run_id,
+            fsrs_state,
+            card_state,
+            scheduler_version,
+            due_date,
+            stability,
+            difficulty,
+            source_ref,
+            file_id,
+            display_path,
+            hunk_id,
+            hunk_hash,
+            created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    base_params = (
+        "card-raw",
+        "retry loop",
+        "run-raw",
+        "{}",
+        "active",
+        "fsrs-test",
+        "2026-04-24T00:00:00Z",
+        0.0,
+        0.0,
+        "abc1234",
+        "file-app",
+        "src/app.py",
+        "hunk-1",
+        "deadbeef",
+        "2026-04-24T00:00:00Z",
+    )
+
+    with connect_review_db(db_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="cards\\.card_state|CHECK constraint"):
+            connection.execute(insert_sql, (*base_params[:4], "broken", *base_params[5:]))
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="core anchor fields must not be NULL|NOT NULL constraint failed",
+        ):
+            connection.execute(insert_sql, (*base_params[:9], None, *base_params[10:]))
+
+
+def test_backup_review_db_rejects_missing_database(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing" / "review.sqlite"
+
+    with pytest.raises(InputError, match="review\\.sqlite does not exist"):
+        review_database_module.backup_review_db(db_path)
+
+    assert not db_path.parent.exists()
+
+
+def test_backup_review_db_wraps_sqlite_database_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initialize_review_db(db_path)
+
+    def fail_connect(_path: Path, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.DatabaseError("simulated busy database")
+
+    monkeypatch.setattr(review_database_module.sqlite3, "connect", fail_connect)
+
+    with pytest.raises(StorageError, match="failed to back up review\\.sqlite"):
+        review_database_module.backup_review_db(db_path)
+
+
+def test_restore_review_db_wraps_sqlite_database_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    backup_path = tmp_path / "manual.bak"
+    backup_path.write_bytes(b"placeholder")
+
+    def fail_connect(_path: Path, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.DatabaseError("simulated restore failure")
+
+    monkeypatch.setattr(review_database_module.sqlite3, "connect", fail_connect)
+
+    with pytest.raises(StorageError, match="failed to restore review\\.sqlite"):
+        review_database_module.restore_review_db(db_path=db_path, backup_path=backup_path)
+
+
+def test_db_check_cli_acquires_repo_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    initialize_review_db(review_db_path(repo_root))
+    observed_locks: list[tuple[Path, str]] = []
+
+    @contextmanager
+    def fake_repo_write_lock(lock_path: Path, *, command: str) -> Iterator[Path]:
+        observed_locks.append((lock_path, command))
+        yield lock_path
+
+    monkeypatch.setattr(cli_module, "repo_write_lock", fake_repo_write_lock)
+
+    result = _RUNNER.invoke(app(), ["db", "check", "--repo-root", str(repo_root)])
+
+    assert result.exit_code == 0
+    assert observed_locks == [(lock_file_path(repo_root), "db check")]
+
+
+def test_sync_result_event_is_idempotent_under_review_db_owner(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    event = _result_event()
+
+    assert sync_result_event(db_path, event) is True
+    assert sync_result_event(db_path, event) is False
+
+    rows = load_result_events_from_db(db_path)
+    assert len(rows) == 1
+    assert rows[0].event_id == event.event_id
+
+
+@pytest.mark.parametrize("overall", [float("nan"), float("inf"), float("-inf"), float("1e309")])
+def test_sync_result_event_rejects_non_finite_overall(
+    tmp_path: Path,
+    overall: float,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    event = _result_event().model_copy(
+        update={
+            "event_id": f"event-{str(overall).replace('-', 'neg-')}",
+            "overall": overall,
+        }
+    )
+
+    with pytest.raises(InputError, match="overall score must be finite"):
+        sync_result_event(db_path, event)
+
+    assert load_result_events_from_db(db_path) == ()
+
+
+def test_import_cards_and_record_fsrs_review(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+
+    inserted = import_cards_from_jsonl(db_path, cards_path)
+    due_cards = list_due_cards(db_path)
+
+    assert inserted == 1
+    assert [card.card_id for card in due_cards] == ["card-1"]
+
+    update = record_card_review(
+        db_path,
+        card_id="card-1",
+        answer="good",
+        reviewed_at_utc=datetime(2026, 4, 24, tzinfo=UTC),
+    )
+
+    assert update.rating == 3
+    assert update.stability > 0
+    assert update.difficulty > 0
+    assert json.loads(update.fsrs_state)["last_review"] == "2026-04-24T00:00:00+00:00"
+    loaded_card = review_database_module.get_card(db_path, "card-1")
+    assert loaded_card is not None
+    assert loaded_card.stability == update.stability
+    assert loaded_card.difficulty == update.difficulty
+    assert loaded_card.reps == 1
+    assert loaded_card.lapses == 0
+    assert loaded_card.last_rating == 3
+    with connect_review_db(db_path) as connection:
+        card_row = connection.execute("SELECT reps, last_rating FROM cards").fetchone()
+        log_row = connection.execute("SELECT rating, state FROM review_logs").fetchone()
+        preset_row = connection.execute(
+            "SELECT total_reviews FROM scheduler_presets WHERE preset_id = 'default'"
+        ).fetchone()
+    assert tuple(card_row) == (1, 3)
+    assert log_row["rating"] == 3
+    assert preset_row["total_reviews"] == 1
+
+
+def test_fsrs_scheduling_is_identical_for_open_and_multiple_choice_cards(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    open_card = _review_card("card-open").model_copy(
+        update={"answer": "It retries transient failures before giving up."}
+    )
+    multiple_choice_card = _multiple_choice_review_card("card-mc")
+    _write_cards_jsonl(cards_path, (open_card, multiple_choice_card))
+    assert import_cards_from_jsonl(db_path, cards_path) == 2
+
+    reviewed_at = datetime(2026, 4, 24, tzinfo=UTC)
+    open_update = record_card_review(
+        db_path,
+        card_id=open_card.card_id,
+        answer="good",
+        reviewed_at_utc=reviewed_at,
+    )
+    multiple_choice_update = record_card_review(
+        db_path,
+        card_id=multiple_choice_card.card_id,
+        answer="good",
+        reviewed_at_utc=reviewed_at,
+    )
+
+    assert multiple_choice_update.rating == open_update.rating
+    assert multiple_choice_update.due_date == open_update.due_date
+    assert multiple_choice_update.stability == open_update.stability
+    assert multiple_choice_update.difficulty == open_update.difficulty
+    assert multiple_choice_update.scaffolding_level == open_update.scaffolding_level
+    open_state = json.loads(open_update.fsrs_state)
+    multiple_choice_state = json.loads(multiple_choice_update.fsrs_state)
+    open_state.pop("card_id", None)
+    multiple_choice_state.pop("card_id", None)
+    assert multiple_choice_state == open_state
+
+
+def test_import_cards_persists_question_and_answer_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    question = "Why does retry_once now loop?"
+    answer = "It retries transient failures before giving up."
+    card = _review_card().model_copy(update={"question": question, "answer": answer})
+    _write_cards_jsonl(cards_path, (card,))
+
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT id, question, answer FROM cards WHERE id = ?",
+            ("card-1",),
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == ("card-1", question, answer)
+
+
+def test_import_cards_accepts_legacy_rows_without_question_answer_fields(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    legacy_payload = _review_card("card-legacy").model_dump(mode="json")
+    legacy_payload.pop("question", None)
+    legacy_payload.pop("answer", None)
+    cards_path.write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT id, question, answer FROM cards WHERE id = ?",
+            ("card-legacy",),
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == ("card-legacy", None, None)
+
+
+def test_list_due_cards_preserves_question_and_answer_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    question = "What makes retry_once review-worthy?"
+    answer = "The retry loop is the concept users need to recall."
+    card = _review_card().model_copy(update={"question": question, "answer": answer})
+    _write_cards_jsonl(cards_path, (card,))
+
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    due_cards = list_due_cards(db_path)
+
+    assert len(due_cards) == 1
+    assert due_cards[0].card_id == "card-1"
+    assert due_cards[0].question == question
+    assert due_cards[0].answer == answer
+    assert due_cards[0].stability is not None
+    assert due_cards[0].difficulty is not None
+    assert due_cards[0].reps == 0
+    assert due_cards[0].lapses == 0
+    assert due_cards[0].last_rating is None
+
+
+def test_import_multiple_choice_card_persists_choices_and_daos_round_trip(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    card = _multiple_choice_review_card()
+    expected_choices = [choice.model_dump(mode="json") for choice in card.choices or ()]
+    _write_cards_jsonl(cards_path, (card,))
+
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT answer_mode, choices_json FROM cards WHERE id = ?",
+            (card.card_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["answer_mode"] == "multiple_choice"
+    assert json.loads(str(row["choices_json"])) == expected_choices
+
+    due_cards = list_due_cards(db_path)
+    assert len(due_cards) == 1
+    assert due_cards[0].answer_mode == "multiple_choice"
+    assert due_cards[0].choices is not None
+    assert [choice.model_dump(mode="json") for choice in due_cards[0].choices] == expected_choices
+
+    loaded_card = review_database_module.get_card(db_path, card.card_id)
+    assert loaded_card is not None
+    assert loaded_card.answer_mode == "multiple_choice"
+    assert loaded_card.choices is not None
+    assert [choice.model_dump(mode="json") for choice in loaded_card.choices] == expected_choices
+
+
+def test_list_due_cards_rejects_corrupt_choices_json_with_storage_error(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    card = _multiple_choice_review_card()
+    _write_cards_jsonl(cards_path, (card,))
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+
+    with connect_review_db(db_path) as connection:
+        connection.execute(
+            "UPDATE cards SET choices_json = ? WHERE id = ?",
+            ("{not valid json", card.card_id),
+        )
+
+    with pytest.raises((InputError, StorageError), match="choices_json"):
+        list_due_cards(db_path)
+
+    with pytest.raises((InputError, StorageError), match="choices_json"):
+        review_database_module.get_card(db_path, card.card_id)
+
+
+def test_import_cards_rejects_invalid_multiple_choice_before_db_write(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    payload = _review_card("card-invalid").model_dump(mode="json")
+    payload["answer"] = "It retries transient failures before giving up."
+    payload["answer_mode"] = "multiple_choice"
+    payload["choices"] = None
+    cards_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(InputError, match="choices"):
+        import_cards_from_jsonl(db_path, cards_path)
+
+    assert not db_path.exists()
+
+
+def test_record_card_review_once_rejects_duplicate_key_payload_mismatch(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+    import_cards_from_jsonl(db_path, cards_path)
+
+    first = record_card_review_once(
+        db_path,
+        card_id="card-1",
+        answer="good",
+        idempotency_key="review-key",
+        reviewed_at_utc=datetime(2026, 4, 24, tzinfo=UTC),
+    )
+    same = record_card_review_once(
+        db_path,
+        card_id="card-1",
+        answer="good",
+        idempotency_key="review-key",
+        reviewed_at_utc=datetime(2026, 4, 25, tzinfo=UTC),
+    )
+
+    assert first is not None
+    assert same is None
+    with pytest.raises(InputError, match="idempotency key already used"):
+        record_card_review_once(
+            db_path,
+            card_id="card-1",
+            answer="wrong",
+            idempotency_key="review-key",
+            reviewed_at_utc=datetime(2026, 4, 26, tzinfo=UTC),
+        )
+
+
+def test_insert_learning_signal_rejects_duplicate_key_payload_mismatch(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initialize_review_db(db_path)
+
+    assert insert_learning_signal(
+        db_path,
+        event_id="event-1",
+        idempotency_key="signal-key",
+        signal_type="quiz_answer",
+        payload={"quiz_id": "q1", "choice": "a", "correct": True},
+        created_at_utc=datetime(2026, 4, 24, tzinfo=UTC),
+    )
+    assert not insert_learning_signal(
+        db_path,
+        event_id="event-2",
+        idempotency_key="signal-key",
+        signal_type="quiz_answer",
+        payload={"choice": "a", "correct": True, "quiz_id": "q1"},
+        created_at_utc=datetime(2026, 4, 25, tzinfo=UTC),
+    )
+    with pytest.raises(InputError, match="idempotency key already used"):
+        insert_learning_signal(
+            db_path,
+            event_id="event-3",
+            idempotency_key="signal-key",
+            signal_type="quiz_answer",
+            payload={"quiz_id": "q1", "choice": "b", "correct": False},
+            created_at_utc=datetime(2026, 4, 26, tzinfo=UTC),
+        )
+
+
+def test_record_card_review_rejects_missing_or_archived_card(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+    import_cards_from_jsonl(db_path, cards_path)
+    set_card_queue_state(db_path, card_id="card-1", state="archived")
+
+    with pytest.raises(InputError, match="active review card does not exist: missing-card"):
+        record_card_review(db_path, card_id="missing-card", answer="good")
+    with pytest.raises(InputError, match="active review card does not exist: card-1"):
+        record_card_review(db_path, card_id="card-1", answer="good")
+
+
+def test_import_cards_migrates_v1_cards_table_before_writing_stale_reason(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _create_v1_review_db_without_stale_reason(db_path)
+    _write_cards_jsonl(cards_path, (_review_card(),))
+
+    inserted = import_cards_from_jsonl(db_path, cards_path)
+    check = check_review_db(db_path)
+
+    assert inserted == 1
+    assert check.schema_version == CURRENT_SCHEMA_VERSION
+    with connect_review_db(db_path) as connection:
+        card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)").fetchall()}
+        stored = connection.execute(
+            "SELECT id, stale_reason FROM cards WHERE id = 'card-1'"
+        ).fetchone()
+    assert "stale_reason" in card_columns
+    assert tuple(stored) == ("card-1", None)
+
+
+def test_import_cards_marks_missing_run_cards_stale_instead_of_leaving_duplicates(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initial_cards = tmp_path / "cards-initial.jsonl"
+    replacement_cards = tmp_path / "cards-replacement.jsonl"
+    _write_cards_jsonl(initial_cards, (_review_card("card-1"),))
+    _write_cards_jsonl(replacement_cards, (_review_card("card-2"),))
+
+    assert import_cards_from_jsonl(db_path, initial_cards) == 1
+    assert import_cards_from_jsonl(db_path, replacement_cards) == 1
+
+    due_cards = list_due_cards(db_path)
+    assert [card.card_id for card in due_cards] == ["card-2"]
+    with connect_review_db(db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, card_state, stale_reason FROM cards ORDER BY id"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("card-1", "stale", "staleness_unknown"),
+        ("card-2", "active", None),
+    ]
+
+
+def test_import_cards_from_runs_marks_empty_run_cards_stale(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card("card-1"),))
+    assert import_cards_from_runs(db_path, state_dir) == 1
+    cards_path.write_text("", encoding="utf-8")
+
+    assert import_cards_from_runs(db_path, state_dir) == 0
+
+    assert list_due_cards(db_path) == ()
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT card_state, stale_reason FROM cards WHERE id = 'card-1'"
+        ).fetchone()
+    assert tuple(row) == ("stale", "staleness_unknown")
+
+
+def test_import_cards_from_runs_skips_bad_utf8_and_imports_later_good_run(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    bad_cards = state_dir / "runs" / "run-bad" / "quiz" / "cards.jsonl"
+    good_cards = state_dir / "runs" / "run-good" / "quiz" / "cards.jsonl"
+    bad_cards.parent.mkdir(parents=True, exist_ok=True)
+    bad_cards.write_bytes(b"\xff\xfe\xfa")
+    _write_cards_jsonl(
+        good_cards,
+        (_review_card("card-good").model_copy(update={"run_id": "run-good"}),),
+    )
+    errors: list[tuple[Path, Exception]] = []
+
+    inserted = import_cards_from_runs(
+        db_path,
+        state_dir,
+        on_error=lambda p, e: errors.append((p, e)),
+    )
+
+    assert inserted == 1
+    assert len(errors) == 1
+    assert errors[0][0] == bad_cards
+    assert isinstance(errors[0][1], InputError)
+    assert [card.card_id for card in list_due_cards(db_path)] == ["card-good"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires elevated Windows privileges")
+def test_import_cards_from_runs_skips_symlinked_run_directory(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    runs_dir = state_dir / "runs"
+    outside_run = tmp_path / "outside" / "run-link"
+    cards_path = outside_run / "quiz" / "cards.jsonl"
+    _write_cards_jsonl(
+        cards_path,
+        (_review_card("outside-card").model_copy(update={"run_id": "run-link"}),),
+    )
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run-link").symlink_to(outside_run, target_is_directory=True)
+    errors: list[tuple[Path, Exception]] = []
+
+    inserted = import_cards_from_runs(
+        db_path,
+        state_dir,
+        on_error=lambda p, e: errors.append((p, e)),
+    )
+
+    assert inserted == 0
+    assert len(errors) == 1
+    assert errors[0][0] == runs_dir / "run-link" / "quiz" / "cards.jsonl"
+    assert isinstance(errors[0][1], InputError)
+    assert list_due_cards(db_path) == ()
+
+
+def test_peek_guard_rejects_good_review(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+    import_cards_from_jsonl(db_path, cards_path)
+
+    with pytest.raises(Exception, match="peeked cards cannot be reviewed as good or easy"):
+        record_card_review(
+            db_path,
+            card_id="card-1",
+            answer="good",
+            peeked_this_session=True,
+        )
+
+    with pytest.raises(Exception, match="peeked cards cannot be reviewed as good or easy"):
+        record_card_review(
+            db_path,
+            card_id="card-1",
+            answer="easy",
+            peeked_this_session=True,
+        )
+
+    update = record_card_review(
+        db_path,
+        card_id="card-1",
+        answer="hard",
+        peeked_this_session=True,
+    )
+    assert update.rating == 2
+
+
+def test_card_queue_archive_suspend_do_not_write_review_log(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(), _review_card("card-2")))
+    import_cards_from_jsonl(db_path, cards_path)
+
+    set_card_queue_state(db_path, card_id="card-1", state="archived")
+    set_card_queue_state(db_path, card_id="card-2", state="suspended")
+
+    assert list_due_cards(db_path) == ()
+    with connect_review_db(db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, card_state, archived_at_utc, suspended_at_utc FROM cards ORDER BY id"
+        ).fetchall()
+        log_count = connection.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
+    assert rows[0]["card_state"] == "archived"
+    assert rows[0]["archived_at_utc"] is not None
+    assert rows[1]["card_state"] == "suspended"
+    assert rows[1]["suspended_at_utc"] is not None
+    assert log_count == 0
+
+
+def test_set_card_queue_state_rejects_missing_card_and_allows_double_archive(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    cards_path = tmp_path / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+    import_cards_from_jsonl(db_path, cards_path)
+
+    with pytest.raises(InputError, match="review card does not exist: missing-card"):
+        set_card_queue_state(db_path, card_id="missing-card", state="archived")
+
+    set_card_queue_state(
+        db_path,
+        card_id="card-1",
+        state="archived",
+        changed_at_utc=datetime(2026, 4, 24, tzinfo=UTC),
+    )
+    set_card_queue_state(
+        db_path,
+        card_id="card-1",
+        state="archived",
+        changed_at_utc=datetime(2026, 4, 25, tzinfo=UTC),
+    )
+
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT card_state, archived_at_utc FROM cards WHERE id = 'card-1'"
+        ).fetchone()
+    assert tuple(row) == ("archived", "2026-04-25T00:00:00Z")
+
+
+def test_review_cli_imports_cards_and_records_answer(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    cards_path = repo_root / ".ahadiff" / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+
+    list_result = _RUNNER.invoke(
+        app(),
+        ["review", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+    assert list_result.exit_code == 0
+    assert "card-1" in list_result.stdout
+
+    review_result = _RUNNER.invoke(
+        app(),
+        [
+            "review",
+            "--repo-root",
+            str(repo_root),
+            "--card-id",
+            "card-1",
+            "--answer",
+            "wrong",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert review_result.exit_code == 0
+    assert "Rating" in review_result.stdout
+    with connect_review_db(review_db_path(repo_root)) as connection:
+        row = connection.execute("SELECT reps, lapses, last_rating FROM cards").fetchone()
+    assert tuple(row) == (1, 1, 1)
+
+
+def test_review_cli_warns_and_skips_schema_invalid_cards_jsonl(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    bad_cards_path = repo_root / ".ahadiff" / "runs" / "run-bad" / "quiz" / "cards.jsonl"
+    good_cards_path = repo_root / ".ahadiff" / "runs" / "run-good" / "quiz" / "cards.jsonl"
+    bad_cards_path.parent.mkdir(parents=True, exist_ok=True)
+    bad_cards_path.write_text(json.dumps({"card_id": "broken"}) + "\n", encoding="utf-8")
+    _write_cards_jsonl(good_cards_path, (_review_card("card-good"),))
+
+    result = _RUNNER.invoke(
+        app(),
+        ["review", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "card-good" in result.stdout
+    assert "Warning" in result.stderr
+    assert "run-bad" in result.stderr.replace("\n", "")
+
+
+def test_review_cli_accepts_easy_answer(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    cards_path = repo_root / ".ahadiff" / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "review",
+            "--repo-root",
+            str(repo_root),
+            "--card-id",
+            "card-1",
+            "--answer",
+            "easy",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Rating" in result.stdout
+    assert "4" in result.stdout
+    with connect_review_db(review_db_path(repo_root)) as connection:
+        row = connection.execute("SELECT last_rating FROM cards WHERE id = 'card-1'").fetchone()
+    assert row is not None
+    assert int(row[0]) == 4
+
+
+def test_review_cli_help_mentions_easy_answer() -> None:
+    result = _RUNNER.invoke(app(), ["review", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "Review answer: easy, good, hard, or" in result.stdout
+    assert "wrong." in result.stdout
+
+
+def test_review_cli_archive_card_without_rating(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    cards_path = repo_root / ".ahadiff" / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    _write_cards_jsonl(cards_path, (_review_card(),))
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "review",
+            "--repo-root",
+            str(repo_root),
+            "--card-id",
+            "card-1",
+            "--action",
+            "archive",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Archived" in result.stdout
+    with connect_review_db(review_db_path(repo_root)) as connection:
+        row = connection.execute(
+            "SELECT card_state, reps FROM cards WHERE id = 'card-1'"
+        ).fetchone()
+        log_count = connection.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
+    assert tuple(row) == ("archived", 0)
+    assert log_count == 0
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    (
+        ["--optimize", "--card-id", "card-1"],
+        ["--optimize", "--answer", "good"],
+        ["--optimize", "--card-id", "card-1", "--action", "archive"],
+    ),
+)
+def test_review_cli_rejects_optimize_with_mutating_review_options(
+    tmp_path: Path,
+    extra_args: list[str],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    result = _RUNNER.invoke(
+        app(),
+        ["review", "--repo-root", str(repo_root), *extra_args],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert "--optimize cannot be combined with --action, --card-id, or --answer" in result.stderr
+
+
+def test_review_cli_optimize_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    class _FakeOptimizeResult:
+        weights = [0.11, 0.22, 0.33]
+        review_count = 12
+        effective_review_count = 8
+        stage = "warm"
+        message = "Warm optimization applied from 8 effective reviews (12 raw logs)."
+
+    def _fake_optimize(_db_path: object) -> _FakeOptimizeResult:
+        return _FakeOptimizeResult()
+
+    monkeypatch.setattr(cli_module, "optimize_review_weights", _fake_optimize)
+
+    result = _RUNNER.invoke(
+        app(),
+        ["review", "--repo-root", str(repo_root), "--optimize"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "FSRS optimizer" in result.stdout
+    assert "warm" in result.stdout.lower()
+    assert "8" in result.stdout
+    assert "12" in result.stdout
+    assert "[0.11, 0.22, 0.33]" in result.stdout
+    assert review_db_path(repo_root).is_file()
+
+
+@pytest.fixture
+def quiz_publication_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    # These tests isolate CLI argument/card wiring with minimal fake reports.
+    # Real publication and rollback are covered in test_source_card_exports.
+    calls: list[dict[str, object]] = []
+
+    def publish(**kwargs: object) -> tuple[object, list[str]]:
+        assert kwargs["event_type"] == "verify"
+        assert kwargs["force"] is True
+        assert kwargs["note_payload"] == {
+            "regenerated_artifact": "quiz",
+            "judge_status": "not_rerun_after_quiz_regeneration",
+        }
+        calls.append(kwargs)
+        return object(), []
+
+    monkeypatch.setattr(cli_module, "_persist_evaluated_run", publish)
+    return calls
+
+
+def test_regenerate_only_quiz_rewrites_quiz_without_touching_lesson(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quiz_publication_calls: list[dict[str, object]],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    lesson_path = run_path / "lesson" / "lesson.full.md"
+    quiz_path = run_path / "quiz" / "quiz.jsonl"
+    misconception_path = run_path / "quiz" / "misconception_cards.jsonl"
+    lesson_path.parent.mkdir(parents=True)
+    quiz_path.parent.mkdir(parents=True)
+    lesson_path.write_text("keep this lesson\n", encoding="utf-8")
+    quiz_path.write_text('{"old": true}\n', encoding="utf-8")
+    calls: list[str] = []
+
+    class _FakeReport:
+        verdict = "PASS"
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        calls.append("quiz")
+        assert kwargs["overwrite"] is True
+        quiz_path.write_text('{"new": true}\n', encoding="utf-8")
+        misconception_path.write_text('{"new-misconception": true}\n', encoding="utf-8")
+        return (
+            QuizArtifactPaths(
+                quiz_dir=quiz_path.parent,
+                quiz_path=quiz_path,
+                misconception_path=misconception_path,
+            ),
+            (),
+        )
+
+    def fake_generate_cards_for_run(**kwargs: object) -> Path:
+        calls.append("cards")
+        cards_path = run_path / "quiz" / "cards.jsonl"
+        _write_cards_jsonl(cards_path, (_review_card(),))
+        return cards_path
+
+    def fake_evaluate_run(_run_path: Path) -> _FakeReport:
+        return _FakeReport()
+
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+    monkeypatch.setattr(cli_module, "generate_cards_for_run", fake_generate_cards_for_run)
+    monkeypatch.setattr(cli_module, "evaluate_run", fake_evaluate_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(quiz_publication_calls) == 1
+    assert calls == ["quiz", "cards"]
+    assert lesson_path.read_text(encoding="utf-8") == "keep this lesson\n"
+    assert quiz_path.read_text(encoding="utf-8") == '{"new": true}\n'
+    assert misconception_path.read_text(encoding="utf-8") == '{"new-misconception": true}\n'
+
+
+def test_regenerate_only_quiz_uses_run_content_lang(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quiz_publication_calls: list[dict[str, object]],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    quiz_path = run_path / "quiz" / "quiz.jsonl"
+    quiz_path.parent.mkdir(parents=True)
+    quiz_path.write_text('{"old": true}\n', encoding="utf-8")
+    (run_path / "metadata.json").write_text(
+        json.dumps({"content_lang": "zh-CN"}) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeReport:
+        verdict = "PASS"
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        captured.update(kwargs)
+        quiz_path.write_text('{"new": true}\n', encoding="utf-8")
+        return QuizArtifactPaths(quiz_dir=quiz_path.parent, quiz_path=quiz_path), ()
+
+    def fake_generate_cards_for_run(**kwargs: object) -> Path:
+        del kwargs
+        cards_path = run_path / "quiz" / "cards.jsonl"
+        _write_cards_jsonl(cards_path, (_review_card(),))
+        return cards_path
+
+    def fake_evaluate_run(_run_path: Path) -> _FakeReport:
+        return _FakeReport()
+
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+    monkeypatch.setattr(cli_module, "generate_cards_for_run", fake_generate_cards_for_run)
+    monkeypatch.setattr(cli_module, "evaluate_run", fake_evaluate_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(quiz_publication_calls) == 1
+    assert captured["output_lang"] == "zh-CN"
+
+
+def test_regenerate_only_quiz_passes_quiz_output_caps_to_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quiz_publication_calls: list[dict[str, object]],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    quiz_path = run_path / "quiz" / "quiz.jsonl"
+    misconception_path = run_path / "quiz" / "misconception_cards.jsonl"
+    quiz_path.parent.mkdir(parents=True)
+    quiz_path.write_text('{"old": true}\n', encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class _FakeReport:
+        verdict = "PASS"
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        captured.update(kwargs)
+        quiz_path.write_text('{"new": true}\n', encoding="utf-8")
+        misconception_path.write_text('{"new-misconception": true}\n', encoding="utf-8")
+        return (
+            QuizArtifactPaths(
+                quiz_dir=quiz_path.parent,
+                quiz_path=quiz_path,
+                misconception_path=misconception_path,
+            ),
+            (),
+        )
+
+    def fake_generate_cards_for_run(**kwargs: object) -> Path:
+        del kwargs
+        cards_path = run_path / "quiz" / "cards.jsonl"
+        _write_cards_jsonl(cards_path, (_review_card(),))
+        return cards_path
+
+    def fake_evaluate_run(_run_path: Path) -> _FakeReport:
+        return _FakeReport()
+
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+    monkeypatch.setattr(cli_module, "generate_cards_for_run", fake_generate_cards_for_run)
+    monkeypatch.setattr(cli_module, "evaluate_run", fake_evaluate_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(quiz_publication_calls) == 1
+    assert captured["quiz_output_token_cap"] == 18_000
+    assert captured["misconception_output_token_cap"] == 6_000
+
+
+def test_regenerate_only_quiz_rejects_concurrent_session_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    (run_path / "quiz").mkdir(parents=True)
+    observed_locks: list[tuple[Path, str]] = []
+    generated = False
+
+    @contextmanager
+    def fake_repo_write_lock(lock_path: Path, *, command: str) -> Iterator[Path]:
+        observed_locks.append((lock_path, command))
+        if command:
+            raise StorageError("another ahadiff process is already running (PID=123)")
+        yield lock_path
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        nonlocal generated
+        del kwargs
+        generated = True
+        raise AssertionError("quiz generation should not start while the repo lock is held")
+
+    monkeypatch.setattr(cli_module, "repo_write_lock", fake_repo_write_lock)
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert "another ahadiff session is already running" in result.stderr
+    assert observed_locks == [(lock_file_path(repo_root), "regenerate quiz")]
+    assert generated is False
+
+
+def test_regenerate_only_quiz_restores_previous_artifacts_when_evaluate_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    lesson_path = run_path / "lesson" / "lesson.full.md"
+    quiz_path = run_path / "quiz" / "quiz.jsonl"
+    cards_path = run_path / "quiz" / "cards.jsonl"
+    misconception_path = run_path / "quiz" / "misconception_cards.jsonl"
+    lesson_path.parent.mkdir(parents=True)
+    quiz_path.parent.mkdir(parents=True)
+    lesson_path.write_text("keep this lesson\n", encoding="utf-8")
+    quiz_path.write_text('{"old": true}\n', encoding="utf-8")
+    cards_path.write_text('{"old-card": true}\n', encoding="utf-8")
+    misconception_path.write_text('{"old-misconception": true}\n', encoding="utf-8")
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        del kwargs
+        quiz_path.write_text('{"new": true}\n', encoding="utf-8")
+        misconception_path.write_text('{"new-misconception": true}\n', encoding="utf-8")
+        return (
+            QuizArtifactPaths(
+                quiz_dir=quiz_path.parent,
+                quiz_path=quiz_path,
+                misconception_path=misconception_path,
+            ),
+            (),
+        )
+
+    def fail_evaluate_run(_run_path: Path) -> object:
+        raise RuntimeError("simulated evaluate failure")
+
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+    monkeypatch.setattr(cli_module, "evaluate_run", fail_evaluate_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert "simulated evaluate failure" in result.stderr
+    assert lesson_path.read_text(encoding="utf-8") == "keep this lesson\n"
+    assert quiz_path.read_text(encoding="utf-8") == '{"old": true}\n'
+    assert cards_path.read_text(encoding="utf-8") == '{"old-card": true}\n'
+    assert misconception_path.read_text(encoding="utf-8") == '{"old-misconception": true}\n'
+
+
+def test_regenerate_only_quiz_marks_existing_run_cards_stale_when_verdict_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quiz_publication_calls: list[dict[str, object]],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    run_path = repo_root / ".ahadiff" / "runs" / "run-reg"
+    lesson_path = run_path / "lesson" / "lesson.full.md"
+    quiz_path = run_path / "quiz" / "quiz.jsonl"
+    cards_path = run_path / "quiz" / "cards.jsonl"
+    lesson_path.parent.mkdir(parents=True)
+    quiz_path.parent.mkdir(parents=True)
+    lesson_path.write_text("keep this lesson\n", encoding="utf-8")
+    quiz_path.write_text('{"old": true}\n', encoding="utf-8")
+    _write_cards_jsonl(cards_path, (_review_card().model_copy(update={"run_id": "run-reg"}),))
+    import_cards_from_jsonl(review_db_path(repo_root), cards_path)
+
+    class _FailReport:
+        verdict = "FAIL"
+
+    def fake_generate_quiz_from_run(
+        **kwargs: object,
+    ) -> tuple[QuizArtifactPaths, tuple[object, ...]]:
+        del kwargs
+        quiz_path.write_text('{"new": true}\n', encoding="utf-8")
+        return QuizArtifactPaths(quiz_dir=quiz_path.parent, quiz_path=quiz_path), ()
+
+    def fake_evaluate_run(_run_path: Path) -> _FailReport:
+        return _FailReport()
+
+    monkeypatch.setattr(cli_module, "generate_quiz_from_run", fake_generate_quiz_from_run)
+    monkeypatch.setattr(cli_module, "evaluate_run", fake_evaluate_run)
+
+    result = _RUNNER.invoke(
+        app(),
+        [
+            "regenerate",
+            "run-reg",
+            "--only",
+            "quiz",
+            "--repo-root",
+            str(repo_root),
+            "--base-url",
+            "http://127.0.0.1:8318",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert len(quiz_publication_calls) == 1
+    assert quiz_path.read_text(encoding="utf-8") == '{"new": true}\n'
+    assert not cards_path.exists()
+    with connect_review_db(review_db_path(repo_root)) as connection:
+        row = connection.execute(
+            "SELECT card_state, stale_reason FROM cards WHERE id = 'card-1'"
+        ).fetchone()
+    assert tuple(row) == ("stale", "staleness_unknown")
+
+
+def test_mark_wrong_cli_writes_idempotent_learning_signal(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    first = _RUNNER.invoke(
+        app(),
+        ["mark", "claim-1", "wrong", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+    second = _RUNNER.invoke(
+        app(),
+        ["mark", "claim-1", "wrong", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert "Already marked wrong" in second.stdout
+    with connect_review_db(review_db_path(repo_root)) as connection:
+        rows = connection.execute(
+            "SELECT signal_type, payload_json FROM learning_signals"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["signal_type"] == "mark_wrong"
+    assert json.loads(rows[0]["payload_json"]) == {"claim_id": "claim-1"}
+
+
+def test_finalize_targeted_verify_clones_new_keep_final_event(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    targeted = _result_event(
+        event_id="018f0f52-91c0-7abc-8123-000000000201",
+        status="targeted_verify",
+        event_type="improve",
+        timestamp="2026-04-24T00:00:00Z",
+    )
+    sync_result_event(db_path, targeted)
+
+    finalized = finalize_targeted_verify_event(
+        db_path,
+        run_id="run-1",
+        event_id="018f0f52-91c0-7abc-8123-000000000202",
+        timestamp=datetime(2026, 4, 25, tzinfo=UTC),
+    )
+
+    rows = load_result_events_from_db(db_path)
+    assert finalized.status == "keep_final"
+    assert finalized.event_type == "improve"
+    assert len(rows) == 2
+    assert {row.status for row in rows} == {"targeted_verify", "keep_final"}
+    assert json.loads(finalized.note_json or "{}")["finalized_from_event_id"] == targeted.event_id
+
+
+def test_finalize_targeted_verify_requires_source_event(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+
+    with pytest.raises(InputError, match="targeted_verify result event does not exist"):
+        finalize_targeted_verify_event(db_path, run_id="run-missing")
+
+
+def test_db_cli_finalize_targeted_verify(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    sync_result_event(
+        review_db_path(repo_root),
+        _result_event(status="targeted_verify", event_type="improve"),
+    )
+
+    result = _RUNNER.invoke(
+        app(),
+        ["db", "finalize-targeted", "run-1", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    rows = load_result_events_from_db(review_db_path(repo_root))
+    assert {row.status for row in rows} == {"targeted_verify", "keep_final"}
+
+
+def test_import_results_tsv_lossy_synthesizes_missing_event_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "\t".join(
+            (
+                "timestamp",
+                "run_id",
+                "source_ref",
+                "base_ref",
+                "prompt_version",
+                "rubric_version",
+                "overall",
+                "verdict",
+                "status",
+                "weakest_dim",
+                "note_json",
+            )
+        )
+        + "\n"
+        + "\t".join(
+            (
+                "2026-04-24T00:00:00Z",
+                "run-1",
+                "abc1234",
+                "",
+                "prompt123",
+                "rubric-v1",
+                "91.50",
+                "PASS",
+                "baseline",
+                "evidence",
+                "",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    outcome = import_results_tsv_lossy(db_path, tsv_path)
+    rows = load_result_events_from_db(db_path)
+
+    assert outcome.imported == 1
+    assert outcome.skipped == 0
+    assert rows[0].event_type == "imported_from_tsv"
+    assert rows[0].eval_bundle_version == "imported_from_tsv"
+    assert json.loads(rows[0].note_json or "{}")["lossy_import"] is True
+
+
+def test_import_results_tsv_lossy_uses_single_connection_for_multiple_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "timestamp\trun_id\tsource_ref\tbase_ref\tprompt_version\trubric_version\t"
+        "overall\tverdict\tstatus\tweakest_dim\tnote_json\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "91.50\tPASS\tbaseline\tevidence\t\n"
+        "2026-04-24T00:00:01Z\trun-2\tdef5678\t\tprompt123\trubric-v1\t"
+        "88.00\tPASS\tnon_ratcheted\tcoverage\t\n",
+        encoding="utf-8",
+    )
+    connection_count = 0
+    real_connect = review_database_module.connect_review_db
+
+    def counting_connect(
+        db_path_arg: Path,
+        *,
+        create_parent: bool = False,
+    ) -> sqlite3.Connection:
+        nonlocal connection_count
+        connection_count += 1
+        return real_connect(db_path_arg, create_parent=create_parent)
+
+    monkeypatch.setattr(review_database_module, "connect_review_db", counting_connect)
+
+    outcome = import_results_tsv_lossy(db_path, tsv_path)
+
+    assert outcome == review_database_module.LossyImportOutcome(imported=2, skipped=0)
+    assert connection_count == 1
+
+
+def test_import_results_tsv_lossy_rolls_back_partial_batch_on_invalid_row(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "timestamp\trun_id\tsource_ref\tbase_ref\tprompt_version\trubric_version\t"
+        "overall\tverdict\tstatus\tweakest_dim\tnote_json\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "91.50\tPASS\tbaseline\tevidence\t\n"
+        "2026-04-24T00:00:01Z\trun-2\tdef5678\t\tprompt123\trubric-v1\t"
+        "not-a-number\tPASS\tnon_ratcheted\tcoverage\t\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InputError, match="invalid overall score"):
+        import_results_tsv_lossy(db_path, tsv_path)
+
+    assert load_result_events_from_db(db_path) == ()
+
+
+@pytest.mark.parametrize("overall", ["nan", "inf", "-inf", "1e309"])
+def test_import_results_tsv_lossy_rejects_non_finite_overall_and_rolls_back(
+    tmp_path: Path,
+    overall: str,
+) -> None:
+    db_path = tmp_path / "review.sqlite"
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "timestamp\trun_id\tsource_ref\tbase_ref\tprompt_version\trubric_version\t"
+        "overall\tverdict\tstatus\tweakest_dim\tnote_json\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "91.50\tPASS\tbaseline\tevidence\t\n"
+        "2026-04-24T00:00:01Z\trun-2\tdef5678\t\tprompt123\trubric-v1\t"
+        f"{overall}\tPASS\tnon_ratcheted\tcoverage\t\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InputError, match="invalid overall score"):
+        import_results_tsv_lossy(db_path, tsv_path)
+
+    assert load_result_events_from_db(db_path) == ()
+
+
+def test_import_results_tsv_lossy_rejects_duplicate_lossy_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "timestamp\trun_id\tsource_ref\tbase_ref\tprompt_version\trubric_version\t"
+        "overall\tverdict\tstatus\tweakest_dim\tnote_json\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "91.50\tPASS\tbaseline\tevidence\t\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "88.00\tPASS\tnon_ratcheted\tcoverage\t\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InputError, match="duplicate lossy identity"):
+        import_results_tsv_lossy(db_path, tsv_path)
+
+    assert load_result_events_from_db(db_path) == ()
+
+
+def test_db_import_results_requires_lossy_confirmation(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    tsv_path = tmp_path / "results.tsv"
+    tsv_path.write_text(
+        "timestamp\trun_id\tsource_ref\tbase_ref\tprompt_version\trubric_version\t"
+        "overall\tverdict\tstatus\tweakest_dim\tnote_json\n"
+        "2026-04-24T00:00:00Z\trun-1\tabc1234\t\tprompt123\trubric-v1\t"
+        "91.50\tPASS\tbaseline\tevidence\t\n",
+        encoding="utf-8",
+    )
+
+    rejected = _RUNNER.invoke(
+        app(),
+        ["db", "import-results", str(tsv_path), "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+    accepted = _RUNNER.invoke(
+        app(),
+        [
+            "db",
+            "import-results",
+            str(tsv_path),
+            "--repo-root",
+            str(repo_root),
+            "--i-understand-this-is-lossy",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert rejected.exit_code == 1
+    assert "is lossy" in rejected.stderr
+    assert accepted.exit_code == 0
+    rows = load_result_events_from_db(review_db_path(repo_root))
+    assert len(rows) == 1
+
+
+def test_make_uuid7_is_monotonic_within_same_millisecond(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 24, 12, 0, 0, 123000, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            del tz
+            return fixed_now
+
+    monkeypatch.setattr(review_database_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(review_database_module, "_uuid7_last_timestamp_ms", -1)
+    monkeypatch.setattr(review_database_module, "_uuid7_last_tail", -1)
+
+    identifiers = [review_database_module.make_uuid7() for _ in range(1024)]
+
+    assert identifiers == sorted(identifiers)
+    assert len(set(identifiers)) == len(identifiers)
+
+
+def test_upgrade_failure_restores_backup(tmp_path: Path) -> None:
+    db_path = tmp_path / "review.sqlite"
+    initialize_review_db(db_path)
+    sync_result_event(db_path, _result_event())
+
+    def failing_migration(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TABLE should_not_survive (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("boom")
+
+    with pytest.raises(Exception, match="rolled back"):
+        upgrade_review_db(db_path, migration_hook=failing_migration)
+
+    with connect_review_db(db_path) as connection:
+        leftover = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_not_survive'"
+        ).fetchone()
+    assert leftover is None
+    assert len(load_result_events_from_db(db_path)) == 1
+
+
+def test_db_cli_upgrade_backup_check_and_restore(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+    db_path = review_db_path(repo_root)
+    initialize_review_db(db_path)
+
+    backup_path = tmp_path / "manual.bak"
+    backup_result = _RUNNER.invoke(
+        app(),
+        ["db", "backup", "--repo-root", str(repo_root), "--output", str(backup_path)],
+        catch_exceptions=False,
+    )
+    assert backup_result.exit_code == 0
+    assert backup_path.exists()
+
+    check_result = _RUNNER.invoke(
+        app(),
+        ["db", "check", "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+    assert check_result.exit_code == 0
+    assert "SQLite quick_check" in check_result.stdout
+    assert "Event id unique" in check_result.stdout
+
+    with connect_review_db(db_path) as connection:
+        connection.execute(
+            "INSERT INTO learning_signals VALUES (?, ?, ?, ?, ?)",
+            ("event-1", "key-1", "mark_wrong", "{}", "2026-04-24T00:00:00Z"),
+        )
+    restore_result = _RUNNER.invoke(
+        app(),
+        ["db", "restore", str(backup_path), "--repo-root", str(repo_root)],
+        catch_exceptions=False,
+    )
+    assert restore_result.exit_code == 0
+    with connect_review_db(db_path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM learning_signals").fetchone()[0]
+    assert count == 0
+
+
+# --- F5 regression: review cards file size cap ---
+
+
+def test_load_review_cards_rejects_oversized_file(tmp_path: Path) -> None:
+    """_load_review_cards rejects files exceeding 16 MiB."""
+    from ahadiff.review.database import _load_review_cards  # pyright: ignore[reportPrivateUsage]
+
+    cards_path = tmp_path / "huge_cards.jsonl"
+    cards_path.write_bytes(b"x" * (16 * 1024 * 1024 + 1))
+    with pytest.raises(InputError, match="16 MiB"):
+        _load_review_cards(cards_path)

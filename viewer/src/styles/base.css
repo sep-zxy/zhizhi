@@ -1,0 +1,267 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--ink);
+  background: var(--paper);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+}
+
+:lang(zh-Hans),
+:lang(zh-CN) {
+  line-height: 1.75;
+}
+
+/* Headings default to the editorial serif. Page-level CSS with more specific
+   selectors still wins; this just ensures bare h1–h6 read as masthead type.
+   Grayscale smoothing keeps the large serif weights crisp on macOS. */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-serif);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*:focus-visible {
+  outline: none;
+  box-shadow: var(--sh-ring);
+  border-radius: var(--radius-6);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+a {
+  color: var(--accent-ink);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  padding: 0.4em 0.9em;
+  transition: border-color var(--dur-fast) var(--ease-out-quart);
+}
+
+button:hover {
+  border-color: var(--hair-strong);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button:active:not(:disabled) {
+    transform: none !important;
+  }
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-mono);
+}
+
+.route-fallback {
+  min-height: 60vh;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hair-strong) var(--paper);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--hair-strong);
+  border-radius: var(--radius-10);
+  border: 2px solid var(--paper);
+}
+
+.error-boundary__fallback {
+  padding: var(--sp-6);
+  margin: var(--sp-6) auto;
+  max-width: 720px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--elevated);
+  color: var(--ink);
+}
+
+.error-boundary__fallback h2 {
+  font-family: var(--font-serif);
+  margin: 0 0 var(--sp-3);
+}
+
+.error-boundary__fallback p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.error-boundary__retry {
+  padding: var(--sp-2) var(--sp-5);
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: var(--radius-6);
+  cursor: pointer;
+  margin-top: var(--sp-3);
+}
+
+.error-boundary__retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Reusable retry button for page-level error states */
+.retry-btn {
+  padding: var(--sp-2) var(--sp-5);
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: var(--radius-6);
+  cursor: pointer;
+  margin-top: var(--sp-3);
+  font-size: 14px;
+}
+
+.retry-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.error-boundary__retry:active,
+.retry-btn:active {
+  transform: scale(0.97);
+  opacity: 0.9;
+}
+
+@media (forced-colors: active) {
+  /* In Windows High Contrast mode the box-shadow ring is invisible, so the
+     `outline: none` rule above would erase all focus indicators. Restore an
+     OS-painted outline so keyboard users can see focus. */
+  *:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .error-boundary__retry,
+  .retry-btn {
+    border: 1px solid ButtonText;
+  }
+}
+
+/* ---- Page entrance animation (moved from tokens.css) ---- */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- Loading spinner ---- */
+.loading-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--hair);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  margin-inline-end: var(--sp-2);
+  vertical-align: middle;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner { animation: none; opacity: 0.5; }
+}
+
+/* ---- Safe-area insets (iOS home indicator) ---- */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .app-content {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* ---- data-state overlay (V6 empty/loading/error pattern) ---- */
+.page[data-state="empty"]   .page-content::before,
+.page[data-state="loading"] .page-content::before,
+.page[data-state="error"]   .page-content::before {
+  content: attr(data-state-msg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 260px;
+  border: 1px dashed var(--hair-strong);
+  border-radius: var(--r-lg);
+  background: var(--subtle);
+  color: var(--muted);
+  font-family: var(--font-serif);
+  font-size: 18px;
+  padding: var(--sp-8);
+  text-align: center;
+  margin-bottom: var(--sp-4);
+}
+
+.page[data-state="loading"] .page-content::before {
+  background: var(--warning-soft-bg, #fbf5e6);
+  border-color: var(--warning-hair, #e3cda1);
+  color: var(--warning);
+}
+
+.page[data-state="error"] .page-content::before {
+  background: var(--accent-softest, #fdf1ec);
+  border-color: var(--danger-hair, #e4b8ae);
+  color: var(--danger);
+}
+
+.page[data-state="empty"]   .page-content > *:not(.page-head),
+.page[data-state="loading"] .page-content > *:not(.page-head),
+.page[data-state="error"]   .page-content > *:not(.page-head) {
+  opacity: 0.25;
+  pointer-events: none;
+  filter: grayscale(0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page[data-state="loading"] .page-content::before,
+  .page[data-state="error"]   .page-content::before {
+    transition: none;
+  }
+}

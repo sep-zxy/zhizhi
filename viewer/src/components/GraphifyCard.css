@@ -1,0 +1,346 @@
+.graphify-card {
+  background: transparent;
+  border: none;
+  border-top: 1px dashed var(--hair-strong);
+  border-bottom: 1px dashed var(--hair-strong);
+  border-radius: 0;
+  padding: var(--sp-4) 0;
+  margin-bottom: var(--sp-4);
+  font-size: var(--fs-sm);
+}
+
+@supports (container-type: inline-size) {
+  .graphify-card {
+    container-type: inline-size;
+  }
+}
+
+.graphify-card__header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+
+.graphify-card__icon {
+  color: var(--accent);
+  font-size: var(--fs-md);
+  line-height: 1;
+}
+
+.graphify-card__header .graphify-badge {
+  margin-left: auto;
+}
+
+.graphify-card__title {
+  font-family: var(--font-serif);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--ink);
+  margin: 0;
+}
+
+.graphify-card__body {
+  margin-top: 0;
+}
+
+/* Keep the settings controls below asynchronous diagnostics in place. The
+   loading and loaded cards reserve the same five metadata rows. */
+.graphify-card--stable .graphify-card__header {
+  min-block-size: calc(var(--fs-md) * 1.5);
+  line-height: 1.5;
+}
+
+.graphify-card--stable .graphify-card__body {
+  --graphify-row-block-size: calc(var(--fs-2xs) * 1.5 + 6px);
+  min-block-size: calc(var(--graphify-row-block-size) * 5 + 4px);
+}
+
+.graphify-card--stable .graphify-card__row {
+  display: grid;
+  grid-template-columns: 90px 12px minmax(0, 1fr);
+  min-block-size: var(--graphify-row-block-size);
+  line-height: 1.5;
+}
+
+.graphify-card--stable .graphify-card__row > span:last-child {
+  grid-column: 2 / -1;
+}
+
+.graphify-card--stable .graphify-card__row > span:nth-child(3) {
+  grid-column: 3 / -1;
+}
+
+.graphify-card--stable .graphify-card__row:last-child {
+  /* The SHA row includes a copy button with its own padding and border. */
+  min-block-size: calc(var(--graphify-row-block-size) + 4px);
+}
+
+.graphify-card__skeleton-value {
+  display: block;
+  inline-size: min(100%, 16ch);
+  block-size: 1em;
+  border-radius: var(--r-sm);
+  background: var(--hair);
+}
+
+.graphify-card__row {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  padding: 3px 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--ink-2);
+  min-width: 0;
+}
+
+.graphify-card__row > span:not(.graphify-card__row-label):not(.graphify-card__row-ok) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.graphify-card__row-label {
+  color: var(--muted);
+  min-width: 90px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.graphify-card__row-ok {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.graphify-card__empty {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-base);
+  color: var(--muted);
+}
+
+.graphify-card__sha-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.graphify-card__copy-btn {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  padding: 1px 6px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  background: var(--subtle);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.graphify-card__copy-btn:hover {
+  background: var(--accent-softer);
+  color: var(--accent-ink);
+}
+
+.graphify-card__copy-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.graphify-card__copy-btn.is-copied {
+  background: var(--success);
+  color: var(--on-accent);
+  border-color: var(--success);
+}
+
+.graphify-card--placeholder {
+  min-height: 96px;
+  visibility: hidden;
+}
+
+/* -- Compact variant (inline for Dashboard) -- */
+
+.graphify-card--compact {
+  padding: 10px var(--sp-4);
+  /* Inline summaries size from their contents inside flex toolbars. */
+  container-type: normal;
+  max-width: 100%;
+}
+
+.graphify-card__compact-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.graphify-card--compact.graphify-card--placeholder {
+  min-height: 43px;
+}
+
+.graphify-card__label {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.graphify-card__counts {
+  font-size: var(--fs-base);
+  color: var(--muted);
+}
+
+/* -- Freshness badge -- */
+
+.graphify-badge {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  border: 1px dashed;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.graphify-badge--success {
+  background: var(--success-soft);
+  color: var(--success);
+  border-color: var(--success-hair);
+}
+
+.graphify-badge--warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border-color: var(--warning-hair);
+}
+
+.graphify-badge--muted {
+  background: var(--subtle);
+  color: var(--muted);
+  border-color: var(--hair);
+}
+
+/* -- Responsive -- */
+
+@supports (container-type: inline-size) {
+  @container (max-width: 540px) {
+    .graphify-card--stable .graphify-card__body {
+      --graphify-row-block-size: calc(var(--fs-2xs) * 3 + 6px);
+    }
+
+    .graphify-card--stable .graphify-card__row {
+      grid-template-columns: 70px 12px minmax(0, 1fr);
+    }
+
+    .graphify-card__compact-inner {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+    }
+
+    .graphify-card__row {
+      flex-wrap: wrap;
+    }
+
+    .graphify-card__row-label {
+      min-width: 70px;
+    }
+  }
+}
+
+/* Fallback for browsers without container queries (Firefox <110, Safari <16,
+   Chrome <105): approximate via viewport width. */
+@supports not (container-type: inline-size) {
+  @media (max-width: 540px) {
+    .graphify-card--stable .graphify-card__body {
+      --graphify-row-block-size: calc(var(--fs-2xs) * 3 + 6px);
+    }
+
+    .graphify-card--stable .graphify-card__row {
+      grid-template-columns: 70px 12px minmax(0, 1fr);
+    }
+
+    .graphify-card__compact-inner {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+    }
+
+    .graphify-card__row {
+      flex-wrap: wrap;
+    }
+
+    .graphify-card__row-label {
+      min-width: 70px;
+    }
+  }
+}
+
+/* -- Print -- */
+
+@media print {
+  .graphify-card {
+    background: var(--elevated);
+    border: 1px solid var(--hair-strong);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--r-md);
+    color: var(--ink);
+    break-inside: avoid;
+  }
+
+  .graphify-card__row {
+    color: var(--ink);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
+/* -- Forced colors -- */
+
+@media (forced-colors: active) {
+  .graphify-card {
+    background: Canvas;
+    border-color: CanvasText;
+    color: CanvasText;
+  }
+
+  .graphify-card__title,
+  .graphify-card__icon,
+  .graphify-card__label,
+  .graphify-card__row,
+  .graphify-card__row-label,
+  .graphify-card__counts,
+  .graphify-card__empty {
+    color: CanvasText;
+  }
+
+  .graphify-badge {
+    background: Canvas;
+    border-color: CanvasText;
+    border-style: solid;
+    color: CanvasText;
+  }
+
+  .graphify-badge--success,
+  .graphify-badge--warning {
+    border-color: Highlight;
+    color: Highlight;
+  }
+
+  .graphify-card__copy-btn {
+    background: Canvas;
+    border-color: CanvasText;
+    color: CanvasText;
+  }
+}
+
+/* -- Reduced motion -- */
+
+@media (prefers-reduced-motion: reduce) {
+  .graphify-card,
+  .graphify-badge {
+    transition: none;
+  }
+}

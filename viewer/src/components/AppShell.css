@@ -1,0 +1,106 @@
+/* ==========================================================================
+   AppShell — shared layout: Topbar + Sidebar + content area
+   Uses tokens from styles/tokens.css exclusively.
+   ========================================================================== */
+
+.skip-to-content {
+  position: absolute;
+  top: -100%;
+  inset-inline-start: var(--sp-4);
+  z-index: var(--z-toast);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: var(--r-md);
+  text-decoration: none;
+  font-size: var(--fs-sm);
+}
+.skip-to-content:focus {
+  top: var(--sp-2);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 248px 1fr;
+  min-height: 100vh;
+}
+
+.main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell__backdrop {
+  display: none;
+}
+
+/* ---------- Content ---------- */
+
+.app-content {
+  min-width: 0;
+  overflow-x: clip;
+}
+
+/* ==========================================================================
+   Responsive 3-state sidebar:
+     >1024px      full sidebar (248px) — default rule above
+     769-1024px   icon-only rail (56px) — sidebar always visible, narrow
+     <=768px      drawer overlay with hamburger
+   ========================================================================== */
+
+@media (max-width: 1024px) and (min-width: 769px) {
+  .app {
+    grid-template-columns: 56px 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  /* Scroll-lock the page underneath while the drawer is open so iOS Safari
+   * doesn't keep scrolling the content beneath the overlay. */
+  .app.nav-open {
+    overflow: hidden;
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  .app-shell__backdrop {
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: min(280px, calc(100vw - 48px));
+    inset-inline-end: 0;
+    z-index: var(--z-overlay);
+    display: block;
+    padding: 0;
+    border: 0;
+    background: rgba(31, 30, 27, 0.32);
+    cursor: pointer;
+  }
+
+  .app-shell__backdrop[hidden] {
+    display: none;
+  }
+}
+
+/* Phone: tighten content padding under 768px (V6:377). */
+@media (max-width: 767px) {
+  .app-content {
+    padding: var(--sp-5) var(--sp-4) var(--sp-6);
+  }
+}
+
+/* ---------- Forced-colors (Windows High Contrast) ---------- */
+@media (forced-colors: active) {
+  .skip-to-content:focus {
+    outline: 2px solid ButtonText;
+    forced-color-adjust: none;
+  }
+  .app-shell__backdrop {
+    background: Canvas;
+    border-inline-start: 2px solid ButtonText;
+  }
+}

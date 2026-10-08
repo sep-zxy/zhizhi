@@ -1,0 +1,961 @@
+/* ==========================================================================
+   Landing page styles. Based on v6 template data-page="landing".
+   ========================================================================== */
+
+.landing {
+  max-width: var(--mw-wide);
+  margin: 0 auto;
+}
+
+/* ---- Hero section — newspaper masthead ---- */
+.hero {
+  position: relative;
+  padding: clamp(78px, 8vw, 138px) clamp(24px, 5vw, 56px) clamp(56px, 7vw, 104px);
+  /* Classic double-rule masthead band across the top of the front page. The
+     deck below it is closed by a second hairline (::after) so the nameplate
+     reads as a framed broadsheet header. */
+  border-top: 4px double var(--hair-strong);
+  overflow: hidden;
+  background:
+    radial-gradient(1200px 320px at 20% -10%, rgba(var(--accent-rgb), 0.07), transparent 60%),
+    linear-gradient(180deg, var(--elevated), transparent 42%),
+    var(--paper);
+}
+
+/* Nameplate folio rule. Localized folio text is rendered in the DOM; this
+   pseudo-element only draws the masthead hairline so CSS never owns copy. */
+.hero::before {
+  content: "";
+  position: absolute;
+  top: var(--sp-4);
+  left: clamp(20px, 4vw, 64px);
+  right: clamp(20px, 4vw, 64px);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--hair);
+  pointer-events: none;
+}
+
+.hero-grid {
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+  gap: var(--sp-16);
+  max-width: var(--mw-page);
+  margin: 0 auto;
+  align-items: center;
+}
+
+/* Hero eyebrow — masthead kicker on a folio rule (anchored onto the .eyebrow
+   the page renders in the hero column). */
+.hero .eyebrow {
+  display: inline-block;
+  margin-bottom: var(--sp-4);
+  padding-top: var(--sp-2);
+  border-top: 2px solid var(--folio-line);
+  min-width: 220px;
+  color: var(--muted-2);
+}
+
+.hero__title {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: var(--bolder-thin, 260);
+  font-size: clamp(2.35rem, 3.8vw + 1rem, 5.8rem);
+  line-height: var(--lh-display);
+  letter-spacing: var(--ls-display);
+  margin: 0;
+  font-variation-settings: "opsz" 72;
+  color: var(--ink-blackletter);
+}
+
+.hero__title em {
+  font-weight: var(--bolder-bold, 760);
+  color: var(--accent-ink);
+  font-style: normal;
+  background-image: linear-gradient(
+    transparent 72%,
+    rgba(var(--accent-rgb), 0.22) 72%,
+    rgba(var(--accent-rgb), 0.22) 92%,
+    transparent 92%
+  );
+  padding: 0 0.08em;
+}
+
+/* Bilingual standfirst — italic serif tagline under the masthead. */
+.hero .en {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 400;
+  font-size: clamp(15px, 1.3vw + 6px, 22px);
+  color: var(--muted);
+  margin-top: var(--sp-3);
+}
+
+/* Lead paragraph — the front-page deck. */
+.hero .lead {
+  font-size: clamp(15.5px, 1vw + 10px, 18px);
+  line-height: 1.72;
+  max-width: 56ch;
+  margin-top: var(--sp-6);
+  color: var(--ink-2, var(--ink));
+}
+
+/* Drop cap on the lead — modern initial-letter with a float fallback for
+   Firefox (mirrors the Stage B .first-letter-drop helper, scoped here so the
+   hero lead opts in without a TSX class change). */
+.hero .lead::first-letter {
+  -webkit-initial-letter: 3 2;
+  initial-letter: 3 2;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-style: normal;
+  color: var(--ink-blackletter);
+  margin-right: 0.08em;
+  font-synthesis: none;
+}
+
+/* Joint check: Safari supports only -webkit-initial-letter, so testing the
+   unprefixed form alone would fire this fallback AND keep the webkit sunk cap,
+   double-rendering. Only Firefox (neither prefix) should fall through. */
+@supports not ((initial-letter: 3) or (-webkit-initial-letter: 3)) {
+  .hero .lead::first-letter {
+    -webkit-initial-letter: normal;
+    initial-letter: normal;
+    float: left;
+    font-size: 3.4em;
+    line-height: 0.85;
+    padding: 2px 0.09em 0 0;
+    margin-top: 0.02em;
+  }
+}
+
+/* ---- CTA buttons ---- */
+.hero-ctas {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: var(--sp-8);
+}
+
+.hero-ctas .btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 44px;
+  padding: 0 var(--sp-6);
+  border-radius: var(--r-md);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: none;
+  background: var(--ink-blackletter);
+  color: var(--on-accent);
+  cursor: pointer;
+  transition:
+    transform 0.22s var(--ease-expo),
+    box-shadow 0.22s var(--ease-expo);
+  box-shadow:
+    0 1px 0 rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 22px -14px rgba(28, 27, 24, 0.55);
+}
+
+.hero-ctas .btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    0 1px 0 rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 16px 36px -18px rgba(28, 27, 24, 0.6);
+}
+
+.hero-ctas .btn-primary:active {
+  transform: translateY(0);
+  transition-duration: 0s;
+}
+
+.hero-ctas__learn {
+  height: 44px;
+  padding: 0 var(--sp-5);
+  border-radius: var(--r-md);
+  background: var(--elevated);
+}
+
+
+
+.hero-learn-status:empty {
+  display: none;
+}
+
+.hero-learn-status {
+  margin-top: var(--sp-5);
+  max-width: min(640px, 100%);
+}
+
+/* Front-page folio crumb closing the hero column (decorative; .folio-line base
+   from bolder.css carries the hairline + mono caps). */
+.hero__folio {
+  margin: var(--sp-8) 0 0;
+}
+
+.hero-learn-status .learn-banner {
+  margin: 0;
+  max-width: none;
+  align-items: flex-start;
+  padding: 12px var(--sp-4);
+  border-radius: var(--r-lg);
+}
+
+/* ---- Demo card ---- */
+.hero-demo {
+  background: var(--elevated);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-xl);
+  box-shadow: var(--sh-lg);
+  overflow: hidden;
+}
+
+.hero-demo__tabs {
+  display: flex;
+  border-bottom: 1px solid var(--hair);
+}
+
+.hero-demo__tab {
+  padding: 10px var(--sp-5);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color var(--dur-fast);
+}
+
+.hero-demo__tab--active {
+  color: var(--accent-ink);
+  border-bottom-color: var(--accent);
+}
+
+.hero-demo__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.hero-demo__source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px var(--sp-5);
+  border-bottom: 1px solid var(--hair);
+  background: var(--subtle);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.hero-demo__source--live {
+  color: var(--success);
+}
+
+.hero-demo__content {
+  padding: var(--sp-5);
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.hero-demo__artifact-empty {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px dashed var(--hair);
+  border-radius: var(--r-md);
+  background: var(--subtle);
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.hero-demo__artifact-empty strong {
+  color: var(--ink);
+}
+
+/* ---- Lesson accordion (collapsible sections in hero card) ---- */
+.hero-demo__accordion {
+  border-top: 1px solid var(--hair);
+  margin-top: var(--sp-2);
+}
+
+.hero-demo__accordion + .hero-demo__accordion {
+  margin-top: 0;
+}
+
+.hero-demo__accordion-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--ink-strong);
+  user-select: none;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+.hero-demo__accordion-summary::-webkit-details-marker {
+  display: none;
+}
+
+.hero-demo__accordion-summary::marker {
+  content: "";
+}
+
+.hero-demo__accordion-summary:hover {
+  color: var(--accent-ink);
+}
+
+.hero-demo__accordion-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.hero-demo__accordion-chevron {
+  flex-shrink: 0;
+  font-size: 16px;
+  color: var(--muted);
+  transition: transform var(--dur-base) var(--ease-out-quart);
+  display: inline-block;
+}
+
+.hero-demo__accordion[open] > .hero-demo__accordion-summary .hero-demo__accordion-chevron {
+  transform: rotate(90deg);
+}
+
+.hero-demo__accordion-body {
+  padding: 0 0 var(--sp-3) 0;
+}
+
+/* ---- Lesson link at bottom of hero card ---- */
+.hero-demo__lesson-link {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--hair);
+  text-align: center;
+}
+
+.hero-demo__lesson-link a {
+  font-family: var(--font-serif);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+.hero-demo__lesson-link a:hover {
+  color: var(--accent);
+}
+
+/* ---- Hero demo: raw diff preformatted text ---- */
+.hero-demo__pre {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  margin: 0;
+}
+
+/* ---- Hero demo: aha lesson paragraph spacing ---- */
+.hero-demo__line {
+  margin: var(--sp-1) 0;
+}
+
+/* ---- Before/after column: lesson paragraph (post-diff render) ---- */
+.ba-col__line {
+  margin: var(--sp-1) 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+}
+
+/* ---- Editorial sections (anchored onto the .section markup the page renders;
+   .landing scope lifts specificity above components.css base rules) ---- */
+.landing .section {
+  padding: var(--sp-16) clamp(20px, 4vw, 64px);
+  max-width: var(--mw-page);
+  margin: 0 auto;
+}
+
+/* Section eyebrow — mono kicker sitting on a hairline column rule, echoing a
+   newspaper department label above the headline. */
+.landing .section > .eyebrow {
+  display: inline-block;
+  margin-bottom: var(--sp-3);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--folio-line);
+  min-width: 200px;
+  color: var(--muted-2);
+}
+
+.landing .section h2 {
+  font-family: var(--font-serif);
+  font-size: var(--fs-h2);
+  line-height: var(--lh-h2);
+  font-weight: 500;
+  letter-spacing: var(--ls-h2);
+  color: var(--ink-blackletter);
+  margin: 0 0 var(--sp-2);
+  text-wrap: balance;
+}
+
+.landing .section > .sub {
+  color: var(--muted);
+  font-size: 15px;
+  max-width: var(--mw-prose);
+  margin-bottom: var(--sp-8);
+  line-height: 1.68;
+}
+
+/* ---- Feature cards — four evidence cards in a broadsheet row ---- */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--sp-4);
+}
+
+.feature-card {
+  position: relative;
+  isolation: isolate;
+  min-height: 190px;
+  padding: var(--sp-6);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: linear-gradient(180deg, var(--elevated) 0%, var(--subtle) 140%);
+  box-shadow: var(--sh-sm);
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.feature-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 18px;
+  bottom: 18px;
+  width: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transform: scaleY(0.25);
+  transform-origin: top center;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+  pointer-events: none;
+  border-radius: 2px;
+  z-index: var(--z-base);
+}
+
+.feature-card:hover::before,
+.feature-card:focus-within::before {
+  opacity: 1;
+  transform: scaleY(1);
+}
+
+.feature-card:hover {
+  border-color: var(--accent-hair);
+  transform: translateY(-1px);
+}
+
+.feature-card__marker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  margin-bottom: var(--sp-8);
+}
+
+.feature-card h3 {
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 520;
+  line-height: 1.18;
+  margin: 0 0 var(--sp-3);
+}
+
+.feature-card p {
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.62;
+  margin: 0;
+}
+
+/* ---- Pipeline steps — five framed columns reading like a printed broadsheet
+   strip (anchored onto the .steps > .st markup the page renders). ---- */
+.landing .steps {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--elevated);
+}
+
+.landing .steps .st {
+  padding: var(--sp-6);
+  border-right: 1px solid var(--hair);
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.landing .steps .st:last-child {
+  border-right: none;
+}
+
+.landing .steps .st:hover {
+  background: var(--accent-softest);
+}
+
+/* Step number — small-caps mono index, the column ordinal. */
+.landing .steps .st .n {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  margin-bottom: var(--sp-3);
+}
+
+.landing .steps .st h3 {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  margin: 0 0 var(--sp-2);
+}
+
+.landing .steps .st p {
+  font-size: 13px;
+  color: var(--muted-2, var(--muted));
+  line-height: 1.6;
+  margin: 0;
+}
+
+/* ---- Before/After ---- */
+.ba-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-6);
+  margin-top: var(--sp-6);
+}
+
+.ba-col {
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.ba-col__header {
+  padding: var(--sp-3) var(--sp-4);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--hair);
+  background: var(--subtle);
+}
+
+.ba-col__body {
+  padding: var(--sp-4);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.ba-col__body pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  margin: 0;
+}
+
+/* ---- Diff collapse ---- */
+.ba-diff-wrap {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  transition: max-height 0.3s ease;
+}
+
+.ba-diff-wrap pre {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ba-diff-fade {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 64px;
+  background: linear-gradient(to bottom, transparent, var(--subtle, #f5f0ea));
+  pointer-events: none;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 6px;
+}
+
+.ba-diff-line-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--elevated);
+  padding: 2px 10px;
+  border-radius: 99px;
+  border: 1px solid var(--hair);
+  pointer-events: none;
+}
+
+.ba-diff-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 0;
+  border: none;
+  border-top: 1px solid var(--hair);
+  background: var(--subtle, #f5f0ea);
+  color: var(--accent-ink, #9b4420);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ba-diff-toggle:hover {
+  background: var(--accent-softest, #f8e9df);
+  background: color-mix(in srgb, var(--accent, #8b6914) 6%, var(--subtle, #f5f0ea));
+}
+
+.ba-diff-toggle:focus-visible {
+  outline: 2px solid var(--accent, #8b6914);
+  outline-offset: -2px;
+}
+
+.ba-diff-toggle .ba-diff-arrow {
+  font-size: 10px;
+  transition: transform 0.3s;
+}
+
+.ba-diff-toggle[aria-expanded="true"] .ba-diff-arrow {
+  transform: rotate(180deg);
+}
+
+/* ---- Benchmark grid ---- */
+.demo-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px var(--sp-2);
+  border: 1px dashed var(--warning-hair);
+  border-radius: var(--r-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  line-height: 1.4;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.demo-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+  margin: 0 0 18px;
+  padding: 10px 14px;
+  border: 1px dashed var(--warning-hair);
+  border-radius: var(--r-md);
+  background: var(--warning-soft-bg);
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.demo-banner strong {
+  color: var(--ink-2, var(--ink));
+  font-weight: 700;
+}
+
+/* ---- Benchmark / trust KPIs — a four-column figures table (anchored onto the
+   .kpi-grid > .kpi.benchmark-card markup the page renders). ---- */
+.landing .section .kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--sp-4);
+}
+
+.benchmark-card {
+  background: var(--elevated);
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-md);
+  padding: var(--sp-6);
+  text-align: left;
+  overflow: visible;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.benchmark-card:hover {
+  border-color: var(--accent-tint);
+}
+
+/* Label row — mono caption flexing the source stamp to the right. */
+.benchmark-card .lb {
+  justify-content: space-between;
+  min-height: 30px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* Headline figure — large serif italic numeral, the table's lead value. */
+.benchmark-card .vl {
+  font-family: var(--font-serif);
+  font-size: 34px;
+  font-weight: 400;
+  font-style: italic;
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum", "lnum";
+  letter-spacing: -0.005em;
+  color: var(--ink-strong);
+  line-height: 1;
+  margin-top: var(--sp-3);
+}
+
+.benchmark-card__delta {
+  color: var(--muted-strong, var(--muted));
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.benchmark-card__delta .up {
+  color: var(--success);
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 1024px) {
+  .hero-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .landing .feature-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .landing .steps {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .landing .steps .st:nth-child(even) {
+    border-right: none;
+  }
+
+  .landing .steps .st:nth-child(n+3) {
+    border-top: 1px solid var(--hair);
+  }
+}
+
+@media (max-width: 900px) {
+  .landing .section .kpi-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .hero {
+    padding: 60px var(--sp-5) 44px;
+  }
+
+  @supports not ((initial-letter: 3) or (-webkit-initial-letter: 3)) {
+    .hero .lead::first-letter {
+      font-size: 3em;
+      padding-right: var(--sp-2);
+    }
+  }
+
+  :lang(zh) .hero .lead::first-letter,
+  :lang(zh-CN) .hero .lead::first-letter {
+    -webkit-initial-letter: normal;
+    initial-letter: normal;
+    float: none;
+    font-size: inherit;
+    line-height: inherit;
+    padding: 0;
+    margin: 0;
+    color: inherit;
+    font-weight: inherit;
+  }
+
+  .landing .steps {
+    grid-template-columns: 1fr;
+  }
+
+  .landing .feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .landing .section .kpi-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .landing .steps .st {
+    border-right: none;
+    border-top: none;
+    border-bottom: 1px solid var(--hair);
+  }
+
+  .landing .steps .st:last-child {
+    border-bottom: none;
+  }
+
+  .ba-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Forced colors ---- */
+@media (forced-colors: active) {
+  .hero-ctas .btn-primary {
+    border: 2px solid Highlight;
+    background: Canvas;
+    color: Highlight;
+  }
+
+  .landing .steps .st {
+    border-color: CanvasText;
+  }
+
+  .ba-col {
+    border-color: CanvasText;
+  }
+
+  .feature-card,
+  .demo-banner,
+  .demo-tag {
+    border-color: CanvasText;
+  }
+
+  .benchmark-card {
+    border-color: CanvasText;
+  }
+
+  .hero-demo__tab--active {
+    border-bottom-color: Highlight;
+  }
+
+  .hero-demo__accordion {
+    border-color: CanvasText;
+  }
+
+  .hero-demo__accordion-summary,
+  .hero-demo__accordion-chevron,
+  .hero-demo__lesson-link a {
+    color: LinkText;
+  }
+
+  .ba-diff-fade {
+    background: none;
+    border-top: 2px solid CanvasText;
+    height: auto;
+    padding: 4px 0;
+  }
+
+  .ba-diff-toggle {
+    border-color: CanvasText;
+    color: LinkText;
+    background: Canvas;
+  }
+
+  .ba-diff-line-count {
+    border-color: CanvasText;
+    color: CanvasText;
+    background: Canvas;
+  }
+}
+
+/* ---- Print ---- */
+@media print {
+  .hero-ctas,
+  .hero-demo__tabs {
+    display: none;
+  }
+
+  .hero {
+    padding: var(--sp-5) 0;
+    border-top: 1px solid #000;
+  }
+
+  .hero-grid,
+  .landing .feature-grid,
+  .landing .steps,
+  .ba-grid,
+  .landing .section .kpi-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .benchmark-card,
+  .feature-card,
+  .landing .steps .st,
+  .ba-col {
+    break-inside: avoid;
+  }
+
+  .demo-banner,
+  .demo-tag {
+    background: transparent;
+    border: 1px solid #999;
+    color: #000;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .ba-diff-wrap {
+    max-height: none !important;
+    overflow: visible;
+  }
+
+  .ba-diff-fade,
+  .ba-diff-toggle {
+    display: none;
+  }
+}
+
+/* ---- Reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  .hero-ctas .btn-primary,
+  .feature-card,
+  .feature-card::before,
+  .landing .steps .st,
+  .hero-demo__accordion-summary,
+  .hero-demo__accordion-chevron,
+  .hero-demo__lesson-link a {
+    transition: none;
+    transform: none !important;
+  }
+
+  .ba-diff-wrap {
+    transition: none;
+  }
+
+  .ba-diff-toggle .ba-diff-arrow {
+    transition: none;
+  }
+}

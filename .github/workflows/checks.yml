@@ -1,0 +1,54 @@
+name: Static Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.33.0'
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: viewer/pnpm-lock.yaml
+      - name: Check JavaScript and TypeScript
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm --dir viewer install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败' }
+          pnpm --dir viewer typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript 校验失败' }
+          node --check desktop/main.mjs
+          if ($LASTEXITCODE -ne 0) { throw '桌面入口语法校验失败' }
+          node --check scripts/require-github-actions.mjs
+          if ($LASTEXITCODE -ne 0) { throw '构建限制脚本语法校验失败' }
+      - name: Check Python syntax
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $syntaxCode = @'
+          import ast
+          from pathlib import Path
+          files = [file for folder in ('src', 'tests', 'scripts', 'desktop') for file in Path(folder).rglob('*.py') if not any(part in ('node_modules', 'sidecar', '__pycache__', '.pyinstaller') for part in file.parts)]
+          for file in files:
+              ast.parse(file.read_text(encoding='utf-8-sig'), filename=str(file))
+          print(f'Python syntax checked: {len(files)} files')
+          '@
+          uv run --no-project --python 3.13 python -c $syntaxCode
+          if ($LASTEXITCODE -ne 0) { throw 'Python 语法校验失败' }

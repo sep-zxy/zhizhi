@@ -1,0 +1,80 @@
+# AHADIFF:GENERATED
+name: AhaDiff Verify
+
+# Boundaries:
+# - Keep provider credentials in environment variables.
+# - Do not commit `.ahadiff/audit.private.jsonl`.
+# - Treat `.ahadiff/` as local state.
+# - Prefer verified claims with file-line evidence.
+# - Do not upload `.ahadiff/` artifacts to external services without explicit user consent.
+
+"on":
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ahadiff-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    env:
+      PYTHON_VERSION: "3.12"
+      SQLITE_AUTOCONF_VERSION: "3510300"
+      SQLITE_DOWNLOAD_YEAR: "2026"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python with current Homebrew SQLite
+        if: runner.os == 'macOS'
+        run: |
+          brew install python@${PYTHON_VERSION}
+          echo "$(brew --prefix python@${PYTHON_VERSION})/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v5
+        if: runner.os != 'macOS'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install SQLite runtime on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sqlite_url="https://www.sqlite.org/${SQLITE_DOWNLOAD_YEAR}/sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/sqlite.tar.gz" "$sqlite_url" || \
+            curl -fsSLo "$RUNNER_TEMP/sqlite.tar.gz" \
+              "https://www.sqlite.org/2025/sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/sqlite.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}"
+          ./configure --prefix="$RUNNER_TEMP/sqlite" --disable-static --fts5
+          make -j"$(nproc)"
+          make install
+          sqlite_lib="$RUNNER_TEMP/sqlite/lib/libsqlite3.so"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlite/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_PRELOAD=$sqlite_lib${LD_PRELOAD:+:$LD_PRELOAD}" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Verify Python SQLite runtime on Linux
+        if: runner.os == 'Linux'
+        run: python -c "import sqlite3; print(sqlite3.sqlite_version, sqlite3.__file__); c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE t USING fts5(x)'); print('fts5 ok')"
+
+      - name: Validate AhaDiff artifacts
+        if: runner.os != 'Windows'
+        run: uvx --python python3.12 --from ahadiff ahadiff verify --ci
+
+      - name: Validate AhaDiff CLI loads on Windows
+        if: runner.os == 'Windows'
+        run: uvx --python python3.12 --from ahadiff ahadiff --version

@@ -1,0 +1,17 @@
+{
+  "name": "growth-companion-desktop",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "package:win": "node ../scripts/require-github-actions.mjs && electron-builder --win nsis --publish never",
+    "package:mac": "node ../scripts/require-github-actions.mjs && electron-builder --mac dmg --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.0.12"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

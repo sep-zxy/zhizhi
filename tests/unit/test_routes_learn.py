@@ -1,0 +1,1947 @@
+"""Tests for ``ahadiff.serve.routes_learn`` — POST /api/learn route."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+import anyio
+import httpx2 as httpx
+import pytest
+from anyio.to_thread import run_sync as run_sync_in_thread
+from starlette.testclient import TestClient
+
+from ahadiff.contracts.serve_app import LearnEstimateResponse
+from ahadiff.contracts.serve_runtime import TaskInfoResponse, TaskSubmitResponse
+from ahadiff.core import sqlite_util as sqlite_util_module
+from ahadiff.core.budget import CaptureRecommendation
+from ahadiff.core.orchestrator import LearnRequest, LearnResult
+from ahadiff.core.task_runner import TaskRunner
+from ahadiff.serve import ServeState, create_app, routes_learn
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _client(
+    state_dir: Path,
+    *,
+    token: str = "test-token",
+    locale: Literal["en", "zh-CN"] = "en",
+) -> TestClient:
+    app = create_app(ServeState(state_dir=state_dir, token=token, locale=locale))
+    return TestClient(app, base_url="http://localhost:8765")
+
+
+def _post_learn(
+    client: TestClient,
+    body: object | None = None,
+    *,
+    token: str = "test-token",
+    content_type: str = "application/json",
+) -> httpx.Response:
+    """Helper: POST /api/learn with correct auth + origin headers."""
+    headers = {
+        "X-AhaDiff-Token": token,
+        "origin": "http://localhost:8765",
+    }
+    if body is not None:
+        return client.post("/api/learn", json=body, headers=headers)
+    # Send raw bytes for malformed-JSON tests
+    return client.post(
+        "/api/learn",
+        content=b"not json",
+        headers={**headers, "content-type": content_type},
+    )
+
+
+def _post_learn_estimate(
+    client: TestClient,
+    body: object | None = None,
+    *,
+    token: str = "test-token",
+) -> httpx.Response:
+    headers = {
+        "X-AhaDiff-Token": token,
+        "origin": "http://localhost:8765",
+    }
+    return client.post("/api/learn/estimate", json={} if body is None else body, headers=headers)
+
+
+def _json_object(response: httpx.Response) -> dict[str, object]:
+    payload = response.json()
+    assert isinstance(payload, dict)
+    return cast("dict[str, object]", payload)
+
+
+def _task_id_from(response: httpx.Response) -> str:
+    payload = TaskSubmitResponse.model_validate(_json_object(response))
+    task_id = payload.task_id
+    assert isinstance(task_id, str)
+    return task_id
+
+
+def _capture_recommendation(
+    *,
+    mode: Literal["auto", "manual"] = "auto",
+    context_window: int = 16_000,
+    max_input_tokens: int = 12_000,
+    max_output_tokens: int = 4_000,
+    source: str = "live",
+) -> CaptureRecommendation:
+    return CaptureRecommendation(
+        mode=mode,
+        max_files=8,
+        hard_limit=400,
+        max_patch_bytes=100_000,
+        runtime_max_patch_bytes=50 * 1024 * 1024,
+        payload_byte_budget=24_000,
+        context_window=context_window,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        diff_token_budget=8_000,
+        safety_reserve=2_000,
+        output_reserve=max_output_tokens,
+        system_prompt_tokens=1_220,
+        fits_minimums=True,
+        model_name="gpt-4o",
+        source=source,
+        cjk_ratio=0.0,
+        cjk_factor=1.0,
+        warnings=[],
+    )
+
+
+def _wait_for_task(
+    client: TestClient,
+    task_id: str,
+    *,
+    expected_status: str,
+    timeout_seconds: float = 2.0,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        resp = client.get(f"/api/tasks/{task_id}")
+        assert resp.status_code == 200
+        payload = _json_object(resp)
+        TaskInfoResponse.model_validate(payload)
+        last_payload = payload
+        if payload["status"] == expected_status:
+            return payload
+        time.sleep(0.02)
+    raise AssertionError(
+        f"task {task_id} did not reach {expected_status!r}; last payload={last_payload!r}"
+    )
+
+
+def _stub_completed_learn(monkeypatch: pytest.MonkeyPatch, run_id: str) -> None:
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id=run_id, status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_requires_token(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = client.post("/api/learn", json={})
+    assert resp.status_code == 403
+
+
+def test_post_learn_wrong_token(tmp_path: Path) -> None:
+    client = _client(tmp_path, token="correct")
+    resp = client.post(
+        "/api/learn",
+        json={},
+        headers={
+            "X-AhaDiff-Token": "wrong",
+            "origin": "http://localhost:8765",
+        },
+    )
+    assert resp.status_code == 401
+
+
+def test_post_learn_estimate_requires_token(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+    resp = client.post("/api/learn/estimate", json={})
+    assert resp.status_code == 403
+
+
+def test_post_learn_estimate_wrong_token(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff", token="correct")
+    resp = _post_learn_estimate(client, token="wrong")
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Estimate
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_estimate_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text('[capture]\nmode = "manual"\n', encoding="utf-8")
+    client = _client(state_dir)
+    patch_text = "diff --git a/a.py b/a.py\n+print('hello')\n"
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text=patch_text,
+            metadata={"selected_files": ["a.py"]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    def fake_capture_recommendation_for_estimate(**_: object) -> CaptureRecommendation:
+        return _capture_recommendation(
+            mode="manual",
+            context_window=16_000,
+            max_input_tokens=12_000,
+            max_output_tokens=4_000,
+        )
+
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+    monkeypatch.setattr(
+        routes_learn,
+        "_capture_recommendation_for_estimate",
+        fake_capture_recommendation_for_estimate,
+    )
+
+    resp = _post_learn_estimate(client)
+
+    assert resp.status_code == 200
+    payload = LearnEstimateResponse.model_validate(_json_object(resp))
+    assert payload.patch_bytes == len(patch_text.encode("utf-8"))
+    assert payload.file_count == 1
+    assert payload.total_lines == 2
+    assert payload.estimated_tokens == 10
+    assert payload.provider_context_window == 16_000
+    assert payload.provider_max_output == 4_000
+    assert payload.risk_level == "ok"
+    assert payload.warnings == []
+    assert payload.preview_patch == patch_text
+    assert payload.preview_truncated is False
+    assert payload.source_kind == "git_ref"
+
+
+def test_post_learn_estimate_passes_changed_paths_to_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_capture_patch(**kwargs: object) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="diff --git a/src/app.py b/src/app.py\n+print('hello')\n",
+            metadata={"selected_files": ["src/app.py"]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    def fake_capture_recommendation_for_estimate(**_: object) -> CaptureRecommendation:
+        return _capture_recommendation(
+            mode="manual",
+            context_window=16_000,
+            max_input_tokens=12_000,
+            max_output_tokens=4_000,
+        )
+
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+    monkeypatch.setattr(
+        routes_learn,
+        "_capture_recommendation_for_estimate",
+        fake_capture_recommendation_for_estimate,
+    )
+
+    resp = _post_learn_estimate(
+        client,
+        body={"changed_paths": ["src/app.py"], "unstaged": True},
+    )
+
+    assert resp.status_code == 200
+    assert captured_kwargs["changed_paths"] == ("src/app.py",)
+
+
+def test_post_learn_estimate_accepts_large_inline_patch_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+    patch_text = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n" + (
+        "+line = 1\n" * 700
+    )
+    assert len(patch_text) > 4096
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_capture_patch(**kwargs: object) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text=patch_text,
+            metadata={"selected_files": ["app.py"]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+
+    resp = _post_learn_estimate(client, body={"patch": patch_text})
+
+    assert resp.status_code == 200
+    assert captured_kwargs["patch_text"] == patch_text
+    assert captured_kwargs["patch"] is None
+
+
+def test_compare_files_estimate_returns_only_sanitized_preview(tmp_path: Path) -> None:
+    secret = "sk-" + "aB2cD3eF4gH5iJ6kL7mN8pQ9rS0tU1vW2xY3zA4b"
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    with _client(state_dir) as client:
+        response = _post_learn_estimate(
+            client,
+            body={
+                "compare_files": [
+                    {"name": "settings.py", "content": 'api_key = "old"\n'},
+                    {"name": "settings.py", "content": f'api_key = "{secret}"\n'},
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert secret not in response.text
+    payload = LearnEstimateResponse.model_validate(response.json())
+    assert payload.source_kind == "file_compare"
+    assert payload.file_count == 1
+    assert "REDACTED" in payload.preview_patch
+    assert "+++ b/after/settings.py" in payload.preview_patch
+    assert not (state_dir / "runs").exists()
+    assert not (tmp_path / "before").exists()
+    assert not (tmp_path / "after").exists()
+
+
+def test_compare_files_preview_matches_dry_run_capture(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    body: dict[str, object] = {
+        "compare_files": [
+            {"name": "例子.py", "content": "def compute():\n    return 1\n"},
+            {"name": "例子.py", "content": "def compute():\n    return 2\n"},
+        ],
+        "dry_run": True,
+        "use_graphify": False,
+    }
+    with _client(state_dir) as client:
+        preview = _post_learn_estimate(client, body=body)
+        assert preview.status_code == 200
+        submitted = _post_learn(client, body=body)
+        assert submitted.status_code == 202
+        task = _wait_for_task(client, _task_id_from(submitted), expected_status="completed")
+    result = cast("dict[str, object]", task["result_summary"])
+    assert result["status"] == "dry_run"
+    run_path = state_dir / "runs" / str(result["run_id"])
+    assert (run_path / "patch.diff").read_text(encoding="utf-8") == preview.json()["preview_patch"]
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["source_kind"] == "file_compare"
+    assert metadata["source_detail"]["type"] == "compare_files"
+    assert not (tmp_path / ".git").exists()
+
+
+@pytest.mark.parametrize("field", ["source", "id", "cell_type"])
+def test_notebook_decoded_invalid_unicode_returns_400(tmp_path: Path, field: str) -> None:
+    cell = {"cell_type": "code", "id": "example", "source": "value = 2\n"}
+    cell[field] = "PRIVATE_NOTEBOOK_SENTINEL\ud800"
+    files = [
+        {"name": "notes.ipynb", "content": json.dumps({"cells": []})},
+        {"name": "notes.ipynb", "content": json.dumps({"cells": [cell]}, ensure_ascii=True)},
+    ]
+    with _client(tmp_path / ".ahadiff") as client:
+        response = _post_learn_estimate(client, body={"compare_files": files})
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "INPUT_BAD_FIELD"
+    assert "PRIVATE_NOTEBOOK_SENTINEL" not in response.text
+    assert "UnicodeEncodeError" not in response.text
+
+
+@pytest.mark.parametrize("notebook", [False, True])
+def test_unchanged_compare_files_returns_empty_preview_without_creating_a_run(
+    tmp_path: Path,
+    notebook: bool,
+) -> None:
+    before = "相同内容\n"
+    after = "相同内容\n"
+    extension = "txt"
+    if notebook:
+        extension = "ipynb"
+        before = json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "id": "same",
+                        "source": "value = 1\n",
+                        "outputs": [{"text": "old"}],
+                    }
+                ]
+            }
+        )
+        after = json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "id": "same",
+                        "source": "value = 1\n",
+                        "outputs": [{"text": "new"}],
+                    }
+                ]
+            }
+        )
+    body = {
+        "compare_files": [
+            {"name": f"before.{extension}", "content": before},
+            {"name": f"after.{extension}", "content": after},
+        ]
+    }
+    state_dir = tmp_path / ".ahadiff"
+    with _client(state_dir) as client:
+        response = _post_learn_estimate(client, body=body)
+    assert response.status_code == 200
+    payload = LearnEstimateResponse.model_validate(response.json())
+    assert payload.source_kind == "file_compare"
+    assert payload.file_count == 0
+    assert payload.patch_bytes == 0
+    assert payload.preview_patch == ""
+    assert payload.preview_truncated is False
+    assert not (state_dir / "runs").exists()
+
+
+def test_unchanged_workspace_files_return_empty_preview(tmp_path: Path) -> None:
+    for name in ("before.txt", "after.txt"):
+        (tmp_path / name).write_text("same\n", encoding="utf-8")
+    with _client(tmp_path / ".ahadiff") as client:
+        response = _post_learn_estimate(client, body={"compare": ["before.txt", "after.txt"]})
+    assert response.status_code == 200
+    payload = LearnEstimateResponse.model_validate(response.json())
+    assert payload.source_kind == "file_compare"
+    assert payload.file_count == payload.patch_bytes == 0
+    assert payload.preview_patch == ""
+
+
+def test_empty_compare_preview_does_not_allow_an_empty_learn_task(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    body = {
+        "compare_files": [
+            {"name": "a.txt", "content": "same\n"},
+            {"name": "b.txt", "content": "same\n"},
+        ],
+        "dry_run": True,
+        "force_learn": True,
+    }
+    with _client(state_dir) as client:
+        assert _post_learn_estimate(client, body=body).status_code == 200
+        submitted = _post_learn(client, body=body)
+        assert submitted.status_code == 202
+        task = _wait_for_task(client, _task_id_from(submitted), expected_status="failed")
+    assert task["result_summary"] is None
+    assert not (state_dir / "runs").exists()
+
+
+@pytest.mark.parametrize("endpoint", ["/api/learn", "/api/learn/estimate"])
+@pytest.mark.parametrize(
+    "files",
+    [
+        [],
+        [{"name": "a.txt", "content": "one file"}],
+        [{"name": "../private.txt", "content": "a"}, {"name": "b.txt", "content": "b"}],
+        [{"name": "CON", "content": "a"}, {"name": "b.txt", "content": "b"}],
+        [{"name": "a.txt", "content": "binary\x00"}, {"name": "b.txt", "content": "b"}],
+        [{"name": "a.txt", "content": 123}, {"name": "b.txt", "content": "b"}],
+        [{"name": "a.txt", "content": "中" * 90_000}, {"name": "b.txt", "content": "b"}],
+    ],
+)
+def test_compare_files_routes_reject_invalid_input(
+    tmp_path: Path,
+    endpoint: str,
+    files: object,
+) -> None:
+    with _client(tmp_path / ".ahadiff") as client:
+        response = client.post(
+            endpoint,
+            json={"compare_files": files},
+            headers={
+                "X-AhaDiff-Token": "test-token",
+                "origin": "http://localhost:8765",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_value_for_compare_files"
+    assert "input_value" not in response.text
+    assert "private.txt" not in response.text
+
+
+def test_compare_files_json_escape_expansion_still_respects_request_limit(tmp_path: Path) -> None:
+    files = [
+        {"name": "a.txt", "content": "\t" * (256 * 1024)},
+        {"name": "b.txt", "content": "\n" * (256 * 1024)},
+    ]
+    with _client(tmp_path / ".ahadiff") as client:
+        response = _post_learn_estimate(client, body={"compare_files": files})
+    assert response.status_code == 413
+
+
+def test_compare_files_task_uses_same_source_and_redacts_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "UPLOADED_BODY_MUST_NOT_APPEAR_IN_TASK_OR_LOG"
+    files = [
+        {"name": "example.txt", "content": "before\n"},
+        {"name": "example.txt", "content": sentinel},
+    ]
+
+    def fail(request: LearnRequest, **_: object) -> LearnResult:
+        assert request.compare_files is not None
+        assert [file.model_dump() for file in request.compare_files] == files
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr("ahadiff.core.orchestrator.run_learn_pipeline", fail)
+    with _client(tmp_path / ".ahadiff") as client:
+        response = _post_learn(client, body={"compare_files": files})
+        assert response.status_code == 202
+        info = _wait_for_task(client, _task_id_from(response), expected_status="failed")
+    assert sentinel not in json.dumps(info)
+    assert sentinel not in caplog.text
+    assert "selected file contents were redacted" in str(info["error"])
+
+
+def test_patch_preview_is_utf8_bounded_and_marks_truncation() -> None:
+    patch = "--- a/notes.md\n+++ b/notes.md\n" + "+学习\n" * 12_000
+    preview, truncated = routes_learn._bounded_patch_preview(patch)  # pyright: ignore[reportPrivateUsage]
+    assert truncated is True
+    assert len(preview.encode("utf-8")) <= 64 * 1024
+    assert patch.startswith(preview)
+    assert "\ufffd" not in preview
+    assert preview.endswith("\n")
+
+
+def test_post_learn_estimate_captures_under_repo_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+    lock_depth = 0
+
+    class RecordingLock:
+        def __enter__(self) -> None:
+            nonlocal lock_depth
+            lock_depth += 1
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            nonlocal lock_depth
+            del exc_type, exc, tb
+            lock_depth -= 1
+
+    def fake_lock(*_args: object, **_kwargs: object) -> RecordingLock:
+        return RecordingLock()
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        assert lock_depth == 1
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="diff --git a/a.py b/a.py\n+print('hello')\n",
+            metadata={"selected_files": ["a.py"]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    monkeypatch.setattr(routes_learn, "serve_repo_write_lock", fake_lock)
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+
+    response = _post_learn_estimate(client)
+
+    assert response.status_code == 200
+    assert lock_depth == 0
+
+
+def test_post_learn_estimate_uses_threadpool_for_capture_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text('[capture]\nmode = "manual"\n', encoding="utf-8")
+    client = _client(state_dir)
+    calls: list[str] = []
+
+    async def recording_run_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
+        del kwargs
+        calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args)
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="diff --git a/a.py b/a.py\n+print('hello')\n",
+            metadata={"selected_files": ["a.py"]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    monkeypatch.setattr(routes_learn, "run_sync_in_thread", recording_run_sync)
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+
+    response = _post_learn_estimate(client)
+
+    assert response.status_code == 200
+    assert "_capture_estimate_with_lock" in calls
+
+
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        "../outside.py",
+        "/tmp/outside.py",
+        "C:secret.txt",
+        "C:/Users/example/app.py",
+        "C:\\Users\\example\\app.py",
+        "\\\\server\\share\\app.py",
+        "src/\x01app.py",
+        ".git/config",
+    ],
+)
+def test_post_learn_estimate_rejects_unsafe_changed_paths(
+    tmp_path: Path,
+    changed_path: str,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    resp = _post_learn_estimate(
+        client,
+        body={"changed_paths": [changed_path], "unstaged": True},
+    )
+
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert body["error"] == "invalid_value_for_changed_paths"
+
+
+@pytest.mark.parametrize(
+    ("estimated_tokens", "context_window", "file_count", "risk_level"),
+    [
+        (4_000, 10_000, 2, "ok"),
+        (5_001, 10_000, 2, "warn"),
+        (8_001, 10_000, 2, "danger"),
+        (4_000, 10_000, 31, "warn"),
+        (4_000, 10_000, 51, "danger"),
+    ],
+)
+def test_post_learn_estimate_risk_levels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    estimated_tokens: int,
+    context_window: int,
+    file_count: int,
+    risk_level: Literal["ok", "warn", "danger"],
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text('[capture]\nmode = "manual"\n', encoding="utf-8")
+    client = _client(state_dir)
+    patch_text = "x\n"
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text=patch_text,
+            metadata={"selected_files": [f"f{i}.py" for i in range(file_count)]},
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return estimated_tokens
+
+    def fake_capture_recommendation_for_estimate(**_: object) -> CaptureRecommendation:
+        return _capture_recommendation(
+            mode="manual",
+            context_window=context_window,
+            max_input_tokens=max(context_window - 4_000, 0),
+            max_output_tokens=4_000,
+        )
+
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(
+        routes_learn,
+        "estimate_text_tokens",
+        fake_estimate_text_tokens,
+    )
+    monkeypatch.setattr(
+        routes_learn,
+        "_capture_recommendation_for_estimate",
+        fake_capture_recommendation_for_estimate,
+    )
+
+    resp = _post_learn_estimate(client)
+
+    assert resp.status_code == 200
+    payload = LearnEstimateResponse.model_validate(_json_object(resp))
+    assert payload.risk_level == risk_level
+    if risk_level == "ok":
+        assert payload.warnings == []
+    else:
+        assert payload.warnings
+
+
+def test_post_learn_estimate_auto_mode_warns_on_omitted_files_not_file_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="x\n",
+            metadata={
+                "selected_files": [f"f{i}.py" for i in range(100)],
+                "omitted_files": ["omitted.py"],
+            },
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    def fake_capture_recommendation_for_estimate(**_: object) -> CaptureRecommendation:
+        return _capture_recommendation(
+            mode="auto",
+            context_window=10_000,
+            max_input_tokens=6_000,
+            max_output_tokens=4_000,
+        )
+
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+    monkeypatch.setattr(
+        routes_learn,
+        "_capture_recommendation_for_estimate",
+        fake_capture_recommendation_for_estimate,
+    )
+
+    resp = _post_learn_estimate(client)
+
+    assert resp.status_code == 200
+    payload = LearnEstimateResponse.model_validate(_json_object(resp))
+    assert payload.file_count == 100
+    assert payload.omitted_files_count == 1
+    assert payload.risk_level == "warn"
+    assert all("File count" not in warning for warning in payload.warnings)
+
+
+def test_post_learn_estimate_audits_clipped_diff_and_omitted_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+    recommendation = _capture_recommendation(mode="auto")
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_capture_recommendation_for_estimate(**_: object) -> CaptureRecommendation:
+        return recommendation
+
+    def fake_capture_patch(**kwargs: object) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="diff --git a/a.py b/a.py\n+print('hello')\n",
+            metadata={
+                "selected_files": ["a.py"],
+                "omitted_files": ["large.py", "generated.py"],
+                "degraded_flags": {"diff_clipped": True},
+            },
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    monkeypatch.setattr(
+        routes_learn,
+        "_capture_recommendation_for_estimate",
+        fake_capture_recommendation_for_estimate,
+    )
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+    resp = _post_learn_estimate(client)
+
+    assert resp.status_code == 200
+    payload = LearnEstimateResponse.model_validate(_json_object(resp))
+    assert payload.diff_clipped is True
+    assert payload.omitted_files_count == 2
+    assert payload.risk_level == "warn"
+    assert "Capture omitted 2 files" in payload.warnings
+    assert "Diff was clipped by effective capture limits" in payload.warnings
+    assert captured_kwargs["max_files"] == recommendation.max_files
+    assert captured_kwargs["hard_limit"] == recommendation.hard_limit
+    assert captured_kwargs["max_patch_bytes"] == recommendation.max_patch_bytes
+
+
+def test_post_learn_estimate_uses_one_config_snapshot_for_capture_and_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    def snapshot(max_input_tokens: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            values={
+                "capture": {"mode": "auto", "max_files": 30, "hard_limit": 3000},
+                "llm": {
+                    "generate_model": "gpt-4o",
+                    "output_token_budget": 50_000,
+                    "claim_extraction_output_cap": 16_000,
+                    "lesson_full_output_cap": 24_000,
+                    "lesson_hint_output_cap": 3_000,
+                    "lesson_compact_output_cap": 2_500,
+                    "quiz_generation_output_cap": 18_000,
+                    "misconception_cards_output_cap": 6_000,
+                },
+                "providers": {
+                    "local": {
+                        "provider_class": "openai",
+                        "model_name": "gpt-4o",
+                        "base_url": "http://127.0.0.1:8318",
+                        "api_key_env": "AHADIFF_PROVIDER_API_KEY",
+                        "probed_max_input_tokens": max_input_tokens,
+                    }
+                },
+                "privacy_mode": "strict_local",
+                "lang": "en",
+            },
+            resolved={},
+        )
+
+    snapshots = [snapshot(120_000), snapshot(4_096)]
+    load_calls: list[Path] = []
+
+    def fake_load_workspace_config(
+        root: Path,
+        cli_overrides: dict[str, object] | None = None,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        del cli_overrides
+        load_calls.append(root)
+        return snapshots[min(len(load_calls) - 1, len(snapshots) - 1)]
+
+    def fake_capture_patch(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_source=SimpleNamespace(source_kind="git_ref"),
+            persisted_patch_text="diff --git a/a.py b/a.py\n+print('hello')\n",
+            metadata={"selected_files": ["a.py"]},
+        )
+
+    def fake_load_workspace_security_config(_root: Path, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            local_hosts=("127.0.0.1",),
+            strict_local_hosts=("127.0.0.1",),
+        )
+
+    def fake_estimate_text_tokens(_text: str, _strategy: object) -> int:
+        return 10
+
+    monkeypatch.setattr(routes_learn, "load_workspace_config", fake_load_workspace_config)
+    monkeypatch.setattr(
+        routes_learn,
+        "load_workspace_security_config",
+        fake_load_workspace_security_config,
+    )
+    monkeypatch.setattr(routes_learn, "capture_patch", fake_capture_patch)
+    monkeypatch.setattr(routes_learn, "estimate_text_tokens", fake_estimate_text_tokens)
+
+    resp = _post_learn_estimate(client)
+
+    assert resp.status_code == 200
+    payload = LearnEstimateResponse.model_validate(_json_object(resp))
+    assert payload.effective_capture_limits is not None
+    assert payload.provider_context_window == payload.effective_capture_limits.context_window
+    assert len(load_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_invalid_json(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = _post_learn(client, body=None)
+    assert resp.status_code == 400
+    assert _json_object(resp)["error_code"] == "INPUT_INVALID_JSON"
+    assert _json_object(resp)["error"] == "invalid_json"
+
+
+def test_post_learn_body_must_be_object(tmp_path: Path) -> None:
+    """Sending a JSON array instead of an object should get 400."""
+    client = _client(tmp_path)
+    resp = client.post(
+        "/api/learn",
+        json=[1, 2, 3],
+        headers={
+            "X-AhaDiff-Token": "test-token",
+            "origin": "http://localhost:8765",
+        },
+    )
+    assert resp.status_code == 400
+    assert _json_object(resp)["error_code"] == "INPUT_BAD_FIELD"
+    assert _json_object(resp)["error"] == "body_must_be_object"
+
+
+# ---------------------------------------------------------------------------
+# Happy path — 202 accepted
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_returns_202_with_task_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_completed_learn(monkeypatch, "run-accepted")
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+        data = _json_object(resp)
+        assert "task_id" in data
+        assert isinstance(data["task_id"], str)
+        assert len(data["task_id"]) > 0
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    assert info["status"] == "completed"
+
+
+def test_post_learn_with_valid_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_completed_learn(monkeypatch, "run-valid-fields")
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(
+            client,
+            body={
+                "dry_run": True,
+                "force_learn": True,
+                "lang": "zh-CN",
+            },
+        )
+        assert resp.status_code == 202
+        assert "task_id" in _json_object(resp)
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    assert info["status"] == "completed"
+
+
+def test_post_learn_accepts_inline_patch_text_from_webui(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        '[capture]\nmode = "manual"\nmax_patch_bytes = 10000000\n',
+        encoding="utf-8",
+    )
+    patch_text = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old = 1\n"
+        "+new = 2\n"
+    )
+
+    with _client(state_dir) as client:
+        resp = _post_learn(
+            client,
+            body={"patch": patch_text, "dry_run": True, "force_learn": True},
+        )
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    summary = cast("dict[str, object]", info["result_summary"])
+    run_id = summary["run_id"]
+    assert isinstance(run_id, str)
+    run_path = state_dir / "runs" / run_id
+    metadata = cast(
+        "dict[str, object]",
+        json.loads((run_path / "metadata.json").read_text(encoding="utf-8")),
+    )
+    assert metadata["source_kind"] == "patch_stdin"
+    source_detail = cast("dict[str, object]", metadata["source_detail"])
+    assert source_detail["type"] == "patch_text"
+    assert (run_path / "patch.diff").read_text(encoding="utf-8") == patch_text
+
+
+def test_post_learn_accepts_large_inline_patch_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ahadiff.core.orchestrator as orchestrator_module
+
+    patch_text = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n" + (
+        "+line = 1\n" * 700
+    )
+    assert len(patch_text) > 4096
+    constructed_kwargs: dict[str, Any] = {}
+
+    def recording_learn_request(**kwargs: Any) -> LearnRequest:
+        constructed_kwargs.update(kwargs)
+        assert kwargs["patch_text"] == patch_text
+        assert "patch" not in kwargs
+        return LearnRequest(**kwargs)
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        assert request.patch_text == patch_text
+        return LearnResult(run_id="run-large-inline-patch", status="completed")
+
+    monkeypatch.setattr(orchestrator_module, "LearnRequest", recording_learn_request)
+    monkeypatch.setattr(orchestrator_module, "run_learn_pipeline", fake_run_learn_pipeline)
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={"patch": patch_text})
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    assert info["status"] == "completed"
+    assert constructed_kwargs["patch_text"] == patch_text
+
+
+def test_post_learn_failure_does_not_leak_inline_patch_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "SECRET_INLINE_PATCH_SENTINEL"
+    patch_text = (
+        "diff --git a/secret.py b/secret.py\n"
+        "--- a/secret.py\n"
+        "+++ b/secret.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        f"+{sentinel}\n"
+    )
+
+    def failing_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        assert request.patch_text == patch_text
+        raise RuntimeError(f"failed to capture pasted patch: {patch_text}")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        failing_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={"patch": patch_text})
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="failed")
+
+    error = str(info["error"])
+    assert sentinel not in error
+    assert "diff --git" not in error
+    assert info["error_code"] == "internal_error"
+
+
+def test_post_learn_malformed_inline_patch_redacts_single_secret_line(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    sentinel = "SECRET_SINGLE_RAW_LINE_SENTINEL"
+    patch_text = (
+        "diff --git a/secret.py b/secret.py\n"
+        "--- a/secret.py\n"
+        "+++ b/secret.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-old = 1\n"
+        f"{sentinel}=should_not_echo\n"
+        "+new = 2\n"
+    )
+
+    with _client(state_dir) as client:
+        resp = _post_learn(client, body={"patch": patch_text, "force_learn": True})
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="failed")
+
+    error = str(info["error"])
+    assert error == "learn task failed; pasted patch details were redacted"
+    assert info["error_code"] == "internal_error"
+    assert sentinel not in json.dumps(info)
+    assert "should_not_echo" not in json.dumps(info)
+    assert "missing prefix" not in error
+
+
+# ---------------------------------------------------------------------------
+# Unknown-field filtering
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_rejects_unknown_fields(tmp_path: Path) -> None:
+    """Extra fields must be rejected with 422, not silently dropped."""
+    client = _client(tmp_path)
+    resp = _post_learn(
+        client,
+        body={
+            "unknown_field": "should be rejected",
+            "another": 42,
+            "dry_run": True,
+        },
+    )
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert body["error_code"] == "INPUT_UNKNOWN_KEYS"
+    assert "unknown_fields" in str(body.get("error", ""))
+
+
+def test_post_learn_filters_none_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fields with None values should be filtered out."""
+    _stub_completed_learn(monkeypatch, "run-none-values")
+    with _client(tmp_path) as client:
+        resp = _post_learn(
+            client,
+            body={
+                "revision": None,
+                "dry_run": True,
+            },
+        )
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Empty body accepted
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_empty_body_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_completed_learn(monkeypatch, "run-empty-body")
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+        data = _json_object(resp)
+        assert "task_id" in data
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Task is visible via /api/tasks after submission
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_task_visible_in_tasks_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_completed_learn(monkeypatch, "run-visible-task")
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+        task_id = _task_id_from(resp)
+
+        tasks_resp = client.get("/api/tasks")
+        assert tasks_resp.status_code == 200
+        tasks_value = _json_object(tasks_resp)["tasks"]
+        assert isinstance(tasks_value, list)
+        tasks = cast("list[dict[str, object]]", tasks_value)
+        task_ids = [task["task_id"] for task in tasks]
+        assert task_id in task_ids
+        info = _wait_for_task(client, task_id, expected_status="completed")
+    assert info["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# H1: Provider override fields rejected (SSRF prevention)
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_drops_provider_fields_before_request_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base_url, provider_class etc. must NOT reach LearnRequest."""
+    import ahadiff.core.orchestrator as orchestrator_module
+
+    forbidden = {"base_url", "provider_class", "model", "api_key_env", "provider_name"}
+    constructed_kwargs: dict[str, Any] = {}
+
+    def recording_learn_request(**kwargs: Any) -> LearnRequest:
+        constructed_kwargs.update(kwargs)
+        assert forbidden.isdisjoint(kwargs)
+        return LearnRequest(**kwargs)
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id="run-provider-fields", status="completed")
+
+    monkeypatch.setattr(orchestrator_module, "LearnRequest", recording_learn_request)
+    monkeypatch.setattr(orchestrator_module, "run_learn_pipeline", fake_run_learn_pipeline)
+
+    client = _client(tmp_path)
+    resp = _post_learn(
+        client,
+        body={
+            "base_url": "http://169.254.169.254/metadata",
+            "provider_class": "openai",
+            "model": "evil-model",
+            "api_key_env": "STOLEN_KEY",
+            "provider_name": "attacker",
+        },
+    )
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert "unknown_fields" in str(body.get("error", ""))
+
+
+def test_post_learn_passes_changed_paths_to_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ahadiff.core.orchestrator as orchestrator_module
+
+    constructed_kwargs: dict[str, Any] = {}
+
+    def recording_learn_request(**kwargs: Any) -> LearnRequest:
+        constructed_kwargs.update(kwargs)
+        assert kwargs["changed_paths"] == ("src/app.py", "tests/test_app.py")
+        return LearnRequest(**kwargs)
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id="run-watch-change", status="completed")
+
+    monkeypatch.setattr(orchestrator_module, "LearnRequest", recording_learn_request)
+    monkeypatch.setattr(orchestrator_module, "run_learn_pipeline", fake_run_learn_pipeline)
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(
+            client,
+            body={"changed_paths": ["src/app.py", "tests/test_app.py"]},
+        )
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    assert info["status"] == "completed"
+    assert constructed_kwargs["workspace_root"] == tmp_path
+    assert constructed_kwargs["changed_paths"] == ("src/app.py", "tests/test_app.py")
+
+
+def test_post_learn_passes_against_spec_to_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ahadiff.core.orchestrator as orchestrator_module
+
+    constructed_kwargs: dict[str, Any] = {}
+
+    def recording_learn_request(**kwargs: Any) -> LearnRequest:
+        constructed_kwargs.update(kwargs)
+        assert kwargs["against_spec"] == (tmp_path / "SPEC.md").resolve()
+        assert kwargs["spec_semantic_review"] is True
+        return LearnRequest(**kwargs)
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id="run-against-spec", status="completed")
+
+    monkeypatch.setattr(orchestrator_module, "LearnRequest", recording_learn_request)
+    monkeypatch.setattr(orchestrator_module, "run_learn_pipeline", fake_run_learn_pipeline)
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(
+            client,
+            body={"against_spec": "SPEC.md", "spec_semantic_review": True},
+        )
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+
+    assert info["status"] == "completed"
+    assert constructed_kwargs["against_spec"] == (tmp_path / "SPEC.md").resolve()
+    assert constructed_kwargs["spec_semantic_review"] is True
+
+
+def test_post_learn_rejects_against_spec_outside_workspace(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = _post_learn(
+        client,
+        body={"against_spec": "/etc/passwd", "spec_semantic_review": True},
+    )
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert body["error_code"] == "INPUT_VALIDATION"
+    assert body["error"] == "invalid_value_for_against_spec"
+
+
+def test_post_learn_estimate_rejects_against_spec_outside_workspace(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = _post_learn_estimate(client, body={"against_spec": "/etc/passwd"})
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert body["error_code"] == "INPUT_VALIDATION"
+    assert body["error"] == "invalid_value_for_against_spec"
+
+
+# ---------------------------------------------------------------------------
+# H3: Queue depth limit
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_queue_depth_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When max pending tasks limit is reached, return a stable conflict error."""
+    import ahadiff.serve.routes_learn as rl
+
+    monkeypatch.setattr(rl, "_MAX_PENDING_TASKS", 0)
+    client = _client(tmp_path)
+    resp = _post_learn(client, body={})
+    assert resp.status_code == 409
+    body = _json_object(resp)
+    assert body["error_code"] == "LOCK_CONFLICT"
+    assert body["error"] == "too_many_pending_learn_tasks"
+
+
+def test_post_learn_prechecks_repo_write_lock(tmp_path: Path) -> None:
+    from ahadiff.git.repo import repo_write_lock
+
+    client = _client(tmp_path)
+    with repo_write_lock(tmp_path / "ahadiff.lock", command="test"):
+        resp = _post_learn(client, body={})
+
+    assert resp.status_code == 409
+    body = _json_object(resp)
+    assert body["error_code"] == "LOCK_CONFLICT"
+    assert body["error"] == "run_in_progress"
+
+
+def test_post_learn_prechecks_sqlite_runtime_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted = False
+    minimum = sqlite_util_module.sqlite_runtime_minimum_text()
+    message = f"SQLite runtime 3.51.0 is below {minimum}"
+
+    def fail_sqlite_gate() -> None:
+        raise routes_learn.AhaDiffError(message)
+
+    def submit_if_capacity(*_args: object, **_kwargs: object) -> str:
+        nonlocal submitted
+        submitted = True
+        raise AssertionError("learn task should not be submitted")
+
+    runner = SimpleNamespace(submit_if_capacity=submit_if_capacity)
+    monkeypatch.setattr(
+        routes_learn,
+        "_assert_sqlite_runtime_supported_for_learn",
+        fail_sqlite_gate,
+    )
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path,
+            token="test-token",
+            task_runner=cast("Any", runner),
+        )
+    )
+    client = TestClient(app, base_url="http://localhost:8765")
+    resp = _post_learn(client, body={})
+
+    assert submitted is False
+    assert resp.status_code == 500
+    body = _json_object(resp)
+    assert body["error_code"] == "STORAGE_REVIEW_DB"
+    assert body["error"] == message
+
+
+# ---------------------------------------------------------------------------
+# M2: Type coercion
+# ---------------------------------------------------------------------------
+
+
+def test_post_learn_coerces_string_bool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'false' as string should be coerced to False, not truthy."""
+    _stub_completed_learn(monkeypatch, "run-string-bool")
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={"dry_run": "false"})
+        assert resp.status_code == 202
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["status"] == "completed"
+
+
+def test_post_learn_coerces_falsey_bool_strings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        captured["dry_run"] = request.dry_run
+        captured["force_learn"] = request.force_learn
+        captured["last"] = request.last
+        captured["use_graphify"] = request.use_graphify
+        return LearnResult(run_id="run-coerce", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(
+            client,
+            body={
+                "dry_run": "false",
+                "force_learn": "0",
+                "last": "true",
+                "use_graphify": "false",
+            },
+        )
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["result_summary"] is not None
+    assert captured == {
+        "dry_run": False,
+        "force_learn": False,
+        "last": True,
+        "use_graphify": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("compare", ("before.py", "after.py")),
+        ("compare_dir", ("old", "new")),
+    ],
+)
+def test_post_learn_coerces_path_pair_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    expected: tuple[str, str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        captured[field] = getattr(request, field)
+        return LearnResult(run_id="run-path-pair", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={field: list(expected)})
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["result_summary"] is not None
+    pair = captured[field]
+    assert isinstance(pair, tuple)
+    path_pair = cast("tuple[Path, Path]", pair)
+    assert tuple(str(part) for part in path_pair) == expected
+
+
+def test_post_learn_rejects_stdin_patch_mode(tmp_path: Path) -> None:
+    """Serve-side learn tasks must not consume process stdin via patch='-'."""
+    client = _client(tmp_path)
+    resp = _post_learn(client, body={"patch": "-"})
+    assert resp.status_code == 422
+    assert _json_object(resp)["error_code"] == "INPUT_VALIDATION"
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ({"last": 3}, "invalid_value_for_last"),
+        ({"last": "not_a_number"}, "invalid_value_for_last"),
+        ({"privacy_mode": "totally_remote"}, "invalid_value_for_privacy_mode"),
+        ({"lang": "fr"}, "invalid_value_for_lang"),
+        ({"author": "x" * 4097}, "invalid_value_for_author"),
+        ({"author": "--all"}, "invalid_value_for_author"),
+        ({"author": "Ada\x7f"}, "invalid_value_for_author"),
+        ({"since": "--all"}, "invalid_value_for_since"),
+        ({"since": "2025-01-01\x1f"}, "invalid_value_for_since"),
+        ({"dry_run": 42}, "invalid_value_for_dry_run"),
+        ({"compare": ["only-one"]}, "invalid_value_for_compare"),
+        ({"compare_dir": ["old", 7]}, "invalid_value_for_compare_dir"),
+    ],
+)
+def test_post_learn_rejects_invalid_values(
+    tmp_path: Path,
+    body: dict[str, object],
+    error: str,
+) -> None:
+    client = _client(tmp_path)
+    resp = _post_learn(client, body=body)
+    assert resp.status_code == 422
+    response_body = _json_object(resp)
+    assert response_body["error_code"] == "INPUT_VALIDATION"
+    assert response_body["error"] == error
+
+
+def test_post_learn_estimate_rejects_since_git_option_injection(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = _post_learn_estimate(client, body={"since": "--all"})
+    assert resp.status_code == 422
+    body = _json_object(resp)
+    assert body["error_code"] == "INPUT_VALIDATION"
+    assert body["error"] == "invalid_value_for_since"
+
+
+@pytest.mark.anyio
+async def test_post_learn_queue_depth_limit_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        release.wait(timeout=1.0)
+        return LearnResult(run_id="run-atomic", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    app = create_app(ServeState(state_dir=tmp_path, token="test-token", locale="en"))
+    transport = httpx.ASGITransport(app=app)
+    headers = {
+        "X-AhaDiff-Token": "test-token",
+        "origin": "http://localhost:8765",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8765") as client:
+        responses: list[httpx.Response] = []
+
+        async def _submit() -> None:
+            responses.append(await client.post("/api/learn", json={}, headers=headers))
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_submit)
+            tg.start_soon(_submit)
+            await anyio.sleep(0.05)
+            release.set()
+
+    assert sorted(response.status_code for response in responses) == [202, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert _json_object(conflict)["error_code"] == "LOCK_CONFLICT"
+
+
+def test_post_learn_completed_task_preserves_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(
+            run_id="run-complete",
+            status="keep",
+            overall=88.5,
+            verdict="PASS",
+            weakest_dim="conciseness",
+            warnings=["warn-1"],
+            artifacts_path=str(request.workspace_root),
+        )
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["result_summary"] == {
+        "run_id": "run-complete",
+        "status": "keep",
+        "overall": 88.5,
+        "verdict": "PASS",
+        "warnings": ["warn-1"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B: error_code + elapsed_seconds in task responses
+# ---------------------------------------------------------------------------
+
+
+def test_completed_task_has_elapsed_seconds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id="run-elapsed", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert "elapsed_seconds" in info
+    assert isinstance(info["elapsed_seconds"], float)
+    assert info["elapsed_seconds"] >= 0
+
+
+def test_failed_task_has_error_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        raise RuntimeError("claim extraction failed: parse error")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="failed")
+    assert info["error_code"] == "claim_error"
+    assert "claim" in str(info["error"]).lower()
+    assert "elapsed_seconds" in info
+
+
+@pytest.mark.anyio
+async def test_post_learn_thread_task_uses_bounded_task_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    cancelled_seen = threading.Event()
+    artifact_path = tmp_path / "thread-finished.txt"
+
+    def fake_run_learn_pipeline(request: LearnRequest, **kwargs: object) -> LearnResult:
+        cancel_check = kwargs["is_cancelled"]
+        assert callable(cancel_check)
+        started.set()
+        release.wait(timeout=1.0)
+        if cast("Any", cancel_check)():
+            cancelled_seen.set()
+        else:
+            artifact_path.write_text("finished\n", encoding="utf-8")
+        return LearnResult(run_id="run-thread", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path,
+            token="test-token",
+            locale="en",
+            task_runner=TaskRunner(max_concurrent=1, task_timeout_seconds=0.05),
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {
+        "X-AhaDiff-Token": "test-token",
+        "origin": "http://localhost:8765",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8765") as client:
+        resp = await client.post("/api/learn", json={}, headers=headers)
+        assert resp.status_code == 202
+        task_id = _task_id_from(resp)
+
+        try:
+            assert await run_sync_in_thread(lambda: started.wait(timeout=1.0))
+            await anyio.sleep(0.15)
+
+            failed_resp = await client.get(f"/api/tasks/{task_id}")
+            assert failed_resp.status_code == 200
+            failed_info = _json_object(failed_resp)
+            assert failed_info["status"] == "failed"
+            assert failed_info["error_code"] == "timeout"
+            assert "timeout" in str(failed_info["error"])
+            assert not artifact_path.exists()
+        finally:
+            release.set()
+
+        assert await run_sync_in_thread(lambda: cancelled_seen.wait(timeout=1.0))
+
+    assert not artifact_path.exists()
+
+
+@pytest.mark.anyio
+async def test_post_learn_blocks_new_submission_while_timed_out_thread_is_still_draining(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_run_learn_pipeline(request: LearnRequest, **kwargs: object) -> LearnResult:
+        del request, kwargs
+        started.set()
+        release.wait(timeout=1.0)
+        return LearnResult(run_id="run-thread", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path,
+            token="test-token",
+            locale="en",
+            task_runner=TaskRunner(max_concurrent=1, task_timeout_seconds=0.05),
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {
+        "X-AhaDiff-Token": "test-token",
+        "origin": "http://localhost:8765",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8765") as client:
+        first = await client.post("/api/learn", json={}, headers=headers)
+        assert first.status_code == 202
+        assert await run_sync_in_thread(lambda: started.wait(timeout=1.0))
+
+        await anyio.sleep(0.15)
+
+        failed_resp = await client.get(f"/api/tasks/{_task_id_from(first)}")
+        assert failed_resp.status_code == 200
+        failed_info = _json_object(failed_resp)
+        assert failed_info["status"] == "failed"
+        assert failed_info["error_code"] == "timeout"
+
+        second = await client.post("/api/learn", json={}, headers=headers)
+        assert second.status_code == 409
+        second_body = _json_object(second)
+        assert second_body["error_code"] == "LOCK_CONFLICT"
+        assert second_body["error"] == "too_many_pending_learn_tasks"
+
+        release.set()
+        deadline = anyio.current_time() + 1.0
+        third: httpx.Response | None = None
+        while anyio.current_time() < deadline:
+            third = await client.post("/api/learn", json={}, headers=headers)
+            if third.status_code == 202:
+                break
+            await anyio.sleep(0.02)
+
+        assert third is not None
+        assert third.status_code == 202
+
+
+@pytest.mark.anyio
+async def test_tasks_cancel_cancels_thread_backed_learn_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    cancelled_seen = threading.Event()
+
+    def fake_run_learn_pipeline(request: LearnRequest, **kwargs: object) -> LearnResult:
+        del request
+        cancel_check = kwargs["is_cancelled"]
+        assert callable(cancel_check)
+        started.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if cast("Any", cancel_check)():
+                cancelled_seen.set()
+                return LearnResult(run_id="run-cancelled", status="completed")
+            time.sleep(0.01)
+        raise AssertionError("cancel was not propagated to learn pipeline")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path,
+            token="test-token",
+            locale="en",
+            task_runner=TaskRunner(max_concurrent=1, task_timeout_seconds=5.0),
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {
+        "X-AhaDiff-Token": "test-token",
+        "origin": "http://localhost:8765",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8765") as client:
+        response = await client.post("/api/learn", json={}, headers=headers)
+        assert response.status_code == 202
+        task_id = _task_id_from(response)
+        assert await run_sync_in_thread(lambda: started.wait(timeout=1.0))
+
+        cancel_response = await client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+        assert cancel_response.status_code == 200
+        assert _json_object(cancel_response) == {"cancelled": True}
+
+        assert await run_sync_in_thread(lambda: cancelled_seen.wait(timeout=1.0))
+        deadline = anyio.current_time() + 1.0
+        info: dict[str, object] | None = None
+        while anyio.current_time() < deadline:
+            status_response = await client.get(f"/api/tasks/{task_id}")
+            assert status_response.status_code == 200
+            info = _json_object(status_response)
+            if info["status"] == "cancelled":
+                break
+            await anyio.sleep(0.02)
+
+        assert info is not None
+        assert info["status"] == "cancelled"
+        assert info["result_summary"] is None
+        assert info["error_code"] is None
+
+
+@pytest.mark.anyio
+async def test_late_cancel_after_publish_boundary_keeps_run_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    cancelled_seen = threading.Event()
+    run_path = tmp_path / ".ahadiff" / "runs" / "run-published"
+
+    def fake_run_learn_pipeline(request: LearnRequest, **kwargs: object) -> LearnResult:
+        del request
+        cancel_check = kwargs["is_cancelled"]
+        assert callable(cancel_check)
+        started.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if cast("Any", cancel_check)():
+                cancelled_seen.set()
+                run_path.mkdir(parents=True, exist_ok=True)
+                (run_path / "finalized.json").write_text("{}\n", encoding="utf-8")
+                (run_path / "score.json").write_text("{}\n", encoding="utf-8")
+                return LearnResult(
+                    run_id="run-published",
+                    status="keep",
+                    artifacts_path=str(run_path),
+                )
+            time.sleep(0.01)
+        raise AssertionError("cancel was not propagated to learn pipeline")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path / ".ahadiff",
+            token="test-token",
+            locale="en",
+            task_runner=TaskRunner(max_concurrent=1, task_timeout_seconds=5.0),
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {
+        "X-AhaDiff-Token": "test-token",
+        "origin": "http://localhost:8765",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8765") as client:
+        response = await client.post("/api/learn", json={}, headers=headers)
+        assert response.status_code == 202
+        task_id = _task_id_from(response)
+        assert await run_sync_in_thread(lambda: started.wait(timeout=1.0))
+
+        cancel_response = await client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+        assert cancel_response.status_code == 200
+        assert await run_sync_in_thread(lambda: cancelled_seen.wait(timeout=1.0))
+
+        info: dict[str, object] | None = None
+        deadline = anyio.current_time() + 1.0
+        while anyio.current_time() < deadline:
+            status_response = await client.get(f"/api/tasks/{task_id}")
+            assert status_response.status_code == 200
+            info = _json_object(status_response)
+            if info["status"] == "cancelled":
+                break
+            await anyio.sleep(0.02)
+
+    assert info is not None
+    assert info["status"] == "cancelled"
+    assert info["result_summary"] is None
+    assert (run_path / "finalized.json").exists()
+    assert (run_path / "score.json").exists()
+
+
+def test_successful_task_error_code_is_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_learn_pipeline(request: LearnRequest, **_: object) -> LearnResult:
+        return LearnResult(run_id="run-ok", status="completed")
+
+    monkeypatch.setattr(
+        "ahadiff.core.orchestrator.run_learn_pipeline",
+        fake_run_learn_pipeline,
+    )
+
+    with _client(tmp_path) as client:
+        resp = _post_learn(client, body={})
+        assert resp.status_code == 202
+
+        info = _wait_for_task(client, _task_id_from(resp), expected_status="completed")
+    assert info["error_code"] is None
+    assert info["error"] is None
+
+
+__all__: list[str] = []

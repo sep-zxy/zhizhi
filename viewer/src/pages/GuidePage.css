@@ -1,0 +1,1195 @@
+/* ==========================================================================
+   GuidePage — daily AhaDiff workflow reference. Companion to OnboardingPage:
+   onboarding sets up the repo, guide explains day-to-day usage. Layout uses
+   flexbox/grid only (no container queries) so the page degrades cleanly on
+   older engines and forced-colors mode. All radii capped at 12px to match
+   the project's surface tokens.
+   ========================================================================== */
+
+.guide {
+  max-width: var(--mw-content);
+  margin: 0 auto;
+  padding: 0 0 var(--sp-10);
+}
+
+/* ---- Header (masthead) ---- */
+.guide__head {
+  margin-bottom: var(--sp-8);
+}
+
+/* Eyebrow now reads as a printed column kicker: mono caps over a folio rule. */
+.guide__eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--muted-2);
+  text-transform: uppercase;
+  margin: 0 0 var(--sp-3);
+  padding-top: 10px;
+  border-top: 2px solid var(--folio-line);
+  display: inline-block;
+  min-width: 220px;
+}
+
+/* Masthead title — display serif scale, balanced wrap with hard fallback. */
+.guide__title {
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: var(--fs-h1);
+  letter-spacing: var(--ls-h1);
+  line-height: var(--lh-h1);
+  color: var(--ink-blackletter);
+  margin: 0;
+  text-wrap: balance;
+}
+
+.guide__subtitle {
+  color: var(--muted-strong);
+  font-size: var(--fs-md);
+  margin: var(--sp-3) 0 0;
+  line-height: var(--lh-relaxed);
+  max-width: var(--mw-prose);
+}
+
+/* Lead-in drop cap — magazine opener on the standfirst. Scoped to the guide
+   subtitle's first letter. initial-letter is the clean sunk-cap path; the
+   joint @supports-not below catches Firefox (no initial-letter at all) without
+   double-rendering on Safari (which only ships the -webkit- prefix). */
+.guide__subtitle--lead::first-letter {
+  -webkit-initial-letter: 2;
+  initial-letter: 2;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-style: normal;
+  font-synthesis: none;
+  color: var(--accent-deep);
+  margin-inline-end: 0.1em;
+}
+
+@supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) {
+  .guide__subtitle--lead::first-letter {
+    -webkit-initial-letter: normal;
+    initial-letter: normal;
+    float: left;
+    font-size: 2.6em;
+    line-height: 0.8;
+    padding: 0.05em 0.1em 0 0;
+    margin-top: 0.02em;
+    vertical-align: baseline;
+  }
+}
+
+/* ---- Section nav (jump-to chips) ---- */
+.guide-nav {
+  margin: 0 0 var(--sp-10);
+  padding: 0 0 var(--sp-6);
+  border: none;
+  background: transparent;
+  /* Classic newsroom heavy separator beneath the masthead/index. */
+  border-bottom: 4px double var(--hair-strong);
+}
+
+.guide-nav__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-6);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guide-nav__item {
+  min-width: 0;
+}
+
+.guide-nav__chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0;
+  border-radius: 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  color: var(--muted-strong);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+.guide-nav__chip:hover {
+  background: transparent;
+  color: var(--ink-blackletter);
+  border: none;
+}
+
+.guide-nav__chip:focus-visible {
+  outline: none;
+  color: var(--accent-ink);
+}
+
+.guide-nav__chip-index {
+  flex-shrink: 0;
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums lining-nums;
+  color: var(--accent-ink);
+  opacity: 1;
+  transition: opacity var(--dur-fast) var(--ease-out-quart);
+}
+
+.guide-nav__chip:hover .guide-nav__chip-index {
+  opacity: 1;
+}
+
+/* ---- Sections shared ---- */
+.guide-section {
+  margin-top: var(--sp-12);
+  scroll-margin-top: var(--sp-6);
+}
+
+/* Section title reads as an editorial subhead: serif h2 scale, anchored to a
+   hairline column rule so each block opens like a newspaper section. */
+.guide-section__title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: var(--fs-h2);
+  letter-spacing: var(--ls-h2);
+  line-height: var(--lh-h2);
+  margin: 0 0 var(--sp-5);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--hair-strong);
+  color: var(--ink-blackletter);
+  text-wrap: balance;
+}
+
+.guide-section__icon {
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--accent);
+}
+
+/* ---- Workflow steps ---- */
+.guide-workflow__steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guide-workflow__step-item {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-2);
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.guide-workflow__step {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  flex: 1;
+  padding: var(--sp-4);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  background: var(--elevated);
+  min-width: 0;
+  transition: border-color var(--dur-base) var(--ease-out-quart),
+    box-shadow var(--dur-base) var(--ease-out-quart),
+    transform var(--dur-base) var(--ease-out-quart);
+}
+
+.guide-workflow__step:hover {
+  border-color: var(--accent-tint);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-2px);
+}
+
+.guide-workflow__step:focus-within {
+  outline: none;
+  box-shadow: var(--ring-focus);
+  border-color: var(--accent);
+}
+
+.guide-workflow__step-icon {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-md);
+  background: var(--accent-softest);
+  color: var(--accent-ink);
+}
+
+.guide-workflow__step-number {
+  position: absolute;
+  inset-block-start: -6px;
+  inset-inline-end: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  box-shadow: 0 0 0 2px var(--elevated);
+}
+
+.guide-workflow__step-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.guide-workflow__step-title {
+  font-weight: 600;
+  font-size: var(--fs-base);
+  color: var(--ink);
+  margin-bottom: var(--sp-1);
+  line-height: var(--lh-snug);
+}
+
+.guide-workflow__step-desc {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  line-height: var(--lh-normal);
+}
+
+.guide-workflow__arrow {
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--muted);
+  opacity: 0.55;
+}
+
+/* ---- Command grid ---- */
+.guide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--sp-6);
+  align-items: stretch;
+}
+
+.guide-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 0;
+  border: none;
+  background: transparent;
+  min-width: 0;
+}
+
+.guide-card:hover {
+  opacity: 0.9;
+}
+
+.guide-card:focus-within {
+  outline: none;
+}
+
+.guide-card__label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-family: var(--font-serif);
+  font-size: 15px;
+  color: var(--ink-strong);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.guide-card .command-block {
+  margin-top: auto;
+}
+
+/* Command block within guide cards must wrap long commands instead of
+   horizontal scrolling. Without this override the inner <pre> would force
+   horizontal overflow on narrow screens. */
+.guide-card .command-block,
+.guide-grid .command-block {
+  min-width: 0;
+}
+
+.guide-card .command-block__code,
+.guide-grid .command-block__code {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/* ---- Install model explainer ---- */
+.guide-install-model {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-6);
+  margin-bottom: var(--sp-6);
+}
+
+.guide-install-model__item {
+  padding: 0;
+  border: none;
+  border-top: 1px solid var(--hair-strong);
+  padding-top: var(--sp-3);
+  background: transparent;
+}
+
+.guide-install-model__item span {
+  display: block;
+  color: var(--ink-strong);
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.guide-install-model__item p {
+  margin: var(--sp-1) 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: var(--lh-relaxed);
+}
+
+/* ---- Notes ---- */
+.guide-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-6) 0 0;
+  padding: var(--sp-4) 0;
+  list-style: none;
+  border-top: 1px dashed var(--hair-strong);
+  border-bottom: 1px dashed var(--hair-strong);
+  background: transparent;
+}
+
+.guide-notes__item {
+  position: relative;
+  padding-inline-start: var(--sp-4);
+  font-size: var(--fs-sm);
+  color: var(--ink-strong);
+  line-height: var(--lh-relaxed);
+}
+
+.guide-notes__item::before {
+  content: '※';
+  position: absolute;
+  inset-block-start: 0.1em;
+  inset-inline-start: 0;
+  color: var(--accent);
+  font-family: var(--font-serif);
+  font-size: 14px;
+  background: transparent;
+  width: auto;
+  height: auto;
+}
+
+/* ---- Env vars dual-track ---- */
+.guide-env {
+  margin-top: var(--sp-8);
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.guide-env__label {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  color: var(--ink-strong);
+  letter-spacing: -0.01em;
+  font-weight: 500;
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--hair-strong);
+  padding-bottom: var(--sp-2);
+}
+
+.guide-env__panes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-6);
+}
+
+.guide-env__pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.guide-env__pane--active {
+  border: none;
+}
+
+.guide-env__pane-label {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--hair);
+  padding-bottom: var(--sp-1);
+}
+
+.guide-env__pane--active .guide-env__pane-label {
+  color: var(--accent-ink);
+  border-bottom-color: var(--accent);
+}
+
+/* ---- Accordion ---- */
+.guide-accordion {
+  border: none;
+  border-top: 1px solid var(--hair-strong);
+  border-bottom: 1px solid var(--hair-strong);
+  background: transparent;
+  overflow: hidden;
+}
+
+.guide-accordion__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) 0;
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: var(--fs-h3);
+  color: var(--ink-strong);
+  -webkit-user-select: none;
+  user-select: none;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+.guide-accordion__summary::-webkit-details-marker {
+  display: none;
+}
+
+.guide-accordion__summary:hover {
+  color: var(--accent);
+}
+
+.guide-accordion__summary:focus-visible {
+  outline: none;
+  color: var(--accent);
+}
+
+.guide-accordion__summary-text {
+  flex: 1;
+}
+
+.guide-accordion__chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform var(--dur-base) var(--ease-out-quart);
+}
+
+.guide-accordion[open] > .guide-accordion__summary .guide-accordion__chevron {
+  transform: rotate(90deg);
+}
+
+.guide-accordion__body {
+  padding: 0 0 var(--sp-4) 0;
+  border: none;
+  background: transparent;
+}
+
+/* ---- Agent Skills ---- */
+.guide-agent-skills__head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  align-items: flex-start;
+  margin-bottom: var(--sp-5);
+}
+
+.guide-agent-skills__subtitle {
+  margin: 0;
+  color: var(--muted);
+  line-height: var(--lh-relaxed);
+  max-width: var(--mw-prose);
+}
+
+.guide-agent-skills__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.guide-agent-skills__tab-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 28px;
+  padding: 3px var(--sp-3);
+  border-radius: var(--r-full);
+  border: 1px solid var(--hair);
+  color: var(--muted);
+  background: var(--subtle);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease-out-quart);
+}
+
+.guide-agent-skills__tab-chip:hover {
+  background: var(--subtle);
+  color: var(--ink);
+  border-color: var(--hair-strong);
+}
+
+.guide-agent-skills__tab-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+  border-color: var(--accent);
+}
+
+.guide-agent-skills__tab-chip--active {
+  color: var(--accent-ink);
+  background: var(--accent-softest);
+  border-color: var(--accent-tint);
+  font-weight: 600;
+}
+
+.guide-agent-skills__tab-chip--active .guide-agent-skills__tab-count {
+  color: var(--accent-ink);
+  opacity: 1;
+}
+
+.guide-agent-skills__tab-chip:not(.guide-agent-skills__tab-chip--active) .guide-agent-skills__tab-count {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.guide-agent-skills__tab-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.guide-agent-card__status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--hair);
+  color: var(--ink-2);
+  background: var(--subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.guide-agent-card__status--installed {
+  color: var(--accent-ink);
+  background: var(--accent-softest);
+  border-color: var(--accent-tint);
+}
+
+.guide-agent-card__status--unsupported,
+.guide-agent-card__status--error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+.guide-agent-skills__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-6);
+}
+
+.guide-agent-skills__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+}
+
+.guide-agent-card {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--elevated);
+}
+
+.guide-agent-card__topline {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.guide-agent-card__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--r-md);
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.guide-agent-card__name {
+  display: block;
+  margin: var(--sp-3) 0 var(--sp-1);
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.guide-agent-card__path {
+  display: block;
+  margin: 0 0 var(--sp-3);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: var(--lh-relaxed);
+  overflow-wrap: anywhere;
+}
+
+.guide-agent-card__actions {
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-3) 0 0;
+  border-top: 1px dashed var(--hair);
+  list-style: none;
+  color: var(--muted-strong);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: var(--lh-relaxed);
+}
+
+.guide-agent-card__actions span,
+.guide-agent-card__actions code {
+  overflow-wrap: anywhere;
+}
+
+.guide-agent-card__actions code {
+  background: transparent;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-strong);
+}
+
+.guide-agent-card__actions-more {
+  margin-top: var(--sp-1);
+  color: var(--muted);
+  font-style: italic;
+}
+
+.guide-agent-card__platform-badge {
+  display: inline-block;
+  margin-inline-start: var(--sp-2);
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--hair-strong);
+  background: var(--subtle);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .guide-agent-card__platform-badge {
+    color: var(--muted-strong);
+  }
+}
+
+:root[data-theme="dark"] .guide-agent-card__platform-badge {
+  color: var(--muted-strong);
+}
+
+/* ---- Integrations ---- */
+.guide-integrations__desc {
+  margin: 0 0 var(--sp-4);
+  font-size: 15px;
+  color: var(--muted-strong);
+  line-height: var(--lh-relaxed);
+  max-width: var(--mw-prose);
+}
+
+.guide-integrations__scope {
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  border: none;
+  border-left: 2px solid var(--accent);
+  padding-left: var(--sp-4);
+  background: transparent;
+  color: var(--ink-strong);
+  font-size: 14px;
+  line-height: var(--lh-relaxed);
+}
+
+.guide-integrations__list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--sp-4);
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  list-style: none;
+}
+
+.guide-integrations__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border: none;
+  border-bottom: 1px dashed var(--hair-strong);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--ink-strong);
+  min-width: 0;
+}
+
+.guide-integrations__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+
+
+.guide-integrations__hint {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--accent);
+  font-family: var(--font-serif);
+  font-size: 15px;
+  color: var(--accent-ink);
+  text-decoration: none;
+  font-style: italic;
+  transition: opacity var(--dur-fast) var(--ease-out-quart);
+  margin-top: var(--sp-4);
+}
+
+.guide-integrations__hint:hover {
+  opacity: 0.8;
+}
+
+.guide-integrations__hint:focus-visible {
+  outline: none;
+  color: var(--accent);
+}
+
+.guide-integrations__hint-icon {
+  flex-shrink: 0;
+  color: var(--accent-ink);
+}
+
+.guide-integrations__hint-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.guide-integrations__hint-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--accent-ink);
+  white-space: nowrap;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 768px) {
+  .guide-agent-skills__head {
+    flex-direction: column;
+  }
+  .guide-agent-skills__tabs {
+    justify-content: flex-start;
+  }
+  .guide-agent-skills__grid {
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  }
+  .guide-workflow__steps {
+    flex-direction: column;
+  }
+  .guide-workflow__step-item {
+    flex: 1 1 auto;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .guide-workflow__arrow {
+    transform: rotate(90deg);
+    align-self: center;
+    margin: var(--sp-1) 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .guide-grid {
+    grid-template-columns: 1fr;
+  }
+  .guide-agent-skills__grid {
+    grid-template-columns: 1fr;
+    gap: var(--sp-4);
+  }
+  .guide-env__panes {
+    grid-template-columns: 1fr;
+  }
+  .guide-integrations__list {
+    grid-template-columns: 1fr;
+  }
+  .guide-integrations__hint {
+    flex-wrap: wrap;
+  }
+}
+
+/* ---- Forced-colors (Windows high-contrast) ---- */
+@media (forced-colors: active) {
+  .guide-nav,
+  .guide-workflow__step,
+  .guide-card,
+  .guide-env__pane,
+  .guide-accordion,
+  .guide-agent-card,
+  .guide-integrations__item,
+  .guide-notes,
+  .guide-integrations__hint,
+  .guide-workflow-card {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .guide-nav__chip {
+    border: 1px solid transparent;
+    color: CanvasText;
+  }
+  .guide-nav__chip:hover,
+  .guide-nav__chip:focus-visible {
+    border-color: LinkText;
+    color: LinkText;
+  }
+  .guide-workflow__step-icon,
+  .guide-section__icon,
+  .guide-integrations__hint-icon,
+  .guide-integrations__hint-cta,
+  .guide-accordion__chevron,
+  .guide-nav__chip-index {
+    color: LinkText;
+  }
+  .guide-workflow__step-number {
+    background: Canvas;
+    color: LinkText;
+    box-shadow: 0 0 0 2px Canvas;
+    border: 1px solid LinkText;
+  }
+  .guide-notes__item::before {
+    color: LinkText;
+    background: transparent;
+  }
+
+  .guide-agent-card__status,
+  .guide-agent-card__platform-badge,
+  .guide-agent-skills__tab-chip,
+  .guide-agent-card__manifest-preview-item {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .guide-env__pane--active {
+    border: 2px solid Highlight;
+  }
+  .guide-accordion__summary:focus-visible,
+  .guide-integrations__hint:focus-visible,
+  .guide-nav__chip:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+}
+
+/* ---- Reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  .guide-workflow__step,
+  .guide-card,
+  .guide-env__pane,
+  .guide-accordion__summary,
+  .guide-accordion__chevron,
+  .guide-nav__chip,
+  .guide-agent-card,
+  .guide-integrations__hint,
+  .guide-agent-skills__tab-chip,
+  .guide-workflow-card {
+    transition: none;
+  }
+  .guide-workflow__step:hover {
+    transform: none;
+  }
+  .guide-accordion[open] > .guide-accordion__summary .guide-accordion__chevron {
+    transform: none;
+  }
+}
+
+/* ---- Component Additions for Sprint 4 ---- */
+.guide-agent-card__install {
+  margin: var(--sp-3) 0;
+}
+
+.guide-agent-card__usage-panel-wrapper {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px dashed var(--hair);
+}
+
+.guide-agent-card__manifest-preview {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px dashed var(--hair);
+  text-align: left;
+}
+
+.guide-agent-card__manifest-preview-title {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.guide-agent-card__manifest-preview-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.guide-agent-card__manifest-preview-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--subtle);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.guide-agent-card__manifest-preview-item--generated {
+  border-left: 3px solid var(--accent);
+}
+
+.guide-agent-card__manifest-preview-item--user-managed {
+  border-left: 3px solid var(--muted-strong);
+}
+
+.guide-agent-card__manifest-preview-path {
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.guide-agent-card__manifest-preview-strategy-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.guide-agent-card__manifest-preview-strategy-badge--generated {
+  background: var(--accent-softest);
+  color: var(--accent-ink);
+}
+
+.guide-agent-card__manifest-preview-strategy-badge--user-managed {
+  background: var(--hair-strong);
+  color: var(--ink-strong);
+}
+
+.guide-workflows-section {
+  margin-top: var(--sp-10);
+  padding-top: var(--sp-8);
+  border-top: 1px solid var(--hair-strong);
+}
+
+.guide-workflows-section__title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: var(--fs-h3);
+  letter-spacing: -0.01em;
+  line-height: var(--lh-h3);
+  margin: 0 0 var(--sp-6);
+  color: var(--ink-blackletter);
+}
+
+.guide-workflows-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--sp-6);
+  margin-bottom: var(--sp-6);
+}
+
+.guide-workflow-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--elevated);
+}
+
+.guide-workflow-card__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+.guide-workflow-card__desc {
+  margin: 0 0 var(--sp-2);
+  font-size: 13px;
+  color: var(--muted);
+  line-height: var(--lh-relaxed);
+  text-align: left;
+}
+
+/* Agent card heading wrapper: keeps h2->h3->h4 order without changing visuals */
+.guide-agent-card__heading {
+  margin: 0;
+  font: inherit;
+}
+
+/* Agent card header button reset */
+.guide-agent-card__header {
+  all: unset;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  cursor: pointer;
+  padding: var(--sp-4);
+  box-sizing: border-box;
+}
+.guide-agent-card__header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--r-sm);
+}
+.guide-agent-card__header-content {
+  display: block;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Chevron rotation */
+.guide-agent-card__chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform var(--dur-base, 200ms) ease;
+}
+.guide-agent-card.is-expanded .guide-agent-card__chevron {
+  transform: rotate(180deg);
+}
+
+/* Collapsible content — hidden attribute handles a11y; grid handles animation */
+.guide-agent-card__collapsible[hidden] {
+  display: none;
+}
+.guide-agent-card__collapsible:not([hidden]) {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+.guide-agent-card__content-inner {
+  overflow: hidden;
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .guide-agent-card__chevron,
+  .guide-agent-card__collapsible {
+    transition: none;
+  }
+}
+
+/* Forced colors */
+@media (forced-colors: active) {
+  .guide-agent-card__header:focus-visible {
+    outline: 2px solid Highlight;
+  }
+}
+
+/* Print: force expand all */
+@media print {
+  .guide-agent-card__collapsible[hidden] {
+    display: grid !important;
+    grid-template-rows: 1fr;
+  }
+  .guide-agent-card__content-inner {
+    overflow: visible;
+  }
+  .guide-agent-card__chevron {
+    display: none;
+  }
+  /* initial-letter is unreliable in print engines — force the float drop cap so
+     the lead cap survives a printed guide. */
+  .guide__subtitle--lead::first-letter {
+    -webkit-initial-letter: initial;
+    initial-letter: normal;
+    float: left;
+    font-size: 2.6em;
+    line-height: 0.8;
+    padding: 0.05em 0.1em 0 0;
+    color: #000;
+  }
+}

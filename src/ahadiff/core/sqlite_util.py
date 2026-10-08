@@ -1,0 +1,768 @@
+"""Centralized SQLite connection helper — rejects symlinks and applies safe pragmas."""
+
+from __future__ import annotations
+
+import errno
+import os
+import sqlite3
+import stat
+import sys
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import quote
+
+from ahadiff.core.errors import StorageError
+
+if TYPE_CHECKING:
+    from ahadiff.core.windows_sqlite import WindowsDirectoryGuard
+
+_VALID_JOURNAL_MODES = frozenset({"DELETE", "WAL", "TRUNCATE", "PERSIST", "MEMORY", "OFF"})
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_OPEN_VERIFICATION_RETRIES = 8
+_SQLITE_MIN_VERSION = (3, 51, 3)
+_SQLITE_ALLOWED_BACKPORT_MINIMUMS: dict[tuple[int, int], tuple[int, int, int]] = {
+    (3, 50): (3, 50, 4),
+    (3, 44): (3, 44, 6),
+}
+
+
+@dataclass(frozen=True)
+class _OpenVerificationState:
+    expected_identity: tuple[int, int] | None
+    existing_path: bool
+    path_change_token: tuple[int, int] | None = None
+    parent_identity: tuple[int, int] | None = None
+    parent_change_token: tuple[int, int] | None = None
+    sidecar_state: tuple[tuple[str, tuple[int, int] | None], ...] = ()
+    nofollow_fd: int | None = None
+    requires_fd_bound_connect: bool = False
+    windows_path_name_connect_without_fd_bound: bool = False
+    windows_directory_guard: WindowsDirectoryGuard | None = None
+
+
+class _RetryOpenVerification(Exception):
+    """Discard an ambiguous connection and rebuild its full path verification."""
+
+
+def safe_sqlite_connect(
+    path: Path | str,
+    *,
+    read_only: bool = False,
+    immutable_read_only: bool = False,
+    journal_mode: str | None = None,
+    busy_timeout_ms: int = 5000,
+    timeout: float = 5.0,
+    row_factory: type | None = None,
+    foreign_keys: bool = False,
+    defensive: bool = False,
+) -> sqlite3.Connection:
+    """Open a SQLite database after verifying the path is not a symlink.
+
+    On Windows, also checks for NTFS reparse points (``st_file_attributes & 0x400``).
+    Applies safe pragmas: ``trusted_schema=OFF``, ``busy_timeout``, and optionally
+    ``journal_mode``, ``foreign_keys``, and ``DBCONFIG_DEFENSIVE``.
+    """
+    if journal_mode is not None and journal_mode.upper() not in _VALID_JOURNAL_MODES:
+        raise ValueError(f"invalid journal_mode: {journal_mode!r}")
+    if busy_timeout_ms < 0:
+        raise ValueError("busy_timeout_ms must be >= 0")
+    if timeout < 0:
+        raise ValueError("timeout must be >= 0")
+
+    special_database = _is_special_sqlite_database(path) and not read_only
+    p = _canonicalize_system_sqlite_path(Path(path))
+    database_target = str(path) if special_database else str(p)
+
+    uri = None
+    if read_only:
+        uri = _read_only_sqlite_uri(p, immutable=immutable_read_only)
+
+    for attempt in range(_OPEN_VERIFICATION_RETRIES):
+        if not special_database:
+            _reject_symlink_ancestors(p)
+        attempt_state = (
+            _OpenVerificationState(expected_identity=None, existing_path=False)
+            if special_database
+            else _prepare_open_verification(p, create_missing=not read_only)
+        )
+        conn: sqlite3.Connection | None = None
+        try:
+            fd_path = _sqlite_proc_fd_path(attempt_state.nofollow_fd)
+            if uri:
+                connect_uri = (
+                    _read_only_sqlite_uri(fd_path, immutable=immutable_read_only)
+                    if fd_path is not None
+                    else uri
+                )
+                conn = sqlite3.connect(connect_uri, uri=True, timeout=timeout)
+            elif attempt_state.expected_identity is not None:
+                if (
+                    attempt_state.requires_fd_bound_connect
+                    and fd_path is None
+                    and not _allow_path_name_connect_without_fd_bound()
+                ):
+                    raise PermissionError(f"safe SQLite create requires fd-bound open support: {p}")
+                connect_path = fd_path if fd_path is not None else p
+                if fd_path is None and sys.platform == "win32":
+                    attempt_state = replace(
+                        attempt_state,
+                        windows_path_name_connect_without_fd_bound=True,
+                    )
+                connect_uri = _read_write_sqlite_uri(connect_path)
+                conn = sqlite3.connect(connect_uri, uri=True, timeout=timeout)
+            else:
+                conn = sqlite3.connect(database_target, timeout=timeout)
+            _verify_opened_database_path(conn, p, attempt_state)
+            if row_factory is not None:
+                conn.row_factory = row_factory
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+            if journal_mode is not None:
+                conn.execute(f"PRAGMA journal_mode = {journal_mode}")
+            if foreign_keys:
+                conn.execute("PRAGMA foreign_keys = ON")
+            if defensive:
+                _flag = getattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE", None)
+                _setconfig = getattr(conn, "setconfig", None)
+                if _flag is not None and callable(_setconfig):
+                    cast("Any", _setconfig)(_flag, True)
+            return conn
+        except sqlite3.OperationalError:
+            if conn is not None:
+                conn.close()
+            _raise_if_parent_changed_during_failed_open(p, attempt_state)
+            raise
+        except _RetryOpenVerification:
+            if conn is not None:
+                conn.close()
+            if attempt + 1 >= _OPEN_VERIFICATION_RETRIES:
+                raise PermissionError(f"database path changed during open: {p}") from None
+            time.sleep(0.01 * (attempt + 1))
+            continue
+        except Exception:
+            if conn is not None:
+                conn.close()
+            raise
+        finally:
+            try:
+                _close_nofollow_fd(attempt_state.nofollow_fd)
+            finally:
+                if attempt_state.windows_directory_guard is not None:
+                    attempt_state.windows_directory_guard.close()
+
+    raise PermissionError(f"database path changed during open: {p}")
+
+
+def mcp_readonly_connect(db_path: Path) -> sqlite3.Connection:
+    """Open a strictly read-only SQLite connection for the MCP server.
+
+    Combines ``mode=ro`` URI access with an enforced ``PRAGMA query_only=ON``
+    so every statement on this connection is rejected by SQLite if it would
+    write. Raises ``StorageError`` if the database does not exist or if
+    ``query_only`` cannot be verified.
+    """
+    if not db_path.exists():
+        raise StorageError(f"MCP read-only DB does not exist: {db_path}")
+    try:
+        connection = safe_sqlite_connect(
+            db_path,
+            read_only=True,
+            busy_timeout_ms=5000,
+        )
+    except sqlite3.DatabaseError as exc:
+        raise StorageError(f"MCP read-only DB open failed: {db_path} ({exc})") from exc
+    except OSError as exc:
+        raise StorageError(f"MCP read-only DB open failed: {db_path} ({exc})") from exc
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute("PRAGMA query_only").fetchone()
+        if row is None or int(row[0]) != 1:
+            actual = "unknown" if row is None else str(row[0])
+            raise StorageError(
+                f"MCP read-only DB failed query_only=ON verification: {db_path} ({actual})"
+            )
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def reject_symlink_path(path: Path | str) -> None:
+    """Raise ``PermissionError`` if *path* is a symlink or (Windows) reparse point."""
+    _reject_symlink(_canonicalize_system_sqlite_path(Path(path)))
+
+
+def _read_only_sqlite_uri(path: PurePath | str, *, immutable: bool = False) -> str:
+    return _sqlite_file_uri(path, "ro", immutable=immutable)
+
+
+def _read_write_sqlite_uri(path: PurePath | str) -> str:
+    return _sqlite_file_uri(path, "rw")
+
+
+def _sqlite_file_uri(path: PurePath | str, mode: str, *, immutable: bool = False) -> str:
+    path_text = str(path).replace("\\", "/")
+    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        path_text = f"/{path_text}"
+    query = f"mode={mode}"
+    if immutable:
+        query = f"{query}&immutable=1"
+    return f"file:{quote(path_text, safe='/:')}?{query}"
+
+
+def _is_special_sqlite_database(path: Path | str) -> bool:
+    return (isinstance(path, str) and path == "") or str(path) == ":memory:"
+
+
+def _canonicalize_system_sqlite_path(path: Path) -> Path:
+    if sys.platform != "darwin" or not path.is_absolute():
+        return path
+
+    path_parts = path.parts
+    if len(path_parts) < 2:
+        return path
+    if path_parts[1] == "var":
+        return Path("/private/var", *path_parts[2:])
+    if path_parts[1] == "tmp":
+        return Path("/private/tmp", *path_parts[2:])
+    return path
+
+
+def _prepare_open_verification(
+    path: Path,
+    *,
+    create_missing: bool = False,
+) -> _OpenVerificationState:
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        if create_missing:
+            return _prepare_missing_database_file(path)
+        return _OpenVerificationState(expected_identity=None, existing_path=False)
+
+    _reject_symlink_stat(path, path_stat)
+    if not stat.S_ISREG(path_stat.st_mode):
+        return _OpenVerificationState(
+            expected_identity=None,
+            existing_path=True,
+            path_change_token=_stat_change_token(path_stat),
+        )
+    _reject_hardlink_stat(path, path_stat)
+    _reject_unknown_windows_identity(path, path_stat)
+
+    path_change_token = _stat_change_token(path_stat)
+    parent_identity, parent_change_token = _parent_directory_state(path)
+    sidecar_state = _sqlite_sidecar_state(path)
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PermissionError(f"refusing to open symlink: {path}") from exc
+        return _OpenVerificationState(
+            expected_identity=(path_stat.st_dev, path_stat.st_ino),
+            existing_path=True,
+            path_change_token=path_change_token,
+            parent_identity=parent_identity,
+            parent_change_token=parent_change_token,
+            sidecar_state=sidecar_state,
+        )
+
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PermissionError(f"database path changed during open: {path}")
+        if _has_windows_reparse_point(file_stat):
+            raise PermissionError(f"refusing to open NTFS reparse point: {path}")
+        _reject_hardlink_stat(path, file_stat)
+        _reject_unknown_windows_identity(path, file_stat)
+        if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise PermissionError(f"database path changed during open: {path}")
+        return _OpenVerificationState(
+            expected_identity=(file_stat.st_dev, file_stat.st_ino),
+            existing_path=True,
+            path_change_token=path_change_token,
+            parent_identity=parent_identity,
+            parent_change_token=parent_change_token,
+            sidecar_state=sidecar_state,
+            nofollow_fd=fd,
+        )
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _prepare_missing_database_file(path: Path) -> _OpenVerificationState:
+    if not _supports_database_dir_fd_create():
+        return _prepare_missing_database_file_without_dir_fd(path)
+
+    parent_fd = _open_parent_directory_for_create(path)
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            return _prepare_open_verification(path, create_missing=False)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PermissionError(f"refusing to open symlink: {path}") from exc
+            raise
+
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise PermissionError(f"database path changed during open: {path}")
+            if _has_windows_reparse_point(file_stat):
+                raise PermissionError(f"refusing to open NTFS reparse point: {path}")
+            _reject_hardlink_stat(path, file_stat)
+            _reject_unknown_windows_identity(path, file_stat)
+            parent_stat = os.fstat(parent_fd)
+            _reject_unknown_windows_identity(path.parent, parent_stat)
+            return _OpenVerificationState(
+                expected_identity=(file_stat.st_dev, file_stat.st_ino),
+                existing_path=True,
+                path_change_token=_stat_change_token(file_stat),
+                parent_identity=(parent_stat.st_dev, parent_stat.st_ino),
+                parent_change_token=_stat_change_token(parent_stat),
+                sidecar_state=_sqlite_sidecar_state(path),
+                nofollow_fd=fd,
+            )
+        except Exception:
+            os.close(fd)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def _supports_database_dir_fd_create() -> bool:
+    return os.open in os.supports_dir_fd
+
+
+def _allow_path_name_connect_without_fd_bound() -> bool:
+    return sys.platform == "win32"
+
+
+def _safe_sqlite_create_requires_fd_bound_connect(path: Path) -> PermissionError:
+    return PermissionError(f"safe SQLite create requires fd-bound open support: {path}")
+
+
+def _prepare_missing_database_file_without_dir_fd(path: Path) -> _OpenVerificationState:
+    if sys.platform != "win32":
+        raise _safe_sqlite_create_requires_fd_bound_connect(path)
+    from ahadiff.core.windows_sqlite import create_windows_sqlite_file
+
+    fd, directory_guard = create_windows_sqlite_file(path)
+    try:
+        file_stat = os.fstat(fd)
+        _reject_symlink_stat(path, file_stat)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PermissionError(f"database path changed during open: {path}")
+        _reject_hardlink_stat(path, file_stat)
+        _reject_unknown_windows_identity(path, file_stat)
+        parent_identity, parent_change_token = _parent_directory_state(path)
+        return _OpenVerificationState(
+            expected_identity=(file_stat.st_dev, file_stat.st_ino),
+            existing_path=True,
+            path_change_token=_stat_change_token(file_stat),
+            parent_identity=parent_identity,
+            parent_change_token=parent_change_token,
+            sidecar_state=_sqlite_sidecar_state(path),
+            nofollow_fd=fd,
+            windows_directory_guard=directory_guard,
+        )
+    except Exception:
+        try:
+            os.close(fd)
+        finally:
+            directory_guard.close()
+        raise
+
+
+def _open_parent_directory_for_create(path: Path) -> int:
+    parent = path.parent
+    parent_lstat = os.lstat(parent)
+    _reject_symlink_stat(parent, parent_lstat)
+    if not stat.S_ISDIR(parent_lstat.st_mode):
+        raise PermissionError(f"database path parent must be a directory: {parent}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(parent), flags)
+    try:
+        parent_stat = os.fstat(fd)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise PermissionError(f"database path parent must be a directory: {parent}")
+        if _has_windows_reparse_point(parent_stat):
+            raise PermissionError(f"refusing to open NTFS reparse point: {parent}")
+        _reject_unknown_windows_identity(parent, parent_stat)
+        if (parent_stat.st_dev, parent_stat.st_ino) != (
+            parent_lstat.st_dev,
+            parent_lstat.st_ino,
+        ):
+            raise PermissionError(f"database path parent changed during open: {parent}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _verify_opened_database_path(
+    conn: sqlite3.Connection,
+    requested_path: Path,
+    verification_state: _OpenVerificationState,
+) -> None:
+    actual_path = _main_database_path(conn)
+    if actual_path is None:
+        return
+
+    _verify_main_database_location(actual_path, requested_path)
+    try:
+        actual_stat = actual_path.stat()
+    except OSError as exc:
+        raise PermissionError(f"database path changed during open: {requested_path}") from exc
+    if not stat.S_ISREG(actual_stat.st_mode):
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    _reject_hardlink_stat(requested_path, actual_stat)
+    _reject_unknown_windows_identity(requested_path, actual_stat)
+
+    actual_identity = (actual_stat.st_dev, actual_stat.st_ino)
+    expected_identity = verification_state.expected_identity
+    if expected_identity is not None:
+        _verify_nofollow_fd_identity(requested_path, verification_state)
+        if actual_identity != expected_identity:
+            raise PermissionError(f"database path changed during open: {requested_path}")
+        _verify_parent_directory_unchanged(requested_path, verification_state)
+        return
+
+    if not verification_state.existing_path:
+        try:
+            requested_lstat = os.lstat(requested_path)
+        except FileNotFoundError as exc:
+            raise PermissionError(f"database path changed during open: {requested_path}") from exc
+        _reject_symlink_stat(requested_path, requested_lstat)
+        requested_stat = requested_path.stat()
+        if not stat.S_ISREG(requested_stat.st_mode):
+            raise PermissionError(f"database path changed during open: {requested_path}")
+        _reject_hardlink_stat(requested_path, requested_stat)
+        _reject_unknown_windows_identity(requested_path, requested_stat)
+        if (requested_stat.st_dev, requested_stat.st_ino) != actual_identity:
+            raise PermissionError(f"database path changed during open: {requested_path}")
+
+
+def _verify_nofollow_fd_identity(
+    requested_path: Path,
+    verification_state: _OpenVerificationState,
+) -> None:
+    expected_identity = verification_state.expected_identity
+    fd = verification_state.nofollow_fd
+    if expected_identity is None or fd is None:
+        return
+    try:
+        fd_stat = os.fstat(fd)
+    except OSError as exc:
+        raise PermissionError(f"database path changed during open: {requested_path}") from exc
+    if not stat.S_ISREG(fd_stat.st_mode):
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    if verification_state.windows_path_name_connect_without_fd_bound:
+        _reject_unknown_windows_identity(requested_path, fd_stat)
+    if (fd_stat.st_dev, fd_stat.st_ino) != expected_identity:
+        raise PermissionError(f"database path changed during open: {requested_path}")
+
+
+def _verify_parent_directory_unchanged(
+    requested_path: Path,
+    verification_state: _OpenVerificationState,
+) -> None:
+    expected_identity = verification_state.parent_identity
+    expected_change_token = verification_state.parent_change_token
+    if expected_identity is None or expected_change_token is None:
+        return
+    current_identity, current_change_token = _parent_directory_state(requested_path)
+    if current_identity == expected_identity and current_change_token == expected_change_token:
+        return
+    if current_identity != expected_identity:
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    try:
+        current_stat = os.lstat(requested_path)
+    except FileNotFoundError as exc:
+        raise PermissionError(f"database path changed during open: {requested_path}") from exc
+    _reject_symlink_stat(requested_path, current_stat)
+    if not stat.S_ISREG(current_stat.st_mode):
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    _reject_hardlink_stat(requested_path, current_stat)
+    _reject_unknown_windows_identity(requested_path, current_stat)
+    requested_identity = verification_state.expected_identity
+    current_requested_identity = (current_stat.st_dev, current_stat.st_ino)
+    if requested_identity is not None and current_requested_identity != requested_identity:
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    if _sqlite_sidecar_state(requested_path) != verification_state.sidecar_state:
+        raise _RetryOpenVerification
+    if verification_state.windows_path_name_connect_without_fd_bound:
+        # A journal can be created and removed between snapshots, leaving only
+        # a parent metadata change. Discard this ambiguous pathname connection
+        # and rebuild all path guards; never accept the already-open connection.
+        raise _RetryOpenVerification
+    if _stat_change_token(current_stat) == verification_state.path_change_token:
+        return
+    # A concurrent commit can change both timestamps while its journal/WAL is
+    # created and removed between our snapshots. A rename-and-restore can look
+    # identical, so never accept this connection. Close it and repeat every
+    # identity/link check on a fresh open; persistent churn still fails closed.
+    raise _RetryOpenVerification
+
+
+def _raise_if_parent_changed_during_failed_open(
+    requested_path: Path,
+    verification_state: _OpenVerificationState,
+) -> None:
+    _raise_if_requested_path_changed_during_failed_open(requested_path, verification_state)
+    expected_identity = verification_state.parent_identity
+    expected_change_token = verification_state.parent_change_token
+    if expected_identity is None or expected_change_token is None:
+        return
+    try:
+        current_identity, current_change_token = _parent_directory_state(requested_path)
+    except PermissionError as exc:
+        raise PermissionError(f"database path changed during open: {requested_path}") from exc
+    if current_identity != expected_identity or current_change_token != expected_change_token:
+        raise PermissionError(f"database path changed during open: {requested_path}")
+
+
+def _raise_if_requested_path_changed_during_failed_open(
+    requested_path: Path,
+    verification_state: _OpenVerificationState,
+) -> None:
+    expected_identity = verification_state.expected_identity
+    if expected_identity is None:
+        return
+    try:
+        current_stat = os.lstat(requested_path)
+    except FileNotFoundError as exc:
+        raise PermissionError(f"database path changed during open: {requested_path}") from exc
+    _reject_symlink_stat(requested_path, current_stat)
+    if not stat.S_ISREG(current_stat.st_mode):
+        raise PermissionError(f"database path changed during open: {requested_path}")
+    _reject_hardlink_stat(requested_path, current_stat)
+    if (current_stat.st_dev, current_stat.st_ino) != expected_identity:
+        raise PermissionError(f"database path changed during open: {requested_path}")
+
+
+def _parent_directory_state(path: Path) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError:
+        return None, None
+    _reject_symlink_stat(path.parent, parent_stat)
+    _reject_unknown_windows_identity(path.parent, parent_stat)
+    return (
+        (parent_stat.st_dev, parent_stat.st_ino),
+        (
+            _stat_time_ns(parent_stat, "st_mtime_ns", "st_mtime"),
+            _stat_time_ns(parent_stat, "st_ctime_ns", "st_ctime"),
+        ),
+    )
+
+
+def _sqlite_sidecar_state(path: Path) -> tuple[tuple[str, tuple[int, int] | None], ...]:
+    state: list[tuple[str, tuple[int, int] | None]] = []
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar_path = path.with_name(f"{path.name}{suffix}")
+        try:
+            sidecar_stat = os.lstat(sidecar_path)
+        except FileNotFoundError:
+            state.append((suffix, None))
+            continue
+        _reject_symlink_stat(sidecar_path, sidecar_stat)
+        if not stat.S_ISREG(sidecar_stat.st_mode):
+            raise PermissionError(f"refusing non-regular SQLite sidecar: {sidecar_path}")
+        _reject_hardlink_stat(sidecar_path, sidecar_stat)
+        _reject_unknown_windows_identity(sidecar_path, sidecar_stat)
+        state.append((suffix, (sidecar_stat.st_dev, sidecar_stat.st_ino)))
+    return tuple(state)
+
+
+def _stat_time_ns(st: os.stat_result, ns_attr: str, seconds_attr: str) -> int:
+    value = getattr(st, ns_attr, None)
+    if value is not None:
+        return int(value)
+    return int(float(getattr(st, seconds_attr)) * 1_000_000_000)
+
+
+def _stat_change_token(st: os.stat_result) -> tuple[int, int]:
+    return (
+        _stat_time_ns(st, "st_mtime_ns", "st_mtime"),
+        _stat_time_ns(st, "st_ctime_ns", "st_ctime"),
+    )
+
+
+def _main_database_path(conn: sqlite3.Connection) -> Path | None:
+    cursor = conn.execute("PRAGMA database_list")
+    try:
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+    if row is None:
+        return None
+    path_text = str(row[2])
+    if path_text == "":
+        return None
+    return Path(path_text)
+
+
+def _verify_main_database_location(actual_path: Path, requested_path: Path) -> None:
+    actual = _canonicalize_system_sqlite_path(actual_path.absolute())
+    requested = _canonicalize_system_sqlite_path(requested_path.absolute())
+    if os.path.normcase(str(actual)) != os.path.normcase(str(requested)):
+        raise PermissionError(f"database path changed during open: {requested_path}")
+
+
+def _sqlite_proc_fd_path(fd: int | None) -> Path | None:
+    if fd is None or not sys.platform.startswith("linux"):
+        return None
+    fd_path = Path("/proc/self/fd") / str(fd)
+    try:
+        fd_path.stat()
+    except OSError:
+        return None
+    return fd_path
+
+
+def _reject_symlink(p: Path) -> None:
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return
+
+    _reject_symlink_stat(p, st)
+
+
+def _reject_symlink_ancestors(path: Path) -> None:
+    absolute_path = path if path.is_absolute() else path.absolute()
+    anchor = absolute_path.anchor
+    if not anchor:
+        return
+    cursor = Path(anchor)
+    for part in absolute_path.parts[1:-1]:
+        cursor = cursor / part
+        try:
+            st = os.lstat(cursor)
+        except FileNotFoundError:
+            return
+        _reject_symlink_stat(cursor, st)
+        if not stat.S_ISDIR(st.st_mode):
+            raise PermissionError(f"database path parent must be a directory: {cursor}")
+
+
+def _reject_symlink_stat(path: Path, st: os.stat_result) -> None:
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(f"refusing to open symlink: {path}")
+    if _has_windows_reparse_point(st):
+        raise PermissionError(f"refusing to open NTFS reparse point: {path}")
+
+
+def _reject_hardlink_stat(path: Path, st: os.stat_result) -> None:
+    if sys.platform == "win32" and stat.S_ISREG(st.st_mode):
+        nlink = getattr(st, "st_nlink", 1)
+        if not isinstance(nlink, int) or nlink < 1:
+            raise PermissionError(f"database path link count unavailable: {path}")
+    if getattr(st, "st_nlink", 1) > 1:
+        raise PermissionError(f"refusing to open hardlinked database path: {path}")
+
+
+def _reject_unknown_windows_identity(path: Path, st: os.stat_result) -> None:
+    if sys.platform != "win32":
+        return
+    if getattr(st, "st_dev", 0) == 0 or getattr(st, "st_ino", 0) == 0:
+        raise PermissionError(f"database path identity unavailable: {path}")
+
+
+def _has_windows_reparse_point(st: os.stat_result) -> bool:
+    if sys.platform != "win32":
+        return False
+    attrs: Any = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & 0x400)
+
+
+def _close_nofollow_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    os.close(fd)
+
+
+def sqlite_runtime_version_tuple() -> tuple[int, int, int]:
+    parts = sqlite3.sqlite_version.split(".")
+    try:
+        major, minor, patch = (int(part) for part in parts[:3])
+    except (TypeError, ValueError):
+        return (0, 0, 0)
+    if len(parts) < 3 or min(major, minor, patch) < 0:
+        return (0, 0, 0)
+    return major, minor, patch
+
+
+def sqlite_runtime_gate_ok(version: tuple[int, int, int]) -> bool:
+    if version >= _SQLITE_MIN_VERSION:
+        return True
+    floor = _SQLITE_ALLOWED_BACKPORT_MINIMUMS.get(version[:2])
+    return floor is not None and version >= floor
+
+
+def sqlite_runtime_minimum_text() -> str:
+    return ".".join(str(part) for part in _SQLITE_MIN_VERSION)
+
+
+def sqlite_runtime_backports_text() -> str:
+    return ", ".join(
+        f"{'.'.join(str(part) for part in floor)}+"
+        for floor in sorted(_SQLITE_ALLOWED_BACKPORT_MINIMUMS.values())
+    )
+
+
+def sqlite_runtime_gate_requirement_message() -> str:
+    return (
+        f"Detected SQLite {sqlite3.sqlite_version}; requires >= {sqlite_runtime_minimum_text()} "
+        f"(or allowed backports {sqlite_runtime_backports_text()}). "
+        "A higher version number alone does not bypass the frozen gate."
+    )
+
+
+def sqlite_runtime_remedy() -> str:
+    return (
+        "Remedy: use a Python environment with SQLite >= "
+        f"{sqlite_runtime_minimum_text()} (or an allowed backport). "
+        "On Windows, CPython's bundled sqlite3.dll is often below this gate; use "
+        "conda/miniforge, replace DLLs/sqlite3.dll with a compatible SQLite build, or run "
+        "under WSL. On macOS/Linux, use Homebrew, OS packages, conda, or a Python build "
+        "linked against a compatible SQLite. "
+        f"This process is using Python's standard-library sqlite3 module from {sqlite3.__file__}."
+    )
+
+
+def sqlite_runtime_failure_message() -> str:
+    return (
+        f"SQLite runtime {sqlite3.sqlite_version} is below {sqlite_runtime_minimum_text()}; "
+        f"allowed backports are {sqlite_runtime_backports_text()}. {sqlite_runtime_remedy()}"
+    )
+
+
+def assert_sqlite_runtime_supported() -> None:
+    if sqlite_runtime_gate_ok(sqlite_runtime_version_tuple()):
+        return
+    raise StorageError(sqlite_runtime_failure_message())
+
+
+__all__ = [
+    "assert_sqlite_runtime_supported",
+    "mcp_readonly_connect",
+    "reject_symlink_path",
+    "safe_sqlite_connect",
+    "sqlite_runtime_backports_text",
+    "sqlite_runtime_failure_message",
+    "sqlite_runtime_gate_ok",
+    "sqlite_runtime_gate_requirement_message",
+    "sqlite_runtime_minimum_text",
+    "sqlite_runtime_remedy",
+    "sqlite_runtime_version_tuple",
+]

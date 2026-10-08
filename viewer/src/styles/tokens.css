@@ -1,0 +1,462 @@
+:root {
+  /* Surface */
+  --paper: #FAF8F2;
+  --subtle: #F3EFE4;
+  --elevated: #FFFFFF;
+
+  /* Text */
+  /* Light-mode contrast clears WCAG AAA (>= 7:1) on --paper for body ink and
+   * meets AA-large+ everywhere for muted.
+   * --muted #5F594C ≈ 6.55:1 on --paper #FAF8F2 and 6.05:1 on --subtle #F3EFE4.
+   * --muted-strong #6B6556 ≈ 5.0:1 on --subtle #F3EFE4 (AA; was #736D5E 4.48:1 which
+   * failed AA on --subtle, flagged by axe-core on the not-proven claim badge).
+   * --ink #141310 ≈ 17.49:1 on --paper (AAA). */
+  --ink: #141310;
+  --ink-strong: #38362F;
+  --muted: #5F594C;
+  --muted-strong: #6B6556;
+
+  /* Borders */
+  --hair: #E4E0D2;
+  --hair-strong: #CDC7B5;
+
+  /* Accent — light-mode accent must give >= 4.5:1 with --on-accent #FFFFFF.
+   * #B2462D on white ≈ 5.52:1 (AA). Prior #BE5236 was 4.7:1.
+   * accent-ink on accent-soft (#F9EBE5): #8A321E ≈ 7.06:1 (AAA). */
+  --on-accent: #FFFFFF;
+  --accent: #B2462D;
+  --accent-rgb: 178 70 45;
+  --accent-ink: #8A321E;
+  --accent-soft: #F9EBE5;
+  --accent-softer: #FAF0E8;
+  --accent-softest: #FDF1EC;
+  --accent-tint: #E4B8AE;
+  --accent-hair: #EBC3AE;
+
+  /* Diff */
+  --add-bg: #E4EFE0;
+  --add-fg: #2F6F4F;
+  --del-bg: #F6DCD5;
+  --del-fg: #A33D2B;
+
+  /* Semantic */
+  --success: #2F6F4F;
+  --warning: #955D13;
+  --danger: #A33D2B;
+  --danger-soft: #F7E2DC;
+  --info: #2E4A6B;
+  --info-soft: #E8EEF4;
+
+  /* Typography — fallback order: Latin primary → CJK secondary → generic system.
+   * Font strategy: local-first, bundled Latin serif. CSP restricts
+   * font-src to 'self' data:, so "Cormorant Garamond" (SIL OFL) ships via
+   * @fontsource (bundled by Vite, see main.tsx) rather than any CDN. The
+   * sans/mono stacks resolve from local() installs with broad system fallbacks;
+   * CJK glyphs fall to Noto Serif/Sans SC or Source Han where installed. */
+  --font-serif: "Cormorant Garamond", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", ui-serif, serif;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC", ui-monospace, monospace;
+
+  /* Editorial type scale — fluid display/heading sizes with tight leading and
+     negative tracking for the newspaper masthead look. Page CSS opts into
+     these on serif display/heading text. */
+  --fs-display: clamp(2.5rem, 5vw + 1rem, 4.2rem);
+  --lh-display: 1.02;
+  --ls-display: -0.03em;
+  --fs-h1: clamp(1.9rem, 3.2vw + 0.8rem, 3.2rem);
+  --lh-h1: 1.08;
+  --ls-h1: -0.02em;
+  --fs-h2: clamp(1.5rem, 2.2vw + 0.6rem, 2.1rem);
+  --lh-h2: 1.15;
+  --ls-h2: -0.015em;
+  --fs-h3: 1.125rem;
+  --lh-h3: 1.30;
+  --fs-eyebrow: 0.6875rem;
+  --ls-eyebrow: 0.20em;
+
+  /* Radius */
+  --radius-6: 6px;
+  --radius-8: var(--r-md);
+  --radius-10: 10px;
+  --radius-12: var(--r-lg);
+  --radius-pill: var(--r-full);
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 1px 0 rgba(180, 160, 130, 0.06), 0 4px 20px -16px rgba(120, 80, 40, 0.18);
+  --shadow-lg: 0 10px 28px -18px rgba(120, 80, 40, 0.3);
+  --shadow-brand: 0 2px 6px -2px rgba(176, 78, 40, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+
+  /* Focus ring */
+  --ring-focus: 0 0 0 2px var(--paper), 0 0 0 4px var(--accent);
+
+  /* Layering */
+  --z-base: 2;
+  --z-content-sticky: 10;
+  --z-content-sticky-raised: 11;
+  --z-floating: 20;
+  --z-sticky: 50;
+  --z-sticky-raised: 55;
+  --z-overlay: 60;
+  --z-dropdown: 70;
+  --z-modal: 80;
+  --z-toast: 100;
+
+  /* Motion */
+  --duration-fast: var(--dur-fast);
+  --duration-normal: var(--dur-base);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+
+  /* --- v6 Design System Tokens (66 additions) --- */
+
+  /* Spacing */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  /* Font size */
+  --fs-2xs: 0.72rem;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8rem;
+  --fs-base: 0.85rem;
+  --fs-md: 1rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.25rem;
+  --fs-2xl: 1.5rem;
+  --fs-3xl: 1.75rem;
+
+  /* Line height */
+  --lh-tight: 1.25;
+  --lh-snug: 1.375;
+  --lh-normal: 1.5;
+  --lh-relaxed: 1.625;
+
+  /* Radius (v6 naming) */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* Shadows (v6 naming) */
+  --sh-sm: 0 1px 0 rgba(180, 160, 130, 0.15);
+  --sh-md: 0 2px 0 rgba(180, 160, 130, 0.15), 0 4px 8px -4px rgba(120, 80, 40, 0.08);
+  --sh-lg: 0 4px 0 rgba(180, 160, 130, 0.1), 0 12px 24px -8px rgba(120, 80, 40, 0.15);
+  --sh-ring: 0 0 0 3px var(--accent-softer);
+
+  /* Duration (v6 naming) */
+  --dur-micro: 0.12s;
+  --dur-xfast: 0.15s;
+  --dur-fast: 0.15s;
+  --dur-base: 0.25s;
+  --dur-slow: 0.4s;
+  --dur-xslow: 0.6s;
+
+  /* Easing (v6 additions) */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-expo: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* Layout max-width */
+  --mw-prose: 680px;
+  --mw-content: 960px;
+  --mw-page: 1280px;
+  --mw-wide: 1440px;
+
+  /* Phase 2D: V6 responsive breakpoint reference (read-only).
+     CSS variables can't be used inside @media queries — these are the
+     authoritative breakpoint values that page CSS must use. Mirrors the V6
+     template breakpoints and risk register R1/R2.
+     --bp-xs: 540px   -- single-column small phones, body 15px
+     --bp-sm: 720px   -- 2-col card grids collapse to 1-col
+     --bp-md: 768px   -- KPI/agent/states grids collapse to 1-col, topbar search hides
+     --bp-md2: 780px  -- mode-grid 4→2 cols
+     --bp-lg: 900px   -- typography clamp + settings-layout 2-col collapse
+     --bp-lg2: 1024px -- mobile-drawer paradigm switch (≤1024 mobile, ≥1025 desktop)
+     --bp-xl: 1280px  -- large-screen page padding lift */
+  --bp-xs: 540px;
+  --bp-sm: 720px;
+  --bp-md: 768px;
+  --bp-md2: 780px;
+  --bp-lg: 900px;
+  --bp-lg2: 1024px;
+  --bp-xl: 1280px;
+
+  /* Ink variants */
+  --ink-2: #38362F;
+  --ink-3: #6B6559;
+  --ink-deep: #1F1E1B;
+  --ink-blackletter: #14130F;
+
+  /* Muted variants */
+  --muted-2: #6A6456;
+  --muted-3: #A8A39A;
+
+  /* Surface variants */
+  --paper-deep: #F3EFE4;
+  --surface-diff: #FDFCF8;
+  --surface-veil: rgba(255, 255, 255, 0.94);
+
+  /* Semantic soft/hair */
+  --success-soft: #ECF4EE;
+  --success-hair: #B9D7C1;
+  --warning-soft: #F7EED9;
+  --warning-soft-bg: #FBF5E6;
+  --warning-hair: #E3CDA1;
+  --danger-hair: #E4B8AE;
+
+  /* Brand */
+  --brand-anthropic: #D97757;
+  --brand-anthropic-ink: #B8542F;
+  --brand-anthropic-soft: #F6E8DF;
+
+  /* Stamp / Editorial */
+  --stamp-verified: #2E4A6B;
+  --stamp-verified-ink: #1F3450;
+  --stamp-verified-tint: rgba(46, 74, 107, 0.05);
+  --stamp-verified-frame: rgba(46, 74, 107, 0.42);
+  --stamp-verified-shadow: rgba(46, 74, 107, 0.22);
+  --stamp-red: #B23A2C;
+  --stamp-red-ink: #7E2318;
+  --folio-line: #1C1B18;
+  --ornament-ink: #A33D2B;
+
+  /* Weight */
+  --bolder-thin: 260;
+  --bolder-bold: 760;
+
+  /* Focus ring (v6 naming) */
+  --ring-offset: 3px;
+  --ring-color: var(--accent-ink);
+  --ring-halo: 0 0 0 4px rgba(210, 112, 80, 0.18);
+
+  /* BOLDER v1 editorial overlay */
+  --ink-display: #15130F;
+  --accent-deep: #8C3A1A;
+  --shadow-editorial: inset 0 1px 0 rgba(210,112,80,.08), 0 28px 40px -12px rgba(28,27,24,.12), 0 4px 12px -2px rgba(28,27,24,.06);
+  --ease-editorial: cubic-bezier(.22,.61,.36,1);
+
+  /* Compatibility aliases — map alternative naming conventions to canonical tokens.
+     These are lazy-resolved, so dark-mode overrides of the underlying tokens apply automatically. */
+  --surface: var(--elevated);
+  --border: var(--hair);
+  --border-subtle: var(--hair);
+  --ink-muted: var(--muted);
+  --bg-page: var(--paper);
+  --bg-hover: var(--subtle);
+  --fg-muted: var(--muted);
+  --accent-faint: var(--accent-softest);
+  --success-faint: #E8F5E9;
+  --danger-faint: #FFEBEE;
+  --sp-0-5: 2px;
+  --r-xs: 2px;
+  --dur-normal: var(--dur-base);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #131210;
+    --subtle: #1C1B18;
+    --elevated: #262521;
+
+    --ink: #EBE8DD;
+    --ink-strong: #F2EFE7;
+    /* Dark-mode muted clears WCAG AAA 7:1 on every dark surface
+       (paper / subtle / elevated). #C0B9AB ≈ 7.87:1 on --elevated #262521,
+       the worst surface, and 9.6:1 on --paper #131210. */
+    --muted: #C0B9AB;
+    --muted-strong: #DBD5CB;
+
+    --hair: #2C2A25;
+    --hair-strong: #3F3C35;
+
+    --on-accent: #131210;
+    /* Dark accent diverges from light --accent #B2462D to a warmer,
+     * higher-luminance terracotta (#E88466) so it stays distinguishable on
+     * dark surfaces and gives accent-ink room to clear AAA on --elevated. */
+    --accent: #E88466;
+    --accent-rgb: 232 132 102;
+    /* #F0A58F ≈ 7.66:1 on --elevated #262521 (AAA). */
+    --accent-ink: #F0A58F;
+    --accent-soft: rgba(232, 132, 102, 0.15);
+    --accent-softer: rgba(210, 112, 80, 0.08);
+    --accent-softest: rgba(210, 112, 80, 0.04);
+    --accent-tint: rgba(210, 112, 80, 0.12);
+    --accent-hair: rgba(210, 112, 80, 0.25);
+
+    --add-bg: rgba(47, 111, 79, 0.15);
+    --add-bg-strong: rgba(47, 111, 79, 0.35);
+    /* Add/del foregrounds also appear on --elevated (claim badges live in the
+       evidence panel), so their AAA target is the worst dark surface. */
+    --add-fg: #95D4B4;
+    --del-bg: rgba(163, 61, 43, 0.15);
+    --del-bg-strong: rgba(163, 61, 43, 0.35);
+    --del-fg: #F4B7AC;
+
+    /* Semantic foregrounds lifted to clear WCAG AAA 7:1 on all dark
+       surfaces (paper / subtle / elevated).  Old values only passed on
+       --paper; e.g. --danger #E09080 was 4.88:1 on --elevated. */
+    --success: #A1D2B8;
+    --warning: #E5C18C;
+    --danger: #ECBCB2;
+    --danger-soft: rgba(163, 61, 43, 0.12);
+    --info: #B3C9E0;
+    --info-soft: rgba(46, 74, 107, 0.12);
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+    --shadow-md: 0 1px 0 rgba(0, 0, 0, 0.15), 0 4px 20px -16px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 10px 28px -18px rgba(0, 0, 0, 0.5);
+    --shadow-brand: 0 2px 6px -2px rgba(210, 112, 80, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+
+    --ring-focus: 0 0 0 3px rgba(210, 112, 80, 0.35);
+
+    /* --- v6 tokens: dark mode overrides --- */
+
+    /* Shadows (v6 naming) */
+    --sh-sm: 0 1px 0 rgba(0, 0, 0, 0.15);
+    --sh-md: 0 1px 0 rgba(0, 0, 0, 0.15), 0 4px 20px -16px rgba(0, 0, 0, 0.4);
+    --sh-lg: 0 2px 4px -1px rgba(0, 0, 0, 0.2), 0 18px 50px -30px rgba(0, 0, 0, 0.5);
+
+    /* Ink variants — text on dark surfaces, AAA >= 7.0:1 on --elevated #38362F */
+    --ink-2: #D8D3C8;
+    --ink-3: #D0CABF;
+    --ink-deep: #EBE8DD;
+    --ink-blackletter: #F5F2E9;
+
+    /* Muted variants */
+    --muted-2: #D5D0C5;
+    --muted-3: #CCC7BC;
+
+    /* Surface variants */
+    --paper-deep: #1A1918;
+    --surface-diff: #211F1C;
+    --surface-veil: rgba(28, 27, 24, 0.94);
+
+    /* Semantic soft/hair — use rgba on dark backgrounds */
+    --success-soft: rgba(47, 111, 79, 0.10);
+    --success-hair: rgba(47, 111, 79, 0.25);
+    --warning-soft: rgba(148, 98, 22, 0.10);
+    --warning-soft-bg: rgba(148, 98, 22, 0.06);
+    --warning-hair: rgba(148, 98, 22, 0.25);
+    --danger-hair: rgba(163, 61, 43, 0.25);
+
+    /* Brand */
+    --brand-anthropic: #D97757;
+    --brand-anthropic-ink: #E8A080;
+    --brand-anthropic-soft: rgba(217, 119, 87, 0.12);
+
+    /* Stamp / Editorial */
+    --stamp-verified: #8FAECF;
+    --stamp-verified-ink: #A8C4DE;
+    --stamp-verified-tint: rgba(143, 174, 207, 0.06);
+    --stamp-verified-frame: rgba(143, 174, 207, 0.30);
+    --stamp-verified-shadow: rgba(0, 0, 0, 0.30);
+    --stamp-red: #E8A090;
+    --stamp-red-ink: #F0B8A8;
+    --folio-line: #E6E3D8;
+    --ornament-ink: #ECBCB2;
+
+    /* Focus ring (v6 naming) */
+    --ring-halo: 0 0 0 4px rgba(210, 112, 80, 0.30);
+
+    /* BOLDER v1 editorial overlay (dark) */
+    --ink-display: #F5F3EE;
+    --accent-deep: #E8A080;
+    --shadow-editorial: inset 0 1px 0 rgba(210,112,80,.12), 0 28px 40px -12px rgba(0,0,0,.3), 0 4px 12px -2px rgba(0,0,0,.15);
+
+    /* Compatibility aliases — dark overrides */
+    --success-faint: rgba(47, 111, 79, 0.08);
+    --danger-faint: rgba(163, 61, 43, 0.08);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #131210;
+  --subtle: #1C1B18;
+  --elevated: #262521;
+  --ink: #EBE8DD;
+  --ink-strong: #F2EFE7;
+  --muted: #C0B9AB;
+  --muted-strong: #DBD5CB;
+  --hair: #2C2A25;
+  --hair-strong: #3F3C35;
+  --on-accent: #131210;
+  --accent: #E88466;
+  --accent-rgb: 232 132 102;
+  --accent-ink: #F0A58F;
+  --accent-soft: rgba(232, 132, 102, 0.15);
+  --accent-softer: rgba(210, 112, 80, 0.08);
+  --accent-softest: rgba(210, 112, 80, 0.04);
+  --accent-tint: rgba(210, 112, 80, 0.12);
+  --accent-hair: rgba(210, 112, 80, 0.25);
+  --add-bg: rgba(47, 111, 79, 0.15);
+  --add-bg-strong: rgba(47, 111, 79, 0.35);
+  --add-fg: #95D4B4;
+  --del-bg: rgba(163, 61, 43, 0.15);
+  --del-bg-strong: rgba(163, 61, 43, 0.35);
+  --del-fg: #F4B7AC;
+  --success: #A1D2B8;
+  --warning: #E5C18C;
+  --danger: #ECBCB2;
+  --danger-soft: rgba(163, 61, 43, 0.12);
+  --info: #B3C9E0;
+  --info-soft: rgba(46, 74, 107, 0.12);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 1px 0 rgba(0, 0, 0, 0.15), 0 4px 20px -16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 28px -18px rgba(0, 0, 0, 0.5);
+  --shadow-brand: 0 2px 6px -2px rgba(210, 112, 80, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --ring-focus: 0 0 0 3px rgba(210, 112, 80, 0.35);
+  --sh-sm: 0 1px 0 rgba(0, 0, 0, 0.15);
+  --sh-md: 0 1px 0 rgba(0, 0, 0, 0.15), 0 4px 20px -16px rgba(0, 0, 0, 0.4);
+  --sh-lg: 0 2px 4px -1px rgba(0, 0, 0, 0.2), 0 18px 50px -30px rgba(0, 0, 0, 0.5);
+  --ink-2: #D8D3C8;
+  --ink-3: #D0CABF;
+  --ink-deep: #EBE8DD;
+  --ink-blackletter: #F5F2E9;
+  --muted-2: #D5D0C5;
+  --muted-3: #CCC7BC;
+  --paper-deep: #1A1918;
+  --surface-diff: #211F1C;
+  --surface-veil: rgba(28, 27, 24, 0.94);
+  --success-soft: rgba(47, 111, 79, 0.10);
+  --success-hair: rgba(47, 111, 79, 0.25);
+  --warning-soft: rgba(148, 98, 22, 0.10);
+  --warning-soft-bg: rgba(148, 98, 22, 0.06);
+  --warning-hair: rgba(148, 98, 22, 0.25);
+  --danger-hair: rgba(163, 61, 43, 0.25);
+  --brand-anthropic: #D97757;
+  --brand-anthropic-ink: #E8A080;
+  --brand-anthropic-soft: rgba(217, 119, 87, 0.12);
+  --stamp-verified: #8FAECF;
+  --stamp-verified-ink: #A8C4DE;
+  --stamp-verified-tint: rgba(143, 174, 207, 0.06);
+  --stamp-verified-frame: rgba(143, 174, 207, 0.30);
+  --stamp-verified-shadow: rgba(0, 0, 0, 0.30);
+  --stamp-red: #E8A090;
+  --stamp-red-ink: #F0B8A8;
+  --folio-line: #E6E3D8;
+  --ornament-ink: #ECBCB2;
+  --ring-halo: 0 0 0 4px rgba(210, 112, 80, 0.30);
+  --ink-display: #F5F3EE;
+  --accent-deep: #E8A080;
+  --shadow-editorial: inset 0 1px 0 rgba(210,112,80,.12), 0 28px 40px -12px rgba(0,0,0,.3), 0 4px 12px -2px rgba(0,0,0,.15);
+
+  /* Compatibility aliases — dark overrides */
+  --success-faint: rgba(47, 111, 79, 0.08);
+  --danger-faint: rgba(163, 61, 43, 0.08);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}

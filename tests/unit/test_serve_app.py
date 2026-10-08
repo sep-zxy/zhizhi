@@ -1,0 +1,4163 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+import pytest
+from pydantic import ValidationError
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+import ahadiff.serve.locale as serve_locale_module
+import ahadiff.serve.lock as serve_lock_module
+import ahadiff.serve.middleware as middleware_module
+import ahadiff.serve.routes_locale as routes_locale_module
+import ahadiff.serve.routes_review as routes_review_module
+import ahadiff.serve.routes_runs as routes_runs_module
+import ahadiff.serve.routes_signals as routes_signals_module
+from ahadiff.contracts import QuizChoice, ResultEvent, ReviewCard, RunArtifactEnvelope
+from ahadiff.eval.results import finalized_artifact_digest
+from ahadiff.git.repo import repo_write_lock
+from ahadiff.review.database import (
+    CURRENT_SCHEMA_VERSION,
+    connect_review_db,
+    import_cards_from_jsonl,
+    initialize_review_db,
+    load_finalized_ratchet_history_page,
+    load_result_event_by_run_and_id,
+    load_result_events_page,
+    sync_result_event,
+    upsert_concept,
+)
+from ahadiff.serve import ServeState, create_app
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator
+
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.types import Message, Receive, Scope, Send
+
+
+@pytest.fixture(autouse=True)
+def _clear_capability_level_warning_runs() -> Generator[None]:  # pyright: ignore[reportUnusedFunction]
+    routes_runs_module._CAPABILITY_LEVEL_WARNING_RUNS.clear()  # pyright: ignore[reportPrivateUsage]
+    yield
+    routes_runs_module._CAPABILITY_LEVEL_WARNING_RUNS.clear()  # pyright: ignore[reportPrivateUsage]
+
+
+def _client(
+    state_dir: Path,
+    *,
+    token: str = "test-token",
+    locale: Literal["en", "zh-CN"] = "en",
+) -> TestClient:
+    app = create_app(ServeState(state_dir=state_dir, token=token, locale=locale))
+    return TestClient(app, base_url="http://localhost:8765")
+
+
+_WRITE_HEADERS = {"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"}
+
+
+def _middleware_client(endpoint: Callable[[Request], Awaitable[Response]]) -> TestClient:
+    app = Starlette(routes=[Route("/probe", endpoint, methods=["GET", "POST"])])
+    app.state.ahadiff = SimpleNamespace(port=8765)
+    app.add_middleware(middleware_module.WriteRateLimitMiddleware)
+    app.add_middleware(middleware_module.LoopbackGuardMiddleware)
+    app.add_middleware(middleware_module.RequestTimeoutMiddleware)
+    return TestClient(app, base_url="http://localhost:8765")
+
+
+def _zero_identity_stat(path_stat: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_mode=path_stat.st_mode,
+        st_size=path_stat.st_size,
+        st_dev=0,
+        st_ino=0,
+        st_nlink=1,
+        st_mtime=path_stat.st_mtime,
+        st_ctime=path_stat.st_ctime,
+        st_mtime_ns=getattr(path_stat, "st_mtime_ns", int(path_stat.st_mtime * 1_000_000_000)),
+        st_ctime_ns=getattr(path_stat, "st_ctime_ns", int(path_stat.st_ctime * 1_000_000_000)),
+    )
+
+
+def _patch_routes_zero_identity_lstat(
+    monkeypatch: pytest.MonkeyPatch,
+    target_path: Path,
+) -> None:
+    original_lstat = routes_runs_module.os.lstat
+
+    def fake_lstat(path: Any) -> Any:
+        path_stat = original_lstat(path)
+        if Path(cast("str | Path", path)) == target_path:
+            return _zero_identity_stat(path_stat)
+        return path_stat
+
+    monkeypatch.setattr(routes_runs_module.os, "lstat", fake_lstat)
+
+
+def _validation_errors(body: dict[str, Any]) -> list[dict[str, Any]]:
+    details_obj = body.get("details")
+    assert isinstance(details_obj, dict)
+    details = cast("dict[str, Any]", details_obj)
+    errors = details.get("errors")
+    assert isinstance(errors, list)
+    return cast("list[dict[str, Any]]", errors)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _event(
+    run_id: str,
+    *,
+    status: str = "keep",
+    source_ref: str = "abc1234",
+    event_id: str | None = None,
+    timestamp: str | None = None,
+    note_json: str | None = None,
+) -> ResultEvent:
+    return ResultEvent(
+        event_id=event_id or f"018f0f52-91c0-7abc-8123-{run_id[-1]:0>12}",
+        run_id=run_id,
+        event_type="learn",
+        timestamp=timestamp or f"2026-04-24T00:00:0{run_id[-1]}Z",
+        source_ref=source_ref,
+        base_ref="base1234",
+        prompt_version="prompt123",
+        eval_bundle_version="eval123",
+        rubric_version="rubric-v1",
+        overall=88.0,
+        verdict="PASS",
+        status=cast("Any", status),
+        weakest_dim="evidence",
+        note_json=note_json,
+    )
+
+
+def _write_run(
+    state_dir: Path,
+    run_id: str,
+    *,
+    finalized: bool = True,
+    content_lang: str = "en",
+) -> Path:
+    run_path = state_dir / "runs" / run_id
+    run_path.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_path / "metadata.json",
+        {
+            "run_id": run_id,
+            "source_kind": "git_ref",
+            "source_ref": "abc1234",
+            "content_lang": content_lang,
+            "capability_level": 2,
+            "degraded_flags": {"diff_clipped": True},
+        },
+    )
+    (run_path / "patch.diff").write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+    (run_path / "claims.jsonl").write_text('{"claim_id":"claim-1"}\n', encoding="utf-8")
+    lesson_dir = run_path / "lesson"
+    lesson_dir.mkdir()
+    (lesson_dir / "lesson.full.md").write_text("full lesson\n", encoding="utf-8")
+    (lesson_dir / "lesson.hint.md").write_text("hint lesson\n", encoding="utf-8")
+    (lesson_dir / "lesson.compact.md").write_text("compact lesson\n", encoding="utf-8")
+    quiz_dir = run_path / "quiz"
+    quiz_dir.mkdir()
+    (quiz_dir / "quiz.jsonl").write_text('{"question":"What changed?"}\n', encoding="utf-8")
+    if finalized:
+        artifact_count, checksum = finalized_artifact_digest(run_path)
+        _write_json(
+            run_path / "finalized.json",
+            {
+                "run_id": run_id,
+                "event_id": f"018f0f52-91c0-7abc-8123-{run_id[-1]:0>12}",
+                "finalized_at": f"2026-04-24T00:00:0{run_id[-1]}Z",
+                "artifact_count": artifact_count,
+                "checksum": checksum,
+                "status": "keep",
+            },
+        )
+    return run_path
+
+
+def _finalize_run(run_path: Path, run_id: str) -> None:
+    artifact_count, checksum = finalized_artifact_digest(run_path)
+    _write_json(
+        run_path / "finalized.json",
+        {
+            "run_id": run_id,
+            "event_id": f"018f0f52-91c0-7abc-8123-{run_id[-1]:0>12}",
+            "finalized_at": f"2026-04-24T00:00:0{run_id[-1]}Z",
+            "artifact_count": artifact_count,
+            "checksum": checksum,
+            "status": "keep",
+        },
+    )
+
+
+def _write_graphify_metadata(run_path: Path, graphify: dict[str, Any]) -> None:
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata["graphify"] = graphify
+    _write_json(run_path / "metadata.json", cast("dict[str, Any]", metadata))
+
+
+def test_healthz_and_loopback_host_guard(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    assert client.get("/healthz").json() == {"ok": True}
+    blocked = client.get("/healthz", headers={"host": "evil.example"})
+
+    assert blocked.status_code == 400
+    assert blocked.json()["error"] == "host_not_allowed"
+
+
+def test_loopback_guard_error_responses_include_status(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    cases = (
+        (client.get("/healthz", headers={"host": "evil.example"}), "host_not_allowed", 400),
+        (
+            client.put(
+                "/api/locale",
+                headers={"X-AhaDiff-Token": "test-token"},
+                json={"lang": "zh-CN"},
+            ),
+            "origin_or_referer_required",
+            403,
+        ),
+        (
+            client.put(
+                "/api/locale",
+                headers={"origin": "https://evil.example", "X-AhaDiff-Token": "test-token"},
+                json={"lang": "zh-CN"},
+            ),
+            "origin_not_allowed",
+            403,
+        ),
+        (
+            client.put(
+                "/api/locale",
+                headers={"referer": "https://evil.example", "X-AhaDiff-Token": "test-token"},
+                json={"lang": "zh-CN"},
+            ),
+            "referer_not_allowed",
+            403,
+        ),
+        (
+            client.post(
+                "/api/signals/helpfulness",
+                headers={
+                    "origin": "http://localhost:8765",
+                    "X-AhaDiff-Token": "test-token",
+                    "content-type": "text/html",
+                },
+                content=b"{}",
+            ),
+            "unsupported_media_type",
+            415,
+        ),
+        (
+            client.post(
+                "/api/signals/helpfulness",
+                headers={
+                    "origin": "http://localhost:8765",
+                    "X-AhaDiff-Token": "test-token",
+                    "content-type": "application/json",
+                },
+                content=b"x" * (1024 * 1024 + 1),
+            ),
+            "payload_too_large",
+            413,
+        ),
+    )
+
+    for response, error, status in cases:
+        assert response.status_code == status
+        body = response.json()
+        assert body["error"] == error
+        assert body["status"] == status
+        assert "error_code" in body
+
+
+def test_proxy_trace_headers_are_rejected(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    health = client.get("/healthz", headers={"x-forwarded-for": "203.0.113.10"})
+    write = client.put(
+        "/api/locale",
+        headers={
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+            "Forwarded": "for=203.0.113.10;proto=http",
+        },
+        json={"lang": "zh-CN"},
+    )
+
+    assert health.status_code == 400
+    assert health.json()["error"] == "proxy_headers_not_allowed"
+    assert health.json()["error_code"] == "INPUT_BAD_FIELD"
+    assert write.status_code == 400
+    assert write.json()["error"] == "proxy_headers_not_allowed"
+    assert write.json()["error_code"] == "INPUT_BAD_FIELD"
+
+
+def test_db_check_endpoint_requires_token_and_reports_counts(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    blocked = client.post("/api/db/check", headers={"origin": "http://localhost:8765"})
+    response = client.post("/api/db/check", headers=_WRITE_HEADERS)
+
+    assert blocked.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "healthy": True,
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "quick_check": "ok",
+        "event_count": 1,
+        "card_count": 0,
+    }
+
+
+def test_db_check_endpoint_does_not_initialize_empty_database(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    db_path = state_dir / "review.sqlite"
+    sqlite3.connect(db_path).close()
+    client = _client(state_dir)
+
+    response = client.post("/api/db/check", headers=_WRITE_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "healthy": False,
+        "schema_version": 0,
+        "quick_check": "ok",
+        "event_count": 0,
+        "card_count": 0,
+    }
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            == []
+        )
+
+
+def test_origin_guard_rejects_non_loopback_write_origin(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.put(
+        "/api/locale",
+        headers={"origin": "https://evil.example", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "origin_not_allowed"
+
+
+def test_cors_preflight_allows_loopback_origin_with_headers(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.options(
+        "/api/locale",
+        headers={
+            "origin": "http://localhost:8765",
+            "access-control-request-method": "PUT",
+            "access-control-request-headers": "X-AhaDiff-Token, Content-Type",
+        },
+    )
+
+    assert response.status_code == 204
+    assert response.headers["access-control-allow-origin"] == "http://localhost:8765"
+    assert response.headers["access-control-allow-methods"] == (
+        "GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE"
+    )
+    assert response.headers["access-control-allow-headers"] == ("Content-Type, X-AhaDiff-Token")
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert response.headers["vary"] == "Origin"
+
+
+def test_cors_preflight_rejects_non_loopback_origin(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.options(
+        "/api/locale",
+        headers={
+            "origin": "https://evil.example",
+            "access-control-request-method": "PUT",
+            "access-control-request-headers": "X-AhaDiff-Token, Content-Type",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "origin_not_allowed"
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_actual_response_allows_loopback_origin(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.put(
+        "/api/locale",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:8765"
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert response.headers["vary"] == "Origin"
+
+
+def test_security_headers_include_restrictive_csp(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.get("/api/locale")
+
+    assert response.status_code == 200
+    assert response.headers["content-security-policy"] == (
+        middleware_module._CONTENT_SECURITY_POLICY  # pyright: ignore[reportPrivateUsage]
+    )
+    csp = response.headers["content-security-policy"]
+    for directive in (
+        "default-src 'self'",
+        "script-src 'self'",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+    ):
+        assert directive in csp
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "same-origin"
+
+
+def test_write_routes_require_token(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    denied = client.put(
+        "/api/locale",
+        headers={"origin": "http://localhost:8765"},
+        json={"lang": "zh-CN"},
+    )
+    accepted = client.put(
+        "/api/locale",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert denied.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.headers["access-control-allow-origin"] == "http://localhost:8765"
+    assert accepted.headers["access-control-allow-credentials"] == "true"
+    assert "ahadiff_lang=zh-CN" in accepted.headers["set-cookie"]
+    assert client.get("/api/locale").json() == {"locale": "zh-CN"}
+
+
+def test_put_locale_persists_and_updates_config_lang(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    app = create_app(
+        ServeState(state_dir=state_dir, token="test-token", locale="en", config_lang="en")
+    )
+    client = TestClient(app, base_url="http://localhost:8765")
+
+    accepted = client.put(
+        "/api/locale",
+        headers=_WRITE_HEADERS,
+        json={"lang": "zh-CN"},
+    )
+    client.cookies.clear()
+    resolved = client.get("/api/locale")
+    accept_language = client.get("/api/locale", headers={"accept-language": "en"})
+    runtime_state = cast("ServeState", app.state.ahadiff)
+
+    assert accepted.status_code == 200
+    assert resolved.json() == {"locale": "zh-CN"}
+    assert accept_language.json() == {"locale": "en"}
+    assert runtime_state.config_lang == "zh-CN"
+    assert 'lang = "zh-CN"' in (state_dir / "config.toml").read_text(encoding="utf-8")
+
+
+def test_put_locale_persists_under_repo_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    events: list[str] = []
+
+    class RecordingLock:
+        def __enter__(self) -> None:
+            events.append("enter")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+            events.append("exit")
+
+    def fake_lock(_state: object, *, command: str) -> RecordingLock:
+        events.append(command)
+        return RecordingLock()
+
+    monkeypatch.setattr(routes_locale_module, "serve_repo_write_lock", fake_lock)
+    client = _client(state_dir)
+
+    response = client.put(
+        "/api/locale",
+        headers=_WRITE_HEADERS,
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 200
+    assert events == ["serve locale update", "enter", "exit"]
+
+
+def test_put_locale_updates_runtime_under_repo_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    app = create_app(
+        ServeState(state_dir=state_dir, token="test-token", locale="en", config_lang="en")
+    )
+    events: list[str] = []
+
+    class RecordingLock:
+        def __enter__(self) -> None:
+            events.append("enter")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+            runtime_state = cast("ServeState", app.state.ahadiff)
+            events.append(f"exit:{runtime_state.config_lang}")
+
+    def fake_lock(_state: object, *, command: str) -> RecordingLock:
+        events.append(command)
+        return RecordingLock()
+
+    monkeypatch.setattr(routes_locale_module, "serve_repo_write_lock", fake_lock)
+    client = TestClient(app, base_url="http://localhost:8765")
+
+    response = client.put(
+        "/api/locale",
+        headers=_WRITE_HEADERS,
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 200
+    assert events == ["serve locale update", "enter", "exit:zh-CN"]
+
+
+def test_put_locale_does_not_update_runtime_when_persist_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    app = create_app(
+        ServeState(state_dir=state_dir, token="test-token", locale="en", config_lang="en")
+    )
+    client = TestClient(app, base_url="http://localhost:8765", raise_server_exceptions=False)
+
+    def fail_persist(_state: ServeState, _lang: str) -> None:
+        raise PermissionError("permission denied: /tmp/private/config.toml")
+
+    monkeypatch.setattr(routes_locale_module, "_persist_lang", fail_persist)
+
+    response = client.put(
+        "/api/locale",
+        headers=_WRITE_HEADERS,
+        json={"lang": "zh-CN"},
+    )
+    runtime_state = cast("ServeState", app.state.ahadiff)
+
+    assert response.status_code == 500
+    assert response.json()["error_code"] == "STORAGE_FS"
+    assert "/tmp/private" not in response.json()["error"]
+    assert runtime_state.locale == "en"
+    assert runtime_state.config_lang == "en"
+    assert client.get("/api/locale").json() == {"locale": "en"}
+
+
+def test_locale_resolves_cookie_accept_language_and_serve_state(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff", locale="zh-CN")
+
+    from_state = client.get("/api/locale")
+    from_accept_language = client.get(
+        "/api/locale",
+        headers={"accept-language": "en;q=0.1, zh-Hans-CN;q=0.9"},
+    )
+    client.cookies.set("ahadiff_lang", "zh-CN")
+    from_cookie = client.get("/api/locale", headers={"accept-language": "en"})
+
+    assert from_state.json() == {"locale": "zh-CN"}
+    assert from_accept_language.json() == {"locale": "zh-CN"}
+    assert from_cookie.json() == {"locale": "zh-CN"}
+
+
+def test_locale_resolver_receives_cli_and_config_lang_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str | None] = {}
+
+    def fake_resolve_locale(**kwargs: str | None) -> Literal["en", "zh-CN"]:
+        captured.update(kwargs)
+        return "zh-CN"
+
+    monkeypatch.setattr(serve_locale_module, "resolve_locale", fake_resolve_locale)
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path / ".ahadiff",
+            token="test-token",
+            locale="en",
+            cli_lang="zh-CN",
+            config_lang="en",
+        )
+    )
+    client = TestClient(app, base_url="http://localhost:8765")
+
+    response = client.get("/api/locale")
+
+    assert response.json() == {"locale": "zh-CN"}
+    assert captured["cli_lang"] == "zh-CN"
+    assert captured["config_lang"] == "en"
+
+
+def test_serve_state_locale_update_preserves_runtime_fields(tmp_path: Path) -> None:
+    state = ServeState(
+        state_dir=tmp_path / ".ahadiff",
+        token="token",
+        locale="en",
+        bind_host="127.0.0.1",
+        port=8766,
+    ).with_runtime_lock()
+
+    updated = state.with_locale("zh-CN")
+
+    assert updated.locale == "zh-CN"
+    assert updated.config_lang == "zh-CN"
+    assert updated.state_dir == state.state_dir
+    assert updated.token == state.token
+    assert updated.bind_host == state.bind_host
+    assert updated.port == state.port
+    assert updated.write_lock is state.write_lock
+    assert updated.repo_lock_path == state.repo_lock_path
+    assert updated.thread_write_lock is state.thread_write_lock
+
+
+def test_serve_state_bind_port_and_token_survive_headless_runtime(tmp_path: Path) -> None:
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path / ".ahadiff",
+            token="headless-token",
+            bind_host="127.0.0.1",
+            port=9123,
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1:9123")
+    runtime_state = cast("ServeState", app.state.ahadiff)
+
+    assert client.get("/healthz").json() == {"ok": True}
+    assert client.get("/api/auth/token", headers={"sec-fetch-site": "same-origin"}).json() == {
+        "token": "headless-token",
+        "expires_at": None,
+    }
+    assert runtime_state.bind_host == "127.0.0.1"
+    assert runtime_state.port == 9123
+    assert runtime_state.token == "headless-token"
+
+
+def test_auth_token_bootstrap_requires_same_origin_browser_signal(tmp_path: Path) -> None:
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path / ".ahadiff",
+            token="bootstrap-token",
+            bind_host="127.0.0.1",
+            port=9123,
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1:9123")
+
+    missing = client.get("/api/auth/token")
+    cross_site = client.get("/api/auth/token", headers={"sec-fetch-site": "cross-site"})
+    same_origin = client.get("/api/auth/token", headers={"sec-fetch-site": "same-origin"})
+    referer = client.get(
+        "/api/auth/token",
+        headers={"referer": "http://127.0.0.1:9123/app"},
+    )
+
+    assert missing.status_code == 401
+    assert missing.json()["error_code"] == "AUTH_REQUIRED"
+    assert cross_site.status_code == 401
+    assert same_origin.status_code == 200
+    assert same_origin.json()["token"] == "bootstrap-token"
+    assert referer.status_code == 200
+    assert referer.json()["token"] == "bootstrap-token"
+
+
+def test_auth_token_bootstrap_accepts_same_origin_post(tmp_path: Path) -> None:
+    app = create_app(
+        ServeState(
+            state_dir=tmp_path / ".ahadiff",
+            token="post-bootstrap-token",
+            bind_host="127.0.0.1",
+            port=9123,
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1:9123")
+
+    allowed = client.post(
+        "/api/auth/token",
+        headers={"origin": "http://127.0.0.1:9123"},
+    )
+    blocked = client.post(
+        "/api/auth/token",
+        headers={"origin": "http://evil.test:9123"},
+    )
+
+    assert allowed.status_code == 200
+    assert allowed.json() == {"token": "post-bootstrap-token", "expires_at": None}
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == "origin_not_allowed"
+
+
+def test_write_routes_require_loopback_origin_or_referer(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    missing = client.put(
+        "/api/locale",
+        headers={"X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+    wrong_port = client.put(
+        "/api/locale",
+        headers={"origin": "http://localhost:9999", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+    referer = client.put(
+        "/api/locale",
+        headers={"referer": "http://127.0.0.1:8765/app", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert missing.status_code == 403
+    assert missing.json()["error"] == "origin_or_referer_required"
+    assert wrong_port.status_code == 403
+    assert wrong_port.json()["error"] == "origin_not_allowed"
+    assert referer.status_code == 200
+
+
+def test_write_routes_allow_https_loopback_origin(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.put(
+        "/api/locale",
+        headers={"origin": "https://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"locale": "zh-CN"}
+
+
+def test_write_routes_reject_body_larger_than_one_megabyte(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+            "content-type": "application/json",
+        },
+        content=b"x" * (1024 * 1024 + 1),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "payload_too_large"
+
+
+@pytest.mark.parametrize(
+    "framing_headers",
+    [
+        [("content-length", "0"), ("transfer-encoding", "chunked")],
+        [("content-length", "1048578"), ("transfer-encoding", "chunked")],
+        [("content-length", "0"), ("content-length", "1048578")],
+        [("content-length", "1048578"), ("content-length", "0")],
+        [("content-length", "0"), ("content-length", "0")],
+        [("content-length", "0, 1048578")],
+    ],
+)
+def test_middleware_rejects_ambiguous_body_framing(
+    framing_headers: list[tuple[str, str]],
+) -> None:
+    received: list[int] = []
+
+    async def consume(request: Request) -> JSONResponse:
+        received.append(len(await request.body()))
+        return JSONResponse({"received": received[-1]})
+
+    client = _middleware_client(consume)
+    response = client.post(
+        "/probe",
+        headers=[
+            ("origin", "http://localhost:8765"),
+            ("content-type", "application/json"),
+            *framing_headers,
+        ],
+        content=b'"' + b"x" * 1_048_576 + b'"',
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request_framing"
+    assert response.headers["access-control-allow-origin"] == "http://localhost:8765"
+    assert received == []
+
+
+@pytest.mark.parametrize(("size", "status"), [(1024, 200), (1_048_576, 200), (1_048_577, 413)])
+def test_middleware_limits_normal_chunked_bodies(size: int, status: int) -> None:
+    received: list[int] = []
+
+    async def consume(request: Request) -> JSONResponse:
+        received.append(len(await request.body()))
+        return JSONResponse({"received": received[-1]})
+
+    client = _middleware_client(consume)
+    response = client.post(
+        "/probe",
+        headers={"origin": "http://localhost:8765", "content-type": "application/json"},
+        content=(b"x" * min(1024, size - offset) for offset in range(0, size, 1024)),
+    )
+
+    assert "content-length" not in response.request.headers
+    assert response.request.headers["transfer-encoding"] == "chunked"
+    assert response.status_code == status
+    if status == 200:
+        assert received == [size]
+    else:
+        assert response.json()["error"] == "payload_too_large"
+        assert received == []
+
+
+def test_middleware_allows_empty_post_without_content_type() -> None:
+    async def consume(request: Request) -> JSONResponse:
+        return JSONResponse({"received": len(await request.body())})
+
+    client = _middleware_client(consume)
+    response = client.post("/probe", headers={"origin": "http://localhost:8765"})
+
+    assert response.status_code == 200
+    assert response.json() == {"received": 0}
+
+
+def test_write_routes_reject_non_json_content_type(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+            "content-type": "text/html",
+        },
+        content=b"{}",
+    )
+
+    assert response.status_code == 415
+    assert response.json()["error"] == "unsupported_media_type"
+
+
+def test_write_routes_reject_missing_content_type(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+        },
+        content=b"{}",
+    )
+
+    assert response.status_code == 415
+    assert response.json()["error"] == "unsupported_media_type"
+
+
+def test_runs_only_expose_finalized_runs_and_artifacts(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True, content_lang="zh-CN")
+    _write_run(state_dir, "run-2", finalized=False)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    sync_result_event(state_dir / "review.sqlite", _event("run-2"))
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs").json()["runs"]
+    detail = client.get("/api/run/run-1").json()
+    hidden = client.get("/api/run/run-2")
+    lesson = client.get("/api/run/run-1/lesson?level=compact").json()
+
+    assert [run["run_id"] for run in runs] == ["run-1"]
+    assert runs[0]["content_lang"] == "zh-CN"
+    assert detail["run_id"] == "run-1"
+    assert detail["content_lang"] == "zh-CN"
+    assert detail["source_kind"] == "git_ref"
+    assert detail["degraded_flags"] == {"diff_clipped": True}
+    assert hidden.status_code == 404
+    assert lesson == {
+        "run_id": "run-1",
+        "artifact_type": "lesson",
+        "content": "compact lesson\n",
+        "content_lang": "zh-CN",
+    }
+
+
+def test_tmp_run_id_is_filtered_and_rejected_from_artifact_endpoint(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1.tmp", finalized=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1.tmp"))
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs").json()["runs"]
+    artifact = client.get("/api/run/run-1.tmp/lesson")
+
+    assert runs == []
+    assert artifact.status_code in {400, 404}
+
+
+def test_run_summary_normalizes_invalid_content_lang_to_default(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False, content_lang="fr")
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir, locale="zh-CN")
+
+    runs = client.get("/api/runs").json()["runs"]
+    detail = client.get("/api/run/run-1").json()
+    lesson = client.get("/api/run/run-1/lesson").json()
+
+    assert [run["run_id"] for run in runs] == ["run-1"]
+    assert runs[0]["content_lang"] == "zh-CN"
+    assert detail["content_lang"] == "zh-CN"
+    assert lesson["content_lang"] == "zh-CN"
+
+
+def test_run_summary_defaults_capability_level_when_missing(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata.pop("capability_level")
+    _write_json(run_path / "metadata.json", cast("dict[str, Any]", metadata))
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs").json()["runs"]
+
+    assert [run["run_id"] for run in runs] == ["run-1"]
+    assert runs[0]["capability_level"] == 1
+
+
+def test_run_artifact_envelope_rejects_non_literal_content_lang() -> None:
+    with pytest.raises(ValidationError):
+        RunArtifactEnvelope(
+            run_id="run-1",
+            artifact_type="lesson",
+            content="lesson body",
+            content_lang=cast("Any", "fr"),
+        )
+
+
+def test_run_artifact_envelope_requires_required_fields() -> None:
+    with pytest.raises(ValidationError):
+        RunArtifactEnvelope.model_validate(
+            {"run_id": "run-1", "artifact_type": "lesson", "content_lang": "en"}
+        )
+
+
+def test_run_detail_projects_graphify_full_from_nested_metadata(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_graphify_metadata(
+        run_path,
+        {
+            "mode": "empty",
+            "status": "fresh",
+            "notes": ["graph artifact is fresh"],
+        },
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_mode"] == "full"
+    assert detail["graphify_status"] == "fresh"
+    assert detail["graphify_notes"] == ["graph artifact is fresh"]
+
+
+def test_run_detail_projects_graphify_learning_only_from_nested_metadata(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_graphify_metadata(
+        run_path,
+        {
+            "freshness": "stale",
+            "notes": ["graph artifact is stale"],
+        },
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_mode"] == "learning_only"
+    assert detail["graphify_status"] == "stale"
+    assert detail["graphify_notes"] == ["graph artifact is stale"]
+
+
+def test_run_detail_ignores_invalid_graphify_status(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_graphify_metadata(run_path, {"status": "invalid"})
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_mode"] == "empty"
+    assert detail["graphify_status"] is None
+
+
+def test_run_detail_maps_legacy_source_present_to_stale(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_graphify_metadata(run_path, {"freshness": "source_present"})
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_status"] == "stale"
+    assert detail["graphify_mode"] == "learning_only"
+
+
+def test_run_detail_maps_legacy_missing_to_unavailable(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_graphify_metadata(run_path, {"status": "missing"})
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_status"] == "unavailable"
+    assert detail["graphify_mode"] == "learning_only"
+
+
+def test_run_detail_projects_graphify_empty_without_nested_metadata(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["graphify_mode"] == "empty"
+    assert detail["graphify_status"] is None
+    assert detail["graphify_notes"] is None
+
+
+def test_run_detail_projects_valid_learnability_metadata(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata["learnability"] = {
+        "score": 0.42,
+        "threshold": 0.5,
+        "skip_lesson_quiz": True,
+        "reasons": ["tiny_change"],
+    }
+    _write_json(run_path / "metadata.json", metadata)
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+
+    assert detail["learnability"] == {
+        "score": 0.42,
+        "threshold": 0.5,
+        "skip_lesson_quiz": True,
+        "reasons": ["tiny_change"],
+    }
+
+
+@pytest.mark.parametrize(
+    "learnability",
+    [
+        {"score": True, "threshold": 0.3, "skip_lesson_quiz": False, "reasons": []},
+        {"score": 0.2, "threshold": False, "skip_lesson_quiz": False, "reasons": []},
+        {"score": 0.2, "threshold": 0.3, "skip_lesson_quiz": "false", "reasons": []},
+        {"score": 0.2, "threshold": 0.3, "skip_lesson_quiz": False, "reasons": [None]},
+        {"score": math.nan, "threshold": 0.3, "skip_lesson_quiz": False, "reasons": []},
+    ],
+)
+def test_project_learnability_rejects_coerced_or_non_finite_values(
+    learnability: dict[str, object],
+) -> None:
+    projected = routes_runs_module._project_learnability(  # pyright: ignore[reportPrivateUsage]
+        {"learnability": learnability}
+    )
+
+    assert projected is None
+
+
+def test_artifact_envelopes_include_content_lang_from_run_metadata(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False, content_lang="zh-CN")
+    concepts_content = '{"term_key":"retry-loop","display_name":"Retry loop"}\n'
+    (run_path / "concepts.jsonl").write_text(concepts_content, encoding="utf-8")
+    (run_path / "entailment.jsonl").write_text(
+        '{"claim_id":"claim-1","predicate":"call_name_added","outcome":"supported"}\n',
+        encoding="utf-8",
+    )
+    (run_path / "quiz" / "misconception_cards.jsonl").write_text(
+        '{"concept":"retry","misconception":"x","correction":"y","evidence_ref":"src/app.py:1","severity":"low","safety_tags":[],"run_id":"run-1"}\n',
+        encoding="utf-8",
+    )
+    (run_path / "quiz" / "distractor_gate.json").write_text(
+        '{"schema":"ahadiff.quiz_distractor_gate","questions_checked":1,"findings":[]}\n',
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    routes = (
+        ("/api/run/run-1/lesson?level=full", "lesson"),
+        ("/api/run/run-1/claims", "claims"),
+        ("/api/run/run-1/quiz", "quiz"),
+        ("/api/run/run-1/misconceptions", "misconceptions"),
+        ("/api/run/run-1/diff", "diff"),
+        ("/api/run/run-1/concepts", "concepts"),
+        ("/api/run/run-1/distractor-gate", "distractor_gate"),
+    )
+
+    for route, artifact_type in routes:
+        response = client.get(route)
+        payload = response.json()
+
+        assert response.status_code == 200
+        assert payload["artifact_type"] == artifact_type
+        assert payload["content_lang"] == "zh-CN"
+
+    detail = client.get("/api/run/run-1").json()
+    assert "quiz/misconception_cards.jsonl" in detail["artifacts"]
+    assert "entailment.jsonl" not in detail["artifacts"]
+    assert "quiz/distractor_gate.json" in detail["artifacts"]
+
+
+def test_entailment_shadow_is_not_exposed_as_generic_run_artifact(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "entailment.jsonl").write_text(
+        '{"schema":"ahadiff.entailment_shadow","schema_version":1,"run_id":"run-1","claim_id":"claim-1","mode":"shadow","applicability":"applicable","outcome":"supported","predicate":"call_name_added","file":"src/app.py","side":"new","start":1,"end":1,"reason":"call_name_added","confidence":"medium"}\n',
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+    response = client.get("/api/run/run-1/entailment")
+
+    assert "entailment.jsonl" not in routes_runs_module._ALLOWED_ARTIFACTS  # pyright: ignore[reportPrivateUsage]
+    assert "entailment" not in routes_runs_module._ARTIFACT_PATHS  # pyright: ignore[reportPrivateUsage]
+    assert "entailment.jsonl" not in detail["artifacts"]
+    assert response.status_code == 404
+
+
+def test_misconceptions_route_returns_404_when_artifact_is_missing(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/misconceptions")
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "artifact_not_found"
+
+
+@pytest.mark.parametrize(
+    ("route", "relative_path"),
+    [
+        ("/api/run/run-1/lesson?level=full", "lesson/lesson.full.md"),
+        ("/api/run/run-1/claims", "claims.jsonl"),
+        ("/api/run/run-1/quiz", "quiz/quiz.jsonl"),
+        ("/api/run/run-1/distractor-gate", "quiz/distractor_gate.json"),
+    ],
+)
+def test_learning_artifact_routes_return_404_when_artifact_is_missing(
+    tmp_path: Path,
+    route: str,
+    relative_path: str,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    artifact_path = run_path / relative_path
+    if not artifact_path.exists():
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("placeholder\n", encoding="utf-8")
+    artifact_path.unlink()
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get(route)
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": "artifact_not_found",
+        "error_code": "RUN_ARTIFACT_NOT_FOUND",
+        "status": 404,
+    }
+
+
+def test_score_route_returns_envelope_when_artifact_exists(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "score.json").write_text('{"overall":88}', encoding="utf-8")
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/score")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["artifact_type"] == "score"
+    assert body["run_id"] == "run-1"
+    assert '"overall":88' in body["content"]
+
+
+def test_spec_alignment_route_returns_envelope_when_artifact_exists(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "spec_alignment.json").write_text(
+        '{"schema":"ahadiff.spec_alignment","score":8}',
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/spec-alignment")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["artifact_type"] == "spec_alignment"
+    assert body["run_id"] == "run-1"
+    assert '"score":8' in body["content"]
+
+
+def test_spec_alignment_route_returns_404_when_artifact_is_missing(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/spec-alignment")
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "artifact_not_found"
+
+
+def test_graphify_signoff_route_returns_envelope_when_artifact_exists(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "graphify_signoff.json").write_text(
+        '{"schema":"ahadiff.graphify_signoff","signoff":"degraded"}',
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/graphify-signoff")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["artifact_type"] == "graphify_signoff"
+    assert '"signoff":"degraded"' in body["content"]
+
+
+def test_score_route_returns_400_when_artifact_is_missing(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/score")
+
+    assert response.status_code == 400
+
+
+def test_artifact_envelope_uses_none_content_lang_when_metadata_field_missing(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False, content_lang="zh-CN")
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata.pop("content_lang")
+    _write_json(run_path / "metadata.json", cast("dict[str, Any]", metadata))
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir, locale="zh-CN")
+
+    response = client.get("/api/run/run-1/lesson?level=full")
+
+    assert response.status_code == 200
+    assert response.json()["content_lang"] is None
+
+
+def test_artifact_envelope_uses_none_content_lang_when_metadata_field_null(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False, content_lang="zh-CN")
+    metadata = json.loads((run_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata["content_lang"] = None
+    _write_json(run_path / "metadata.json", cast("dict[str, Any]", metadata))
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir, locale="zh-CN")
+
+    response = client.get("/api/run/run-1/lesson?level=full")
+
+    assert response.status_code == 200
+    assert response.json()["content_lang"] is None
+
+
+def test_artifact_route_returns_413_for_oversized_text_artifact(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "patch.diff").write_text(
+        "x" * (routes_runs_module._MAX_TEXT_ARTIFACT_BYTES + 1),  # pyright: ignore[reportPrivateUsage]
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/diff")
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "patch.diff exceeds size limit"
+
+
+def test_get_run_returns_413_for_oversized_json_metadata(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "metadata.json").write_text(
+        '{"padding":"' + "x" * routes_runs_module._MAX_JSON_OBJECT_BYTES + '"}\n',  # pyright: ignore[reportPrivateUsage]
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "metadata.json exceeds size limit"
+
+
+def test_concepts_route_returns_413_for_oversized_repo_concepts(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "concepts.jsonl").write_text(
+        "x" * (routes_runs_module._MAX_TEXT_ARTIFACT_BYTES + 1),  # pyright: ignore[reportPrivateUsage]
+        encoding="utf-8",
+    )
+    client = _client(state_dir)
+
+    response = client.get("/api/concepts")
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "concepts.jsonl exceeds size limit"
+
+
+def test_artifact_envelopes_use_none_content_lang_when_metadata_missing(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    (run_path / "metadata.json").unlink()
+    (run_path / "concepts.jsonl").write_text(
+        '{"term_key":"retry-loop","display_name":"Retry loop"}\n',
+        encoding="utf-8",
+    )
+    _finalize_run(run_path, "run-1")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir, locale="zh-CN")
+
+    routes = (
+        "/api/run/run-1/lesson?level=full",
+        "/api/run/run-1/claims",
+        "/api/run/run-1/quiz",
+        "/api/run/run-1/diff",
+        "/api/run/run-1/concepts",
+    )
+
+    for route in routes:
+        response = client.get(route)
+        payload = response.json()
+
+        assert response.status_code == 200
+        assert payload["content_lang"] is None
+
+
+def test_get_run_concepts_returns_content(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    content = '{"term_key":"retry-loop","display_name":"Retry loop"}\n'
+    (run_path / "concepts.jsonl").write_text(content, encoding="utf-8")
+    artifact_count, checksum = finalized_artifact_digest(run_path)
+    _write_json(
+        run_path / "finalized.json",
+        {
+            "run_id": "run-1",
+            "event_id": "018f0f52-91c0-7abc-8123-000000000001",
+            "finalized_at": "2026-04-24T00:00:01Z",
+            "artifact_count": artifact_count,
+            "checksum": checksum,
+            "status": "keep",
+        },
+    )
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/concepts")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "run_id": "run-1",
+        "artifact_type": "concepts",
+        "content": content,
+        "content_lang": "en",
+    }
+
+
+def test_get_run_concepts_missing_returns_404(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/concepts")
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "artifact_not_found"
+
+
+def test_artifact_routes_require_finalized_marker_event_match(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    artifact_count, checksum = finalized_artifact_digest(run_path)
+    _write_json(
+        run_path / "finalized.json",
+        {
+            "run_id": "run-1",
+            "event_id": "018f0f52-91c0-7abc-8123-999999999999",
+            "finalized_at": "2026-04-24T00:00:01Z",
+            "artifact_count": artifact_count,
+            "checksum": checksum,
+            "status": "keep",
+        },
+    )
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    response = client.get("/api/run/run-1/lesson")
+
+    assert response.status_code == 400
+    assert "finalized result event does not exist" in response.json()["error"]
+
+
+def test_load_result_event_by_run_and_id_requires_exact_match(tmp_path: Path) -> None:
+    db_path = tmp_path / ".ahadiff" / "review.sqlite"
+    event = _event("run-1")
+    initialize_review_db(db_path)
+    sync_result_event(db_path, event)
+
+    matched = load_result_event_by_run_and_id(
+        db_path,
+        run_id="run-1",
+        event_id=event.event_id,
+    )
+
+    assert matched is not None
+    assert matched.event_id == event.event_id
+    assert matched.run_id == "run-1"
+    assert load_result_event_by_run_and_id(db_path, run_id="run-2", event_id=event.event_id) is None
+    assert (
+        load_result_event_by_run_and_id(db_path, run_id="run-1", event_id="missing-event") is None
+    )
+    assert (
+        load_result_event_by_run_and_id(
+            tmp_path / "missing.sqlite",
+            run_id="run-1",
+            event_id=event.event_id,
+        )
+        is None
+    )
+
+
+def test_finalized_run_lookup_does_not_use_full_result_event_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    def fail_event_page(*_args: Any, **_kwargs: Any) -> tuple[ResultEvent, ...]:
+        raise AssertionError("result_events page scan should not be used for run artifact lookup")
+
+    monkeypatch.setattr(routes_runs_module, "load_result_events_page", fail_event_page)
+
+    detail = client.get("/api/run/run-1")
+    lesson = client.get("/api/run/run-1/lesson")
+
+    assert detail.status_code == 200
+    assert detail.json()["run_id"] == "run-1"
+    assert lesson.status_code == 200
+    assert lesson.json()["content"] == "full lesson\n"
+
+
+def test_run_lists_use_sql_pagination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(3):
+        run_id = f"run-{index}"
+        _write_run(state_dir, run_id, finalized=True)
+        sync_result_event(
+            db_path,
+            _event(
+                run_id,
+                event_id=f"018f0f52-91c0-7abc-8123-{index:012d}",
+                timestamp=f"2026-04-24T00:00:0{index}Z",
+            ),
+        )
+    calls: list[tuple[int, tuple[str, str] | None]] = []
+
+    def recording_page(*args: Any, **kwargs: Any) -> tuple[ResultEvent, ...]:
+        calls.append(
+            (cast("int", kwargs["limit"]), cast("tuple[str, str] | None", kwargs["before"]))
+        )
+        return load_result_events_page(*args, **kwargs)
+
+    monkeypatch.setattr(routes_runs_module, "load_result_events_page", recording_page)
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs").json()["runs"]
+
+    assert [run["run_id"] for run in runs] == ["run-2", "run-1", "run-0"]
+    assert calls == [(routes_runs_module._MAX_LIST_RUNS, None)]  # pyright: ignore[reportPrivateUsage]
+
+
+def test_run_lists_page_without_full_finalized_directory_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(1001):
+        run_id = f"run-{index:04d}"
+        event_id = f"018f0f52-91c0-7abc-8123-{index:012d}"
+        run_path = state_dir / "runs" / run_id
+        run_path.mkdir(parents=True)
+        _write_json(
+            run_path / "metadata.json",
+            {
+                "run_id": run_id,
+                "source_kind": "git_ref",
+                "source_ref": f"abc{index:04d}",
+                "content_lang": "en",
+                "capability_level": 2,
+                "degraded_flags": {},
+            },
+        )
+        (run_path / "patch.diff").write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+        artifact_count, checksum = finalized_artifact_digest(run_path)
+        timestamp = f"2026-04-24T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}Z"
+        _write_json(
+            run_path / "finalized.json",
+            {
+                "run_id": run_id,
+                "event_id": event_id,
+                "finalized_at": timestamp,
+                "artifact_count": artifact_count,
+                "checksum": checksum,
+                "status": "keep",
+            },
+        )
+        sync_result_event(
+            db_path,
+            _event(
+                run_id,
+                source_ref=f"abc{index:04d}",
+                event_id=event_id,
+                timestamp=timestamp,
+            ),
+        )
+    calls: list[int] = []
+
+    runs_dir = state_dir / "runs"
+
+    original_iterdir = Path.iterdir
+
+    def fail_runs_iterdir(self: Path) -> Iterator[Path]:
+        if self == runs_dir:
+            raise AssertionError("list pagination must not scan all finalized run directories")
+        return original_iterdir(self)
+
+    original_load_page = routes_runs_module.load_result_events_page
+
+    def recording_page(*args: Any, **kwargs: Any) -> tuple[ResultEvent, ...]:
+        calls.append(cast("int", kwargs["limit"]))
+        return original_load_page(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", fail_runs_iterdir)
+    monkeypatch.setattr(routes_runs_module, "load_result_events_page", recording_page)
+    client = _client(state_dir)
+
+    first = client.get("/api/runs?limit=10").json()
+    second = client.get(f"/api/runs?limit=10&cursor={first['next_cursor']}").json()
+
+    assert len(first["runs"]) == 10
+    assert len(second["runs"]) == 10
+    assert first["runs"][0]["run_id"] == "run-1000"
+    assert second["runs"][0]["run_id"] == "run-0990"
+    assert calls[:2] == [10, 10]
+
+
+def test_ratchet_history_uses_sql_pagination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(3):
+        run_id = f"run-{index}"
+        _write_run(state_dir, run_id, finalized=True)
+        sync_result_event(
+            db_path,
+            _event(
+                run_id,
+                event_id=f"018f0f52-91c0-7abc-8123-{index:012d}",
+                timestamp=f"2026-04-24T00:00:0{index}Z",
+                status="keep",
+            ),
+        )
+    calls: list[tuple[int, tuple[str, str] | None]] = []
+
+    def recording_page(*args: Any, **kwargs: Any) -> tuple[ResultEvent, ...]:
+        calls.append(
+            (cast("int", kwargs["limit"]), cast("tuple[str, str] | None", kwargs["before"]))
+        )
+        return load_finalized_ratchet_history_page(*args, **kwargs)
+
+    monkeypatch.setattr(routes_runs_module, "load_finalized_ratchet_history_page", recording_page)
+    client = _client(state_dir)
+
+    history = client.get("/api/ratchet/history").json()["history"]
+
+    assert [entry["run_id"] for entry in history] == ["run-2", "run-1", "run-0"]
+    assert calls == [(routes_runs_module._MAX_RATCHET_HISTORY, None)]  # pyright: ignore[reportPrivateUsage]
+
+
+def test_ratchet_history_returns_restricted_note_json(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(
+        db_path,
+        _event(
+            "run-1",
+            status="keep",
+            note_json=json.dumps(
+                {
+                    "baseline_overall": 70.0,
+                    "failed_gates": [
+                        "accuracy",
+                        {"drop": "nested"},
+                        "evidence",
+                    ],
+                    "phase25": True,
+                    "phase25_note": "PHASE25: consecutive_discard_count=2",
+                    "ratchet_reason": "verdict_or_hard_gate_failed",
+                    "trigger_reason": "consecutive_discard_count=2",
+                    "verdict": "FAIL",
+                    "api_key": "sk-test-secret",
+                    "worktree_path": "/tmp/ahadiff-sensitive-worktree",
+                    "target_prompt": "internal prompt text",
+                    "stash_ref": "commit-sha",
+                    "unsafe_nested": {"token": "secret"},
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+    client = _client(state_dir)
+
+    entry = client.get("/api/ratchet/history").json()["history"][0]
+    detail = client.get("/api/run/run-1").json()
+    note = json.loads(entry["note_json"])
+    detail_note = json.loads(detail["note_json"])
+
+    assert note == {
+        "baseline_overall": 70.0,
+        "failed_gates": ["accuracy", "evidence"],
+        "phase25": True,
+        "phase25_note": "PHASE25: consecutive_discard_count=2",
+        "ratchet_reason": "verdict_or_hard_gate_failed",
+        "trigger_reason": "consecutive_discard_count=2",
+        "verdict": "FAIL",
+    }
+    assert detail_note == note
+
+
+def test_ratchet_transparency_requires_write_token(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    client = _client(state_dir)
+
+    response = client.get("/api/ratchet/transparency")
+
+    assert response.status_code == 401
+
+
+def test_ratchet_transparency_returns_result_events_and_benchmark_truth(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    sync_result_event(db_path, _event("run-1", status="keep", timestamp="2026-04-24T00:00:01Z"))
+    sync_result_event(
+        db_path,
+        _event(
+            "run-2",
+            status="discard",
+            timestamp="2026-04-24T00:00:02Z",
+            note_json=json.dumps(
+                {
+                    "phase25": True,
+                    "phase25_note": "PHASE25: consecutive_discard_count=2",
+                    "trigger_reason": "consecutive_discard_count=2",
+                    "worktree_path": str(tmp_path / "sensitive-worktree"),
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+    _write_json(
+        tmp_path / "benchmarks" / "manifest.json",
+        {
+            "schema_version": 1,
+            "suite_id": "ahadiff-local-v1",
+            "suite_digest": "abc123",
+            "visibility": "private",
+            "entries": [
+                {"id": "eval-1", "kind": "eval", "language": "python", "group": "main"},
+                {
+                    "id": "eval-2",
+                    "kind": "eval",
+                    "language": "typescript",
+                    "group": "main",
+                    "degraded": True,
+                },
+                {"id": "int-1", "kind": "integration", "language": "python", "group": "api"},
+            ],
+        },
+    )
+    _write_json(
+        state_dir / "benchmarks" / "local-report.json",
+        {
+            "suite_id": "ahadiff-local-v1",
+            "suite_digest": "abc123",
+            "eval_bundle_version": "bundle-v1",
+            "model_id": "none",
+            "api_family_version": "none",
+            "output_lang": "en",
+            "comparable_entry_count": 2,
+            "excluded_degraded_count": 1,
+            "mean_score": 87.25,
+            "claim_verification_rate": 1.0,
+            "entries": [
+                {
+                    "id": "eval-1",
+                    "group": "main",
+                    "language": "python",
+                    "degraded": False,
+                    "overall": 91.0,
+                    "verdict": "PASS",
+                    "weakest_dim": "evidence",
+                    "claim_verification_rate": 1.0,
+                    "ground_truth_digest": "f" * 64,
+                }
+            ],
+        },
+    )
+    client = _client(state_dir)
+
+    response = client.get("/api/ratchet/transparency", headers=_WRITE_HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["status"] for row in body["results"][:2]] == ["discard", "keep"]
+    note = json.loads(body["results"][0]["note_json"])
+    assert note == {
+        "phase25": True,
+        "phase25_note": "PHASE25: consecutive_discard_count=2",
+        "trigger_reason": "consecutive_discard_count=2",
+    }
+    assert body["benchmark"]["warnings"] == []
+    assert body["benchmark"]["manifest"] == {
+        "schema_version": 1,
+        "suite_id": "ahadiff-local-v1",
+        "suite_digest": "abc123",
+        "visibility": "private",
+        "entry_count": 3,
+        "eval_entry_count": 2,
+        "integration_entry_count": 1,
+        "degraded_entry_count": 1,
+        "language_count": 2,
+        "group_count": 2,
+    }
+    report = body["benchmark"]["report"]
+    assert report["mean_score"] == 87.25
+    assert report["entries"][0]["ground_truth_digest"] == "f" * 64
+
+
+def test_ratchet_transparency_preserves_legacy_status_without_validation_crash(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    with connect_review_db(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO result_events (
+                event_id, run_id, event_type, timestamp, source_ref, base_ref,
+                prompt_version, eval_bundle_version, rubric_version, overall,
+                verdict, status, weakest_dim, note_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "evt-legacy",
+                "run-legacy",
+                "learn",
+                "2026-04-24T00:00:03Z",
+                "abc1234",
+                "base1234",
+                "prompt123",
+                "eval123",
+                "rubric-v1",
+                81.0,
+                "PASS",
+                "legacy_done",
+                "novel_dimension",
+                json.dumps(
+                    {
+                        "phase25": True,
+                        "worktree_path": str(tmp_path / "sensitive-worktree"),
+                        "api_key": "must-not-leak",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+    client = _client(state_dir)
+
+    response = client.get("/api/ratchet/transparency", headers=_WRITE_HEADERS)
+
+    assert response.status_code == 200
+    row = response.json()["results"][0]
+    assert row["status"] == "legacy_done"
+    assert row["weakest_dim"] == "novel_dimension"
+    assert json.loads(row["note_json"]) == {"phase25": True}
+
+
+def test_ratchet_transparency_sanitizes_corrupt_benchmark_report_values(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_json(
+        tmp_path / "benchmarks" / "manifest.json",
+        {
+            "schema_version": 1,
+            "suite_id": "ahadiff-local-v1",
+            "suite_digest": "abc123",
+            "visibility": "private",
+            "entries": [{"id": "eval-1", "kind": "eval", "language": "python", "group": "main"}],
+        },
+    )
+    _write_json(
+        state_dir / "benchmarks" / "local-report.json",
+        {
+            "suite_id": "ahadiff-local-v1",
+            "suite_digest": "abc123",
+            "eval_bundle_version": "bundle-v1",
+            "comparable_entry_count": -1,
+            "excluded_degraded_count": -2,
+            "mean_score": 88.0,
+            "claim_verification_rate": 1.0,
+            "entries": [
+                {
+                    "id": "bad-degraded",
+                    "group": "main",
+                    "language": "python",
+                    "degraded": "false",
+                    "overall": 88.0,
+                },
+                {
+                    "id": "good-entry",
+                    "group": "main",
+                    "language": "python",
+                    "degraded": False,
+                    "overall": 91.0,
+                },
+            ],
+        },
+    )
+    client = _client(state_dir)
+
+    response = client.get("/api/ratchet/transparency", headers=_WRITE_HEADERS)
+
+    assert response.status_code == 200
+    report = response.json()["benchmark"]["report"]
+    assert report["comparable_entry_count"] is None
+    assert report["excluded_degraded_count"] is None
+    assert [entry["id"] for entry in report["entries"]] == ["good-entry"]
+
+
+def test_ratchet_transparency_blocks_symlinked_benchmark_report(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("os.symlink is unavailable")
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    report_path = state_dir / "benchmarks" / "local-report.json"
+    report_path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-report.json"
+    outside.write_text('{"suite_id":"leak"}\n', encoding="utf-8")
+    try:
+        os.symlink(outside, report_path)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    client = _client(state_dir)
+
+    response = client.get("/api/ratchet/transparency", headers=_WRITE_HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["benchmark"]["report"] is None
+    assert "benchmark_report_unreadable" in body["benchmark"]["warnings"]
+
+
+def test_ratchet_history_drops_oversized_or_deep_note_json(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_run(state_dir, "run-1", finalized=True)
+    _write_run(state_dir, "run-2", finalized=True)
+    sync_result_event(
+        db_path,
+        _event(
+            "run-1",
+            status="keep",
+            note_json=json.dumps({"phase25_note": "x" * 70_000}),
+        ),
+    )
+    sync_result_event(
+        db_path,
+        _event(
+            "run-2",
+            status="keep",
+            note_json="[" * 20_000 + "0" + "]" * 20_000,
+        ),
+    )
+    client = _client(state_dir)
+
+    history = client.get("/api/ratchet/history").json()["history"]
+
+    assert {entry["run_id"]: entry["note_json"] for entry in history} == {
+        "run-1": None,
+        "run-2": None,
+    }
+
+
+def test_legacy_finalized_marker_without_digest_is_hidden(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    _write_json(
+        run_path / "finalized.json",
+        {
+            "run_id": "run-1",
+            "event_id": "018f0f52-91c0-7abc-8123-000000000001",
+            "status": "keep",
+        },
+    )
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_finalized_marker_checksum_mismatch_is_hidden(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    (run_path / "patch.diff").write_text("diff changed after finalization\n", encoding="utf-8")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1/lesson")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_symlink_artifact_invalidates_finalized_run(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    lesson_path = run_path / "lesson" / "lesson.full.md"
+    lesson_path.unlink()
+    lesson_path.symlink_to("/etc/hosts")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1/lesson")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_malformed_finalized_marker_is_hidden_without_500(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    (run_path / "finalized.json").write_text("{not-json\n", encoding="utf-8")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_oversized_finalized_marker_is_hidden_from_list_without_500(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    (run_path / "finalized.json").write_text(
+        '{"padding":"' + "x" * routes_runs_module._MAX_JSON_OBJECT_BYTES + '"}\n',  # pyright: ignore[reportPrivateUsage]
+        encoding="utf-8",
+    )
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_malformed_run_metadata_is_hidden_from_list_without_500(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    (run_path / "metadata.json").write_text("[]\n", encoding="utf-8")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+def test_non_object_finalized_marker_is_hidden_without_500(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    run_path = _write_run(state_dir, "run-1", finalized=True)
+    (run_path / "finalized.json").write_text("[]\n", encoding="utf-8")
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1")
+
+    assert response.status_code == 400
+    assert "finalized marker is invalid" in response.json()["error"]
+
+
+@pytest.mark.skipif(
+    not hasattr(routes_runs_module.os, "symlink")
+    or not hasattr(routes_runs_module.os, "O_NOFOLLOW"),
+    reason="requires POSIX symlink no-follow support",
+)
+def test_bounded_finalized_artifact_digest_rejects_symlink_swap_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    state_dir = tmp_path / ".ahadiff"
+    run_path = _write_run(state_dir, "run-1", finalized=False)
+    artifact_path = run_path / "artifact.txt"
+    artifact_path.write_text("safe artifact\n", encoding="utf-8")
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_text("outside\n", encoding="utf-8")
+    original_open = routes_runs_module.os.open
+    swapped = False
+
+    def swapping_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if Path(path) == artifact_path and not swapped:
+            swapped = True
+            artifact_path.unlink()
+            routes_runs_module.os.symlink(outside_path, artifact_path)
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(routes_runs_module.os, "open", swapping_open)
+
+    with pytest.raises(InputError, match="symlink|changed during validation"):
+        routes_runs_module._bounded_finalized_artifact_digest(run_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert swapped is True
+
+
+def test_bounded_finalized_artifact_digest_rejects_reparse_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    run_path = tmp_path / "run_reparse_dir"
+    reparse_dir = run_path / "junction"
+    reparse_dir.mkdir(parents=True)
+    (reparse_dir / "outside-secret.txt").write_text("outside-secret\n", encoding="utf-8")
+
+    def fake_has_reparse_point(path_stat: object) -> bool:
+        return routes_runs_module.stat.S_ISDIR(cast("Any", path_stat).st_mode)
+
+    monkeypatch.setattr(
+        routes_runs_module,
+        "_has_windows_reparse_point",
+        fake_has_reparse_point,
+    )
+
+    with pytest.raises(InputError, match="Windows reparse point"):
+        routes_runs_module._bounded_finalized_artifact_digest(run_path)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_symlink_run_directory_is_not_served(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    outside_state_dir = tmp_path / "outside" / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    outside_run_path = _write_run(outside_state_dir, "run-1", finalized=True)
+    (state_dir / "runs").mkdir(parents=True)
+    (state_dir / "runs" / "run-1").symlink_to(outside_run_path, target_is_directory=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").json() == {"runs": []}
+    response = client.get("/api/run/run-1/lesson")
+
+    assert response.status_code == 404
+    assert "finalized run does not exist" in response.json()["error"]
+
+
+def test_run_detail_uses_finalized_marker_event_not_newer_unfinalized_event(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(
+        state_dir / "review.sqlite",
+        _event("run-1", event_id="018f0f52-91c0-7abc-8123-000000000001"),
+    )
+    sync_result_event(
+        state_dir / "review.sqlite",
+        _event(
+            "run-1",
+            status="targeted_verify",
+            event_id="018f0f52-91c0-7abc-8123-000000000099",
+        ),
+    )
+    client = _client(state_dir)
+
+    detail = client.get("/api/run/run-1").json()
+    runs = client.get("/api/runs").json()["runs"]
+
+    assert detail["status"] == "keep"
+    assert runs[0]["status"] == "keep"
+
+
+def test_run_lists_validate_finalized_marker_run_event_binding(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    run_1_path = _write_run(state_dir, "run-1", finalized=False)
+    _write_run(state_dir, "run-2", finalized=False)
+    run_2_event_id = "018f0f52-91c0-7abc-8123-000000000002"
+    artifact_count, checksum = finalized_artifact_digest(run_1_path)
+    _write_json(
+        run_1_path / "finalized.json",
+        {
+            "run_id": "run-1",
+            "event_id": run_2_event_id,
+            "finalized_at": "2026-04-24T00:00:01Z",
+            "artifact_count": artifact_count,
+            "checksum": checksum,
+            "status": "keep",
+        },
+    )
+    sync_result_event(db_path, _event("run-2", event_id=run_2_event_id, status="keep"))
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs")
+    history = client.get("/api/ratchet/history")
+
+    assert runs.json() == {"runs": []}
+    assert history.json() == {"history": []}
+
+
+def test_runs_source_kind_filter_and_ratchet_history(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    _write_run(state_dir, "run-2", finalized=True)
+    _write_json(
+        state_dir / "runs" / "run-2" / "metadata.json",
+        {
+            "run_id": "run-2",
+            "source_kind": "patch_file",
+            "source_ref": "sha256:fixture",
+            "capability_level": 1,
+            "degraded_flags": {},
+        },
+    )
+    sync_result_event(state_dir / "review.sqlite", _event("run-1", status="keep"))
+    sync_result_event(
+        state_dir / "review.sqlite",
+        _event("run-2", status="non_ratcheted", source_ref="sha256:fixture"),
+    )
+    client = _client(state_dir)
+
+    filtered = client.get("/api/runs?source_kind=git_ref").json()["runs"]
+    history = client.get("/api/ratchet/history").json()["history"]
+
+    assert [run["run_id"] for run in filtered] == ["run-1"]
+    assert [entry["run_id"] for entry in history] == ["run-1"]
+
+
+def test_runs_source_kind_filter_stops_after_max_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(1, 4):
+        run_id = f"run-{index}"
+        _write_run(state_dir, run_id, finalized=True)
+        sync_result_event(db_path, _event(run_id, status="keep"))
+    original_load_page = routes_runs_module.load_result_events_page
+    page_calls = 0
+
+    def spy_load_page(*args: Any, **kwargs: Any) -> tuple[ResultEvent, ...]:
+        nonlocal page_calls
+        page_calls += 1
+        return original_load_page(*args, **kwargs)
+
+    monkeypatch.setattr(routes_runs_module, "_MAX_LIST_RUN_PAGES", 2)
+    monkeypatch.setattr(routes_runs_module, "load_result_events_page", spy_load_page)
+    client = _client(state_dir)
+
+    response = client.get("/api/runs?source_kind=patch_file&page_size=1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["runs"] == []
+    assert payload["next_cursor"]
+    assert page_calls == 2
+
+
+def test_run_and_ratchet_lists_are_capped_to_newest_500(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(505):
+        run_id = f"run-{index:03d}"
+        event_id = f"018f0f52-91c0-7abc-8123-{index:012d}"
+        run_path = state_dir / "runs" / run_id
+        run_path.mkdir(parents=True)
+        _write_json(
+            run_path / "metadata.json",
+            {
+                "run_id": run_id,
+                "source_kind": "git_ref",
+                "source_ref": f"abc{index:03d}",
+                "content_lang": "en",
+                "capability_level": 2,
+                "degraded_flags": {},
+            },
+        )
+        (run_path / "patch.diff").write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+        artifact_count, checksum = finalized_artifact_digest(run_path)
+        _write_json(
+            run_path / "finalized.json",
+            {
+                "run_id": run_id,
+                "event_id": event_id,
+                "finalized_at": f"2026-04-24T00:{index // 60:02d}:{index % 60:02d}Z",
+                "artifact_count": artifact_count,
+                "checksum": checksum,
+                "status": "keep",
+            },
+        )
+        sync_result_event(
+            db_path,
+            _event(
+                run_id,
+                source_ref=f"abc{index:03d}",
+                event_id=event_id,
+                timestamp=f"2026-04-24T00:{index // 60:02d}:{index % 60:02d}Z",
+            ),
+        )
+    client = _client(state_dir)
+
+    runs = client.get("/api/runs").json()["runs"]
+    history = client.get("/api/ratchet/history").json()["history"]
+
+    assert len(runs) == 500
+    assert len(history) == 500
+    assert runs[0]["run_id"] == "run-504"
+    assert history[0]["run_id"] == "run-504"
+    assert runs[-1]["run_id"] == "run-005"
+    assert history[-1]["run_id"] == "run-005"
+
+
+def test_concepts_route_does_not_follow_symlink(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    target = tmp_path / "outside-concepts.jsonl"
+    target.write_text('{"concept":"outside"}\n', encoding="utf-8")
+    (state_dir / "concepts.jsonl").symlink_to(target)
+    client = _client(state_dir)
+
+    assert client.get("/api/concepts").json() == {"artifact_type": "concepts", "content": ""}
+
+
+def test_concepts_route_supports_limit_and_cursor(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "concepts.jsonl").write_text(
+        "".join(
+            json.dumps({"term_key": f"term-{index}", "concept": f"term {index}"}) + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
+    client = _client(state_dir)
+
+    first = client.get("/api/concepts?limit=2").json()
+    second = client.get(f"/api/concepts?limit=2&cursor={first['next_cursor']}").json()
+
+    assert [json.loads(line)["term_key"] for line in first["content"].splitlines()] == [
+        "term-0",
+        "term-1",
+    ]
+    assert first["next_cursor"] == "jsonl:3"
+    assert [json.loads(line)["term_key"] for line in second["content"].splitlines()] == ["term-2"]
+    assert "next_cursor" not in second
+
+
+def test_concepts_route_reads_db_backed_storage_without_jsonl(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    for index in range(3):
+        upsert_concept(
+            db_path,
+            term_key=f"db-term-{index}",
+            concept=f"db term {index}",
+            run_id="run-a",
+            source_ref="abc123",
+            branch_hint=None,
+            related_claims=(),
+            file_refs=(),
+        )
+    client = _client(state_dir)
+
+    first = client.get("/api/concepts?limit=2").json()
+    second = client.get(f"/api/concepts?limit=2&cursor={first['next_cursor']}").json()
+
+    assert [json.loads(line)["term_key"] for line in first["content"].splitlines()] == [
+        "db-term-0",
+        "db-term-1",
+    ]
+    assert first["next_cursor"] == "db:db-term-1"
+    assert [json.loads(line)["term_key"] for line in second["content"].splitlines()] == [
+        "db-term-2"
+    ]
+    assert "next_cursor" not in second
+
+
+def test_concepts_route_reparse_jsonl_uses_db_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    upsert_concept(
+        db_path,
+        term_key="db-only",
+        concept="db only",
+        run_id="run-a",
+        source_ref="abc123",
+        branch_hint=None,
+        related_claims=(),
+        file_refs=(),
+    )
+    (state_dir / "concepts.jsonl").write_text(
+        json.dumps({"term_key": "blocked-jsonl", "concept": "blocked"}) + "\n",
+        encoding="utf-8",
+    )
+
+    def _is_reparse(path_stat: object) -> bool:
+        del path_stat
+        return True
+
+    monkeypatch.setattr(routes_runs_module, "_has_windows_reparse_point", _is_reparse)
+    monkeypatch.setattr("ahadiff.core.paths._has_windows_reparse_point", _is_reparse)
+    client = _client(state_dir)
+
+    response = client.get("/api/concepts")
+
+    assert response.status_code == 200
+    entries = [json.loads(line) for line in response.json()["content"].splitlines()]
+    assert [entry["term_key"] for entry in entries] == ["db-only"]
+
+
+def test_run_routes_use_anyio_threadpool_for_file_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    _write_run(state_dir, "run-1", finalized=True)
+    sync_result_event(state_dir / "review.sqlite", _event("run-1"))
+    calls: list[str] = []
+
+    async def recording_run_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
+        del kwargs
+        calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args)
+
+    monkeypatch.setattr(routes_runs_module.to_thread, "run_sync", recording_run_sync)
+    client = _client(state_dir)
+
+    assert client.get("/api/runs").status_code == 200
+    assert client.get("/api/run/run-1").status_code == 200
+    assert client.get("/api/run/run-1/lesson").status_code == 200
+
+    assert "_list_runs_payload" in calls
+    assert "_run_detail_payload" in calls
+    assert any("lambda" in call for call in calls)
+
+
+def test_read_text_capped_checks_size_from_open_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visible_path = tmp_path / "artifact.txt"
+    visible_path.write_text("ok\n", encoding="utf-8")
+    original_lstat = routes_runs_module.os.lstat
+    grew_after_lstat = False
+
+    def growing_lstat(path: Any) -> Any:
+        nonlocal grew_after_lstat
+        result = original_lstat(path)
+        if Path(cast("str", path)) == visible_path:
+            visible_path.write_text("too large\n", encoding="utf-8")
+            grew_after_lstat = True
+        return result
+
+    monkeypatch.setattr(routes_runs_module.os, "lstat", growing_lstat)
+    read_text_capped = cast("Any", routes_runs_module._read_text_capped)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(routes_runs_module.HTTPException) as exc_info:
+        read_text_capped(visible_path, max_bytes=4)
+
+    assert grew_after_lstat is True
+    assert exc_info.value.status_code == 413
+
+
+def test_read_text_capped_rejects_path_swap_after_lstat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    visible_path = tmp_path / "artifact.txt"
+    visible_path.write_text("safe\n", encoding="utf-8")
+    outside_path = tmp_path / "outside-secret.txt"
+    outside_path.write_text("outside-secret\n", encoding="utf-8")
+    original_open = routes_runs_module.os.open
+
+    def fake_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if Path(cast("str", path)) == visible_path:
+            return original_open(str(outside_path), flags, mode)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(routes_runs_module.os, "open", fake_open)
+    read_text_capped = cast("Any", routes_runs_module._read_text_capped)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(InputError, match="changed during validation"):
+        read_text_capped(visible_path, max_bytes=1024)
+
+
+def test_read_text_capped_rejects_hardlinked_file(tmp_path: Path) -> None:
+    if not hasattr(os, "link"):
+        pytest.skip("hardlinks unavailable on this platform")
+
+    from ahadiff.core.errors import InputError
+
+    outside_path = tmp_path / "outside-secret.txt"
+    outside_path.write_text("outside-secret\n", encoding="utf-8")
+    visible_path = tmp_path / "artifact.txt"
+    os.link(outside_path, visible_path)
+
+    read_text_capped = cast("Any", routes_runs_module._read_text_capped)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(InputError, match="hardlink"):
+        read_text_capped(visible_path, max_bytes=1024)
+
+
+@pytest.mark.skipif(
+    not hasattr(routes_runs_module.os, "symlink"), reason="requires symlink support"
+)
+def test_read_text_capped_rejects_symlink_when_open_may_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    target_path = tmp_path / "target.txt"
+    target_path.write_text("target\n", encoding="utf-8")
+    link_path = tmp_path / "artifact-link.txt"
+    routes_runs_module.os.symlink(target_path, link_path)
+    original_open = routes_runs_module.os.open
+    nofollow_flag = getattr(routes_runs_module.os, "O_NOFOLLOW", 0)
+
+    def following_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if nofollow_flag:
+            flags &= ~nofollow_flag
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(routes_runs_module.os, "open", following_open)
+    read_text_capped = routes_runs_module._read_text_capped  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(InputError, match="symlink"):
+        read_text_capped(link_path, max_bytes=1024)
+
+
+@pytest.mark.skipif(
+    not hasattr(routes_runs_module.os, "symlink"), reason="requires symlink support"
+)
+def test_hash_bounded_finalized_artifact_rejects_symlink_when_open_may_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    target_path = tmp_path / "target.txt"
+    target_path.write_text("target\n", encoding="utf-8")
+    link_path = tmp_path / "artifact-link.txt"
+    routes_runs_module.os.symlink(target_path, link_path)
+    expected_stat = target_path.stat()
+    original_open = routes_runs_module.os.open
+    nofollow_flag = getattr(routes_runs_module.os, "O_NOFOLLOW", 0)
+
+    def following_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if nofollow_flag:
+            flags &= ~nofollow_flag
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(routes_runs_module.os, "open", following_open)
+    hash_artifact = routes_runs_module._hash_bounded_finalized_artifact  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(InputError, match="symlink"):
+        hash_artifact(link_path, "artifact-link.txt", expected_stat)
+
+
+def test_bounded_finalized_artifact_digest_rejects_hardlinked_artifact(tmp_path: Path) -> None:
+    if not hasattr(os, "link"):
+        pytest.skip("hardlinks unavailable on this platform")
+
+    from ahadiff.core.errors import InputError
+
+    outside_path = tmp_path / "outside-secret.txt"
+    outside_path.write_text("outside-secret\n", encoding="utf-8")
+    run_path = tmp_path / "run_hardlink"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    os.link(outside_path, artifact_path)
+
+    with pytest.raises(InputError, match="hardlinked artifact"):
+        routes_runs_module._bounded_finalized_artifact_digest(  # pyright: ignore[reportPrivateUsage]
+            run_path
+        )
+
+
+def test_routes_finalized_artifact_digest_allows_zero_inode_lstat_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_path = tmp_path / "run_zero_inode"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    artifact_path.write_text("safe artifact\n", encoding="utf-8")
+    _patch_routes_zero_identity_lstat(monkeypatch, artifact_path)
+
+    artifact_count, checksum = routes_runs_module._bounded_finalized_artifact_digest(  # pyright: ignore[reportPrivateUsage]
+        run_path
+    )
+
+    assert artifact_count == 1
+    assert len(checksum) == 64
+
+
+def test_routes_finalized_artifact_digest_rejects_replacement_with_zero_inode_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    run_path = tmp_path / "run_zero_inode_swap"
+    run_path.mkdir()
+    artifact_path = run_path / "artifact.txt"
+    artifact_bytes = b"safe-data-01\n"
+    replacement_bytes = b"evil-data-02\n"
+    assert len(artifact_bytes) == len(replacement_bytes)
+    artifact_path.write_bytes(artifact_bytes)
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_bytes(replacement_bytes)
+    expected_zero_stat = _zero_identity_stat(artifact_path.stat())
+    _patch_routes_zero_identity_lstat(monkeypatch, artifact_path)
+    original_open = routes_runs_module.os.open
+    original_fstat = routes_runs_module.os.fstat
+    open_count = 0
+    opened_fds: set[int] = set()
+
+    def fake_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        nonlocal open_count
+        if Path(cast("str | Path", path)) == artifact_path:
+            open_count += 1
+            opened_path = artifact_path if open_count == 1 else outside_path
+            fd = original_open(opened_path, flags, mode)
+            opened_fds.add(fd)
+            return fd
+        return original_open(path, flags, mode)
+
+    def fake_fstat(fd: int) -> Any:
+        if fd in opened_fds:
+            return expected_zero_stat
+        return original_fstat(fd)
+
+    monkeypatch.setattr(routes_runs_module.os, "open", fake_open)
+    monkeypatch.setattr(routes_runs_module.os, "fstat", fake_fstat)
+
+    with pytest.raises(InputError, match="changed during validation"):
+        routes_runs_module._bounded_finalized_artifact_digest(run_path)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_bounded_finalized_artifact_digest_rejects_aggregate_size_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ahadiff.core.errors import InputError
+
+    run_path = tmp_path / "run_total_limit"
+    run_path.mkdir()
+    (run_path / "one.txt").write_text("12345", encoding="utf-8")
+    (run_path / "two.txt").write_text("67890", encoding="utf-8")
+    monkeypatch.setattr(routes_runs_module, "_MAX_FINALIZED_ARTIFACTS_TOTAL_BYTES", 8)
+
+    with pytest.raises(InputError, match="total size limit"):
+        routes_runs_module._bounded_finalized_artifact_digest(  # pyright: ignore[reportPrivateUsage]
+            run_path
+        )
+
+
+def test_review_queue_uses_anyio_threadpool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    initialize_review_db(state_dir / "review.sqlite")
+    calls: list[str] = []
+    loop_threads: dict[str, int] = {}
+    worker_threads: dict[str, int] = {}
+    original_run_sync = routes_review_module.to_thread.run_sync
+
+    async def recording_run_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
+        name = getattr(func, "__name__", repr(func))
+        calls.append(name)
+        loop_threads[name] = threading.get_ident()
+
+        def invoke_in_worker() -> Any:
+            worker_threads[name] = threading.get_ident()
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            return func(*args)
+
+        return await original_run_sync(invoke_in_worker, **kwargs)
+
+    monkeypatch.setattr(routes_review_module.to_thread, "run_sync", recording_run_sync)
+    client = _client(state_dir)
+
+    assert client.get("/api/review/queue").status_code == 200
+
+    assert calls == ["_review_queue_sync", "_review_queue_projection"]
+    assert set(worker_threads) == set(calls)
+    assert all(worker_threads[name] != loop_threads[name] for name in calls)
+
+
+def test_serve_repo_write_lock_follows_thread_then_repo_lock_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class RecordingThreadLock:
+        def __enter__(self) -> None:
+            events.append("thread_enter")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+            events.append("thread_exit")
+
+    @contextmanager
+    def fake_repo_write_lock(lock_path: Path, *, command: str) -> Iterator[Path]:
+        del command
+        events.append("repo_enter")
+        yield lock_path
+        events.append("repo_exit")
+
+    state = ServeState(
+        state_dir=tmp_path / ".ahadiff",
+        token="test-token",
+        repo_lock_path=tmp_path / ".ahadiff" / "ahadiff.lock",
+        thread_write_lock=cast("Any", RecordingThreadLock()),
+    )
+    monkeypatch.setattr(serve_lock_module, "repo_write_lock", fake_repo_write_lock)
+
+    with serve_lock_module.serve_repo_write_lock(state, command="test"):
+        events.append("inside")
+
+    assert events == ["thread_enter", "repo_enter", "inside", "repo_exit", "thread_exit"]
+
+
+def test_mark_wrong_signal_is_idempotent(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+    payload = {"claim_id": "claim-1", "idempotency_key": "mark:claim-1:wrong"}
+
+    first = client.post(
+        "/api/signals/mark-wrong",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+    second = client.post(
+        "/api/signals/mark-wrong",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+
+    assert first.json() == {"inserted": True}
+    assert second.json() == {"inserted": False}
+
+
+def test_signal_write_respects_repo_write_lock(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+    payload = {"claim_id": "claim-1", "idempotency_key": "mark:claim-1:wrong"}
+
+    with repo_write_lock(state_dir / "ahadiff.lock", command="db restore"):
+        blocked = client.post(
+            "/api/signals/mark-wrong",
+            headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+            json=payload,
+        )
+
+    accepted = client.post(
+        "/api/signals/mark-wrong",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.json()["error_code"] == "LOCK_CONFLICT"
+    assert blocked.json()["error"] == "another_ahadiff_process_is_running"
+    assert accepted.status_code == 200
+    assert accepted.json() == {"inserted": True}
+
+
+def _quiz_choices(correct_text: str = "Retry loop") -> list[QuizChoice]:
+    return [
+        QuizChoice(label="A", text=correct_text, is_correct=True),
+        QuizChoice(label="B", text="It removes exception handling.", is_correct=False),
+        QuizChoice(label="C", text="It disables retry behavior.", is_correct=False),
+        QuizChoice(label="D", text="It changes only comments.", is_correct=False),
+    ]
+
+
+def _serve_review_card(
+    card_id: str,
+    *,
+    answer_mode: Literal["open", "multiple_choice"] = "open",
+) -> ReviewCard:
+    answer = "Retry loop"
+    return ReviewCard(
+        card_id=card_id,
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id=f"hunk-{card_id}",
+        hunk_hash=f"deadbeef{card_id}",
+        symbol="retry_once",
+        question="What changed?",
+        answer=answer,
+        answer_mode=answer_mode,
+        choices=_quiz_choices(answer) if answer_mode == "multiple_choice" else None,
+    )
+
+
+def _write_review_cards(
+    db_path: Path,
+    cards_path: Path,
+    cards: list[ReviewCard | dict[str, Any]],
+) -> None:
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for card in cards:
+        payload = card.model_dump(mode="json") if isinstance(card, ReviewCard) else card
+        lines.append(json.dumps(payload, sort_keys=True))
+    cards_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == len(cards)
+
+
+def _legacy_open_card_payload(card_id: str) -> dict[str, Any]:
+    payload = _serve_review_card(card_id).model_dump(mode="json")
+    payload.pop("answer_mode", None)
+    payload.pop("choices", None)
+    return payload
+
+
+def _learning_signal_payload(db_path: Path, idempotency_key: str) -> dict[str, Any]:
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM learning_signals WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+    assert row is not None
+    return cast("dict[str, Any]", json.loads(str(row["payload_json"])))
+
+
+def test_quiz_answer_signal_validates_dto_and_records_payload(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+    payload = {
+        "idempotency_key": "quiz:run-1:q1",
+        "quiz_id": "q1",
+        "choice": "Retry loop answer text",
+        "correct": False,
+        "selected_choice_label": "B",
+    }
+
+    first = client.post(
+        "/api/signals/quiz-answer",
+        headers=_WRITE_HEADERS,
+        json=payload,
+    )
+    second = client.post(
+        "/api/signals/quiz-answer",
+        headers=_WRITE_HEADERS,
+        json=payload,
+    )
+
+    assert first.json() == {"inserted": True}
+    assert second.json() == {"inserted": False}
+    with connect_review_db(state_dir / "review.sqlite") as connection:
+        row = connection.execute(
+            "SELECT signal_type, payload_json FROM learning_signals"
+        ).fetchone()
+    assert row["signal_type"] == "quiz_answer"
+    assert json.loads(row["payload_json"]) == {
+        "choice": "Retry loop answer text",
+        "correct": False,
+        "quiz_id": "q1",
+        "selected_choice_label": "B",
+    }
+
+
+def test_empty_idempotency_key_is_rejected_before_signal_write(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/mark-wrong",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"claim_id": "claim-1", "idempotency_key": ""},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    errors = _validation_errors(body)
+    assert errors[0]["loc"] == ["idempotency_key"]
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "field"),
+    [
+        (
+            "/api/signals/mark-wrong",
+            {"claim_id": "", "idempotency_key": "mark-empty-claim"},
+            "claim_id",
+        ),
+        (
+            "/api/signals/srs-review",
+            {"card_id": "", "answer": "hard", "idempotency_key": "review-empty-card"},
+            "card_id",
+        ),
+        (
+            "/api/review/rate",
+            {"card_id": "", "answer": "good", "idempotency_key": "rate-empty-card"},
+            "card_id",
+        ),
+        (
+            "/api/review/queue-state",
+            {"card_id": "", "state": "archived"},
+            "card_id",
+        ),
+    ],
+)
+def test_signal_write_rejects_empty_identifiers_before_db_write(
+    tmp_path: Path,
+    path: str,
+    payload: dict[str, object],
+    field: str,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        path,
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    errors = _validation_errors(body)
+    assert errors[0]["loc"] == [field]
+    assert not (state_dir / "review.sqlite").exists()
+
+
+def test_srs_review_records_card_review(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    card = ReviewCard(
+        card_id="card-1",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "hard", "idempotency_key": "review-1"},
+    )
+    duplicate = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "hard", "idempotency_key": "review-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["inserted"] is True
+    assert response.json()["review"]["card_id"] == "card-1"
+    assert response.json()["review"]["rating"] == 2
+    assert duplicate.json() == {"inserted": False}
+    with connect_review_db(db_path) as connection:
+        payload = connection.execute(
+            "SELECT payload_json FROM learning_signals WHERE idempotency_key = 'review-1'"
+        ).fetchone()
+    assert payload is not None
+    assert json.loads(str(payload[0]))["peeked_this_session"] is False
+
+
+def test_srs_review_accepts_selected_choice_label(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [_serve_review_card("card-1", answer_mode="multiple_choice")],
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/srs-review",
+        headers=_WRITE_HEADERS,
+        json={
+            "card_id": "card-1",
+            "answer": "wrong",
+            "selected_choice_label": "C",
+            "idempotency_key": "review-srs-choice-c",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["inserted"] is True
+    payload = _learning_signal_payload(db_path, "review-srs-choice-c")
+    assert payload["selected_choice_label"] == "C"
+    assert payload["choice_correct"] is False
+
+
+def test_srs_review_rejects_peeked_good_answer(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    card = ReviewCard(
+        card_id="card-1",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={
+            "card_id": "card-1",
+            "answer": "good",
+            "peeked_this_session": True,
+            "idempotency_key": "review-peeked-good",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "peeked cards cannot be reviewed as good or easy" in response.json()["error"]
+
+
+def test_review_queue_get_is_public_and_rate_requires_token(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    card = ReviewCard(
+        card_id="card-1",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    client = _client(state_dir)
+
+    queue = client.get("/api/review/queue")
+    denied = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765"},
+        json={"card_id": "card-1", "answer": "good", "idempotency_key": "review-api-1"},
+    )
+    accepted = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "good", "idempotency_key": "review-api-1"},
+    )
+    duplicate = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "good", "idempotency_key": "review-api-1"},
+    )
+
+    assert queue.status_code == 200
+    assert queue.json()["cards"][0]["card_id"] == "card-1"
+    assert denied.status_code == 401
+    assert "X-AhaDiff-Token" in denied.json()["error"]
+    assert accepted.status_code == 200
+    assert accepted.json()["inserted"] is True
+    assert accepted.json()["review"]["rating"] == 3
+    assert duplicate.json() == {"inserted": False}
+
+
+def test_review_rate_uses_configured_desired_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    state_dir = repo_root / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        "[learn]\ndesired_retention = 0.84\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_record_card_review_once(*_args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(
+        routes_review_module,
+        "record_card_review_once",
+        fake_record_card_review_once,
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "good", "idempotency_key": "review-api-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"inserted": False}
+    assert seen["desired_retention"] == 0.84
+
+
+def test_review_rate_uses_workspace_config_outside_git_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        "[learn]\ndesired_retention = 0.84\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_record_card_review_once(*_args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(
+        routes_review_module,
+        "record_card_review_once",
+        fake_record_card_review_once,
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "good", "idempotency_key": "review-api-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"inserted": False}
+    assert seen["desired_retention"] == 0.84
+
+
+def test_srs_review_signal_uses_configured_desired_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        "[learn]\ndesired_retention = 0.84\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_record_card_review_once(*_args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(
+        routes_signals_module,
+        "record_card_review_once",
+        fake_record_card_review_once,
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-1", "answer": "hard", "idempotency_key": "signal-api-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"inserted": False}
+    assert seen["desired_retention"] == 0.84
+
+
+def test_review_queue_returns_answer_mode_and_choices_for_due_cards(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [
+            _legacy_open_card_payload("card-open"),
+            _serve_review_card("card-multiple", answer_mode="multiple_choice"),
+        ],
+    )
+    client = _client(state_dir)
+
+    response = client.get("/api/review/queue")
+
+    assert response.status_code == 200
+    cards_by_id = {card["card_id"]: card for card in response.json()["cards"]}
+    assert cards_by_id["card-open"]["answer_mode"] == "open"
+    assert cards_by_id["card-open"]["choices"] is None
+    multiple_choice = cards_by_id["card-multiple"]
+    assert multiple_choice["answer_mode"] == "multiple_choice"
+    assert multiple_choice["choices"] == [
+        {"label": "A", "text": "Retry loop", "is_correct": True},
+        {"label": "B", "text": "It removes exception handling.", "is_correct": False},
+        {"label": "C", "text": "It disables retry behavior.", "is_correct": False},
+        {"label": "D", "text": "It changes only comments.", "is_correct": False},
+    ]
+
+
+def test_review_rate_selected_choice_label_records_choice_correct(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [_serve_review_card("card-1", answer_mode="multiple_choice")],
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers=_WRITE_HEADERS,
+        json={
+            "card_id": "card-1",
+            "answer": "wrong",
+            "selected_choice_label": "B",
+            "idempotency_key": "review-api-choice-b",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["inserted"] is True
+    payload = _learning_signal_payload(db_path, "review-api-choice-b")
+    assert payload["selected_choice_label"] == "B"
+    assert payload["choice_correct"] is False
+
+
+def test_review_rate_invalid_selected_choice_label_does_not_write_review_log(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [_serve_review_card("card-1", answer_mode="multiple_choice")],
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers=_WRITE_HEADERS,
+        json={
+            "card_id": "card-1",
+            "answer": "wrong",
+            "selected_choice_label": "Z",
+            "idempotency_key": "review-api-invalid-label",
+        },
+    )
+
+    assert response.status_code == 422
+    with connect_review_db(db_path) as connection:
+        review_log_count = connection.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
+        signal_count = connection.execute("SELECT COUNT(*) FROM learning_signals").fetchone()[0]
+    assert review_log_count == 0
+    assert signal_count == 0
+
+
+def test_review_rate_open_card_rejects_selected_choice_label_without_review_log(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [_serve_review_card("card-1")],
+    )
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers=_WRITE_HEADERS,
+        json={
+            "card_id": "card-1",
+            "answer": "wrong",
+            "selected_choice_label": "A",
+            "idempotency_key": "review-api-open-choice",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "selected_choice_label is only valid" in response.json()["error"]
+    with connect_review_db(db_path) as connection:
+        review_log_count = connection.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
+        signal_count = connection.execute("SELECT COUNT(*) FROM learning_signals").fetchone()[0]
+    assert review_log_count == 0
+    assert signal_count == 0
+
+
+def test_review_rate_duplicate_key_changed_selected_choice_label_rejects(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    _write_review_cards(
+        db_path,
+        state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl",
+        [_serve_review_card("card-1", answer_mode="multiple_choice")],
+    )
+    client = _client(state_dir)
+    payload = {
+        "card_id": "card-1",
+        "answer": "good",
+        "selected_choice_label": "A",
+        "idempotency_key": "review-api-same-key",
+    }
+
+    first = client.post("/api/review/rate", headers=_WRITE_HEADERS, json=payload)
+    changed_choice = client.post(
+        "/api/review/rate",
+        headers=_WRITE_HEADERS,
+        json={**payload, "selected_choice_label": "B"},
+    )
+
+    assert first.status_code == 200
+    assert first.json()["inserted"] is True
+    assert changed_choice.status_code == 400
+    assert "idempotency key already used" in changed_choice.json()["error"]
+
+
+def test_public_review_queue_does_not_migrate_legacy_db(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    state_dir.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE cards (id TEXT PRIMARY KEY)")
+        conn.execute("PRAGMA user_version=7")
+
+    client = _client(state_dir)
+    response = client.get("/api/review/queue")
+
+    assert response.status_code == 200
+    assert response.json() == {"cards": []}
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cards)").fetchall()}
+    assert "question" not in columns
+    assert "answer" not in columns
+
+
+def test_review_queue_reports_current_schema_corruption(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    state_dir.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE result_events (event_id TEXT PRIMARY KEY)")
+        conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+
+    client = _client(state_dir)
+    response = client.get("/api/review/queue")
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "review_database_unavailable"
+
+
+def test_review_queue_state_updates_card_without_review_log(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    card = ReviewCard(
+        card_id="card-archive",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    client = _client(state_dir)
+
+    denied = client.post(
+        "/api/review/queue-state",
+        headers={"origin": "http://localhost:8765"},
+        json={"card_id": "card-archive", "state": "archived"},
+    )
+    accepted = client.post(
+        "/api/review/queue-state",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"card_id": "card-archive", "state": "archived"},
+    )
+
+    assert denied.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "card_id": "card-archive",
+        "state": "archived",
+        "updated": True,
+    }
+    with connect_review_db(db_path) as connection:
+        row = connection.execute(
+            "SELECT card_state, archived_at_utc FROM cards WHERE id = 'card-archive'"
+        ).fetchone()
+        log_count = connection.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
+    assert row["card_state"] == "archived"
+    assert row["archived_at_utc"] is not None
+    assert log_count == 0
+
+
+def test_review_rate_rejects_peeked_easy_answer(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    card = ReviewCard(
+        card_id="card-1",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/review/rate",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={
+            "card_id": "card-1",
+            "answer": "easy",
+            "peeked_this_session": True,
+            "idempotency_key": "review-api-peeked",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "peeked cards cannot be reviewed as good or easy" in response.json()["error"]
+
+
+def test_review_queue_returns_empty_on_legacy_db_without_triggering_migration(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE result_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL
+            )
+            """
+        )
+    client = _client(state_dir)
+
+    queue = client.get("/api/review/queue")
+
+    assert queue.status_code == 200
+    assert queue.json() == {"cards": []}
+    with sqlite3.connect(db_path) as connection:
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert user_version == 0
+    assert "cards" not in tables
+
+
+def test_malformed_origin_is_rejected_without_500(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.put(
+        "/api/locale",
+        headers={"origin": "http://localhost:bad", "X-AhaDiff-Token": "test-token"},
+        json={"lang": "zh-CN"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "origin_not_allowed"
+
+
+def test_malformed_json_write_body_returns_400(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.put(
+        "/api/locale",
+        headers={
+            "content-type": "application/json",
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+        },
+        content="{not-json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "INPUT_INVALID_JSON"
+    assert response.json()["error"] == "invalid_json"
+
+
+def test_viewer_static_serves_spa_fallback_without_viewer_source_changes(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    viewer_dist = tmp_path / "viewer" / "dist"
+    viewer_dist.mkdir(parents=True)
+    (viewer_dist / "index.html").write_text("<h1>AhaDiff</h1>\n", encoding="utf-8")
+    app = create_app(ServeState(state_dir=state_dir, token="test-token"), viewer_dist=viewer_dist)
+    client = TestClient(app, base_url="http://localhost:8765")
+
+    root = client.get("/")
+    nested = client.get("/dashboard")
+
+    assert root.status_code == 200
+    assert nested.status_code == 200
+    assert "AhaDiff" in nested.text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/%5C%5Cremote.invalid%5Cshare%5Cfile",
+        "/%5C%5C%3F%5CUNC%5Cremote.invalid%5Cshare%5Cfile",
+        "/C%3A%5Coutside%5Cfile",
+        "/C%3Arelative-file",
+        "/assets/file%3Astream",
+        "/NUL.txt",
+        "/NUL%20.txt",
+        "/assets/COM%C2%B9",
+        "/assets/COM%C2%B9%20.js",
+        "/assets/%00file",
+        "/%2e%2e%5Coutside",
+    ],
+)
+def test_viewer_rejects_unsafe_static_paths_before_filesystem_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    from ahadiff.serve.static import SpaStaticFiles
+
+    viewer_dist = tmp_path / "viewer"
+    viewer_dist.mkdir()
+    (viewer_dist / "index.html").write_text("AhaDiff", encoding="utf-8")
+    looked_up: list[str] = []
+
+    def forbidden_lookup(_self: SpaStaticFiles, path: str) -> tuple[str, os.stat_result | None]:
+        looked_up.append(path)
+        raise AssertionError("unsafe path reached filesystem resolver")
+
+    monkeypatch.setattr(SpaStaticFiles, "lookup_path", forbidden_lookup)
+    app = create_app(
+        ServeState(state_dir=tmp_path / ".ahadiff", token="test-token"),
+        viewer_dist=viewer_dist,
+    )
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.get(url)
+    assert response.status_code == 404
+    assert looked_up == []
+
+
+@pytest.mark.parametrize("path", ["assets/app.js", "assets\\app.js", ".", "目录/module.js"])
+def test_viewer_static_guard_accepts_normalized_relative_asset_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    import asyncio
+
+    from starlette.responses import Response
+    from starlette.staticfiles import StaticFiles
+
+    from ahadiff.serve.static import SpaStaticFiles
+
+    received: list[str] = []
+
+    async def capture_response(_self: StaticFiles, candidate: str, _scope: object) -> Response:
+        received.append(candidate)
+        return Response("asset")
+
+    monkeypatch.setattr(StaticFiles, "get_response", capture_response)
+    response = asyncio.run(SpaStaticFiles(directory=tmp_path).get_response(path, {"type": "http"}))
+    assert response.status_code == 200
+    assert received == [path]
+
+
+def test_api_unknown_returns_json_404(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    viewer_dist = tmp_path / "viewer" / "dist"
+    viewer_dist.mkdir(parents=True)
+    (viewer_dist / "index.html").write_text("<h1>AhaDiff</h1>\n", encoding="utf-8")
+    app = create_app(ServeState(state_dir=state_dir, token="test-token"), viewer_dist=viewer_dist)
+    client = TestClient(app, base_url="http://localhost:8765")
+
+    response = client.get("/api/does-not-exist")
+
+    assert response.status_code == 404
+    assert "application/json" in response.headers["content-type"]
+    assert response.json()["error"] == "not_found"
+    assert response.json()["error_code"] == "NOT_FOUND"
+    assert response.json()["details"]["path"] == "/api/does-not-exist"
+
+
+def test_api_unknown_post_returns_json_404(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/not-a-real-endpoint",
+        headers={"origin": "http://localhost:8765"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_helpfulness_signal_records_section_id_and_rating(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+    payload = {
+        "idempotency_key": "help:run-1:section-1",
+        "target_kind": "file",
+        "target_id": "section-1",
+        "payload": {"rating": 5, "section_id": "sec-intro"},
+    }
+
+    first = client.post(
+        "/api/signals/helpfulness",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+    second = client.post(
+        "/api/signals/helpfulness",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+
+    assert first.json() == {"inserted": True}
+    assert second.json() == {"inserted": False}
+    with connect_review_db(state_dir / "review.sqlite") as connection:
+        row = connection.execute(
+            "SELECT signal_type, payload_json FROM learning_signals"
+        ).fetchone()
+    assert row["signal_type"] == "helpfulness"
+    assert json.loads(row["payload_json"]) == {
+        "target_kind": "file",
+        "target_id": "section-1",
+        "payload": {"rating": 5, "section_id": "sec-intro"},
+    }
+
+
+def test_helpfulness_signal_invalid_payload(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={"idempotency_key": "help:run-1:section-1"},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    errors = _validation_errors(body)
+    assert errors[0]["loc"] == ["target_id"]
+
+
+def test_helpfulness_signal_invalid_section_target_id_returns_422(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={
+            "idempotency_key": "help:run-1:no-separator",
+            "target_kind": "section",
+            "target_id": "no_separator",
+            "payload": {"helpful": True},
+        },
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    errors = _validation_errors(body)
+    err_item = errors[0]
+    assert "ctx" not in err_item
+    assert "target_id must contain ':'" in err_item["msg"]
+
+
+def test_helpfulness_signal_normalizes_section_target_id(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json={
+            "idempotency_key": "help:run-1:intro",
+            "target_kind": "section",
+            "target_id": "  run1  :  intro  ",
+            "payload": {"helpful": True},
+        },
+    )
+
+    assert response.json() == {"inserted": True}
+    with connect_review_db(state_dir / "review.sqlite") as connection:
+        row = connection.execute("SELECT payload_json FROM learning_signals").fetchone()
+    assert json.loads(row["payload_json"])["target_id"] == "run1:intro"
+
+
+def test_helpfulness_signal_rejects_non_finite_numbers(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    client = _client(state_dir)
+
+    response = client.post(
+        "/api/signals/helpfulness",
+        headers={
+            "content-type": "application/json",
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+        },
+        content=(
+            '{"idempotency_key":"help:run-1:section-1","target_id":"section-1",'
+            '"payload":{"rating":NaN}}'
+        ),
+    )
+
+    assert response.status_code == 400
+    assert "finite" in response.json()["error"]
+
+
+def test_failed_srs_review_does_not_poison_idempotency_key(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".ahadiff"
+    db_path = state_dir / "review.sqlite"
+    initialize_review_db(db_path)
+    client = _client(state_dir)
+    payload = {"card_id": "card-1", "answer": "hard", "idempotency_key": "review-1"}
+
+    missing_card = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+    card = ReviewCard(
+        card_id="card-1",
+        concept="retry loop",
+        run_id="run-1",
+        source_ref="abc1234",
+        fsrs_state="{}",
+        file_id="file-app",
+        display_path="src/app.py",
+        hunk_id="hunk-1",
+        hunk_hash="deadbeefcafe",
+        symbol="retry_once",
+    )
+    cards_path = state_dir / "runs" / "run-1" / "quiz" / "cards.jsonl"
+    cards_path.parent.mkdir(parents=True, exist_ok=True)
+    cards_path.write_text(json.dumps(card.model_dump(mode="json")) + "\n", encoding="utf-8")
+    assert import_cards_from_jsonl(db_path, cards_path) == 1
+    retry = client.post(
+        "/api/signals/srs-review",
+        headers={"origin": "http://localhost:8765", "X-AhaDiff-Token": "test-token"},
+        json=payload,
+    )
+
+    assert missing_card.status_code == 400
+    assert retry.status_code == 200
+    assert retry.json()["inserted"] is True
+
+
+def test_middleware_rejects_unsupported_content_type(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/signals/mark-wrong",
+        headers={
+            "content-type": "text/html",
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+        },
+        content="<html></html>",
+    )
+
+    assert response.status_code == 415
+    assert response.json()["error"] == "unsupported_media_type"
+
+
+def test_middleware_rejects_oversized_body(tmp_path: Path) -> None:
+    client = _client(tmp_path / ".ahadiff")
+
+    response = client.post(
+        "/api/signals/mark-wrong",
+        headers={
+            "content-type": "application/json",
+            "content-length": "2000000",
+            "origin": "http://localhost:8765",
+            "X-AhaDiff-Token": "test-token",
+        },
+        content='{"claim_id":"claim-1","idempotency_key":"test"}',
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "payload_too_large"
+
+
+def test_request_timeout_cancels_cooperative_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(middleware_module, "_DEFAULT_REQUEST_TIMEOUT", 0.05)
+    events: list[str] = []
+
+    async def slow_endpoint(_request: Request) -> JSONResponse:
+        try:
+            await asyncio.sleep(0.15)
+            events.append("side_effect")
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+        return JSONResponse({"ok": True})
+
+    response = _middleware_client(slow_endpoint).get("/probe")
+
+    assert response.status_code == 504
+    assert response.json()["error"] == "request_timeout"
+    assert events == ["cancelled"]
+
+
+def test_request_timeout_keeps_stream_alive_after_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(middleware_module, "_DEFAULT_REQUEST_TIMEOUT", 0.05)
+
+    async def stream() -> AsyncIterator[str]:
+        yield "data: first\n\n"
+        await asyncio.sleep(0.15)
+        yield "data: last\n\n"
+
+    async def endpoint(_request: Request) -> StreamingResponse:
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    response = _middleware_client(endpoint).get("/probe")
+
+    assert response.status_code == 200
+    assert response.text == "data: first\n\ndata: last\n\n"
+
+
+def test_request_timeout_does_not_mask_endpoint_timeout_error() -> None:
+    async def endpoint(_request: Request) -> JSONResponse:
+        raise TimeoutError("upstream operation timed out")
+
+    with pytest.raises(TimeoutError, match="upstream operation timed out"):
+        _middleware_client(endpoint).get("/probe")
+
+
+@pytest.mark.parametrize("scope_type", ["websocket", "lifespan"])
+def test_request_timeout_passes_non_http_scopes_through(scope_type: str) -> None:
+    forwarded: list[Scope] = []
+
+    async def downstream(scope: Scope, _receive: Receive, _send: Send) -> None:
+        forwarded.append(scope)
+
+    async def receive() -> Message:
+        raise AssertionError("middleware must not consume non-HTTP messages")
+
+    async def send(_message: Message) -> None:
+        raise AssertionError("middleware must not emit non-HTTP messages")
+
+    scope: Scope = {"type": scope_type}
+    asyncio.run(middleware_module.RequestTimeoutMiddleware(downstream)(scope, receive, send))
+
+    assert forwarded == [scope]
+
+
+def test_middleware_rejects_malformed_ipv6_origin() -> None:
+    assert (
+        middleware_module._is_allowed_origin(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1",
+            expected_port=8765,
+        )
+        is False
+    )
+    assert (
+        middleware_module._is_allowed_preflight_origin(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1",
+            expected_port=8765,
+        )
+        is False
+    )
+
+
+def test_middleware_preflight_respects_expected_port() -> None:
+    assert (
+        middleware_module._is_allowed_preflight_origin(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1]:9999",
+            expected_port=8765,
+        )
+        is False
+    )
+    assert (
+        middleware_module._is_allowed_preflight_origin(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1]:8765",
+            expected_port=8765,
+        )
+        is True
+    )
+
+
+def test_load_valid_finalized_marker_rejects_non_finite_json(tmp_path: Path) -> None:
+    run_path = tmp_path / "run_0123456789abcdef0123456789abcdef"
+    run_path.mkdir()
+    (run_path / "finalized.json").write_text(
+        (
+            '{"run_id":"run_0123456789abcdef0123456789abcdef","event_id":"evt-1",'
+            '"finalized_at":NaN,"artifact_count":1,"checksum":"abc"}'
+        ),
+        encoding="utf-8",
+    )
+
+    marker = routes_runs_module._load_valid_finalized_marker(  # pyright: ignore[reportPrivateUsage]
+        run_path
+    )
+
+    assert marker is None
+
+
+# --- F3 regression: pagination cursor length limit ---
+
+
+def test_cursor_exceeding_max_length_returns_400(tmp_path: Path) -> None:
+    """Overly long cursor values are rejected before touching the DB."""
+    client = _client(tmp_path)
+    long_cursor = "A" * 600
+    response = client.get(f"/api/runs?cursor={long_cursor}")
+    assert response.status_code == 400
+    assert "maximum length" in response.json()["error"]
+
+
+# --- 6A: /api/watch/status ---
+
+
+def test_watch_status_disabled_by_default(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    resp = client.get("/api/watch/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["enabled"] is False
+    assert data["running"] is False
+    assert data["pending_changes"] == 0
+    assert data["restartable"] is True
+    assert data["stop_timed_out"] is False
+    assert data["consecutive_failures"] == 0
+    assert data["total_triggers"] == 0
+    assert data["total_failures"] == 0
+    assert data["last_error"] is None
+    assert data["failure_threshold_hit"] is False
+    assert "watch_path" not in data
+
+
+class _FakeWatcher:
+    def status(self) -> dict[str, object]:
+        return {
+            "running": True,
+            "last_trigger_time": 123.0,
+            "pending_changes": 2,
+            "restartable": False,
+            "stop_timed_out": True,
+            "consecutive_failures": 3,
+            "total_triggers": 8,
+            "total_failures": 4,
+            "last_error": "boom",
+            "failure_threshold_hit": False,
+        }
+
+
+def test_watch_status_with_watcher_attached(tmp_path: Path) -> None:
+    app = create_app(ServeState(state_dir=tmp_path, token="t"))
+    app.state.file_watcher = _FakeWatcher()
+
+    client = TestClient(app, base_url="http://localhost:8765")
+    resp = client.get("/api/watch/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["enabled"] is True
+    assert data["running"] is True
+    assert data["pending_changes"] == 2
+    assert data["last_trigger_time"] == 123.0
+    assert data["restartable"] is False
+    assert data["stop_timed_out"] is True
+    assert data["consecutive_failures"] == 3
+    assert data["total_triggers"] == 8
+    assert data["total_failures"] == 4
+    assert data["last_error"] == "boom"
+    assert data["failure_threshold_hit"] is False
+    assert "watch_path" not in data

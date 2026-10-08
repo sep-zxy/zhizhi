@@ -1,0 +1,701 @@
+import { expect, test, type Page } from '@playwright/test';
+import type { ModelLimitsResponse } from '../../src/api/types';
+import { installServeMock } from '../fixtures/serve-mock';
+
+async function openPreferences(page: Page) {
+  await page.goto('/#/settings');
+  await expect(page.getByRole('tab', { name: /preferences/i })).toBeVisible();
+  await page.getByRole('tab', { name: /preferences/i }).click();
+  const panel = page.locator('#spanel-preferences');
+  await expect(panel).toBeVisible();
+  return panel;
+}
+
+async function installProviderSmartConfigMock(page: Page) {
+  const previewBodies: Record<string, unknown>[] = [];
+  const updateBodies: Record<string, unknown>[] = [];
+  const provider = {
+    alias: 'openai-gpt5',
+    role: 'generate',
+    provider_class: 'openai',
+    provider_kind: 'openai',
+    model_name: 'gpt-5.4-mini',
+    base_url: 'https://api.openai.com/v1',
+    api_key_env: 'OPENAI_API_KEY',
+    key_status: 'configured',
+    api_family: 'openai_chat',
+    api_family_version: 'v1',
+    max_output_tokens: null,
+    thinking_level: null,
+    probed: true,
+    probed_max_context: 128000,
+    probed_max_input_tokens: null,
+    probed_max_output_tokens: null,
+    probed_limits_source: null,
+    model_limits_name: null,
+    probed_tpm: 1000000,
+    probed_rpm: 500,
+    probe_timestamp: '2026-04-30T11:59:00Z',
+    available_models: ['gpt-5.4-mini', 'deployment-prod'],
+  };
+
+  await page.unroute((url) => url.pathname === '/api/providers');
+  await page.route(
+    (url) => url.pathname === '/api/providers',
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ providers: [provider] }),
+      }),
+  );
+  await page.route(
+    (url) => url.pathname === '/api/providers/model-limits/preview',
+    async (route) => {
+      const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+      previewBodies.push(body);
+      const providerClass = body.provider_class;
+      const modelName = body.model_name;
+      if (typeof providerClass !== 'string' || typeof modelName !== 'string') {
+        throw new Error('Model limits preview requires a provider class and model name');
+      }
+      const usesProfile = body.model_limits_name === 'openai/gpt-4o';
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          alias: null,
+          provider_class: providerClass,
+          model_name: modelName,
+          max_context_tokens: usesProfile ? 128000 : 400000,
+          max_input_tokens: null,
+          max_output_tokens: usesProfile ? 16384 : 128000,
+          max_context_known: true,
+          max_input_known: false,
+          max_output_known: true,
+          context_policy: 'shared_pool',
+          source: 'registry',
+          confidence: usesProfile ? 'low' : 'high',
+          warnings: usesProfile ? [{ code: 'provider_limits.low_confidence', params: {} }] : [],
+          thinking: {
+            supported: false,
+            accepted_levels: [],
+            payload_mode: 'unsupported',
+            warnings: [],
+            minimum_output_tokens: {},
+          },
+        } satisfies ModelLimitsResponse),
+      });
+    },
+  );
+  await page.route(
+    (url) => url.pathname === '/api/providers/openai-gpt5',
+    async (route) => {
+      const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+      updateBodies.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          updated: true,
+          warnings: [{ code: 'provider_limits.max_output_clamped' }],
+          provider: {
+            ...provider,
+            model_name: body.model_name,
+            max_output_tokens: body.max_output_tokens,
+            model_limits_name: body.model_limits_name,
+          },
+        }),
+      });
+    },
+  );
+
+  return { previewBodies, updateBodies };
+}
+
+test.describe('cross-browser corner cases', () => {
+  test.beforeEach(async ({ page, context }) => {
+    await context.clearCookies();
+    await installServeMock(page);
+  });
+
+  for (const locale of ['en', 'zh-CN']) {
+    test(`page frames stay centered on wide screens and usable on phones (${locale})`, async ({ page, baseURL }) => {
+      if (!baseURL) throw new Error('baseURL is required');
+      await page.context().addCookies([{ name: 'ahadiff_lang', value: locale, url: baseURL }]);
+      const routes = [
+        { hash: '/', selector: '[data-page="dashboard"]' },
+        { hash: '/run/test-run/lesson', selector: '[data-page="lesson"]' },
+        { hash: '/run/test-run/diff', selector: '[data-page="diff"]' },
+        { hash: '/ratchet', selector: '.ratchet-page' },
+      ];
+
+      for (const width of [2560, 375]) {
+        await page.setViewportSize({ width, height: width > 1000 ? 1440 : 812 });
+        for (const route of routes) {
+          await page.goto(`/#${route.hash}`);
+          const frame = page.locator(route.selector);
+          await expect(frame).toBeVisible();
+          await expect.poll(() => frame.evaluate(element => {
+            const available = element.parentElement?.getBoundingClientRect();
+            if (!available) throw new Error('Page frame has no content container');
+            const bounds = element.getBoundingClientRect();
+            return Math.abs((bounds.left - available.left) - (available.right - bounds.right));
+          })).toBeLessThanOrEqual(2);
+          expect(await page.evaluate(() =>
+            document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          )).toBeLessThanOrEqual(1);
+
+          if (width > 1000 && route.hash.endsWith('/diff')) {
+            const code = page.locator('.diff-page__body');
+            const inspector = page.locator('.claim-inspector');
+            await expect(code.locator('.diff-view')).toBeVisible();
+            await expect(inspector).toBeVisible();
+            const codeBounds = await code.boundingBox();
+            const inspectorBounds = await inspector.boundingBox();
+            if (!codeBounds || !inspectorBounds) throw new Error('Diff columns are not rendered');
+            expect(codeBounds.width).toBeGreaterThan(inspectorBounds.width);
+
+            const compact = page.locator('.diff-page__header .graphify-card--compact');
+            const counts = compact.locator('.graphify-card__counts');
+            await expect(counts).toBeVisible();
+            const compactBounds = await compact.boundingBox();
+            const countsBounds = await counts.boundingBox();
+            if (!compactBounds || !countsBounds) throw new Error('Graph summary is not rendered');
+            expect(compactBounds.width).toBeGreaterThan(100);
+            expect(countsBounds.x + countsBounds.width).toBeLessThanOrEqual(compactBounds.x + compactBounds.width + 1);
+          }
+        }
+      }
+    });
+  }
+
+  test('rapid locale toggle settles to final state', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    await page.goto('/');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    const switcher = page.getByRole('group', { name: /Language|语言/i });
+    const zhBtn = switcher.getByRole('button', { name: '简体中文' });
+    const enBtn = switcher.getByRole('button', { name: 'English' });
+
+    // Rapid toggle: en -> zh-CN -> en -> zh-CN without awaiting intermediate UI
+    await zhBtn.click();
+    await enBtn.click();
+    await zhBtn.click();
+    await enBtn.click();
+
+    // Final state should be en
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Dashboard/i);
+    await expect(enBtn).toHaveAttribute('aria-pressed', 'true');
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('Settings preferences saves fixed quiz count 30', async ({ page }) => {
+    const panel = await openPreferences(page);
+    const quizCount = panel.getByRole('spinbutton', { name: 'Quiz question count' });
+    await expect(quizCount).toHaveValue('3');
+
+    await quizCount.fill('30');
+    const putWait = page.waitForResponse(
+      (res) => res.url().endsWith('/api/config') && res.request().method() === 'PUT',
+    );
+    await panel.getByRole('button', { name: 'Save' }).click();
+    await putWait;
+
+    await expect(quizCount).toHaveValue('30');
+    await expect(panel.getByText('Choose a number from 1 to 30.')).toBeVisible();
+  });
+
+  test('Settings preferences saves adaptive quiz range up to 30', async ({ page }) => {
+    const panel = await openPreferences(page);
+    await panel.getByRole('button', { name: 'Adaptive' }).click();
+    const minInput = panel.getByRole('spinbutton', { name: 'Min questions' });
+    const maxInput = panel.getByRole('spinbutton', { name: 'Max questions' });
+    await expect(maxInput).toHaveValue('12');
+
+    await minInput.fill('3');
+    await maxInput.fill('30');
+    const putWait = page.waitForResponse(
+      (res) => res.url().endsWith('/api/config') && res.request().method() === 'PUT',
+    );
+    await panel.getByRole('button', { name: 'Save' }).click();
+    await putWait;
+
+    await expect(panel.getByRole('button', { name: 'Adaptive' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    await expect(minInput).toHaveValue('3');
+    await expect(maxInput).toHaveValue('30');
+  });
+
+  test('Settings quiz count range copy switches locale', async ({ page }) => {
+    const panel = await openPreferences(page);
+    await expect(panel.getByText('Choose a number from 1 to 30.')).toBeVisible();
+
+    await panel.getByRole('button', { name: 'Adaptive' }).click();
+    await expect(
+      panel.getByText('Range bounds accept 1 to 30. Defaults adapt between 3 and 12 based on diff complexity.'),
+    ).toBeVisible();
+
+    const putWait = page.waitForResponse(
+      (res) => res.url().endsWith('/api/locale') && res.request().method() === 'PUT',
+    );
+    await panel.getByRole('button', { name: '简体中文' }).click();
+    await putWait;
+
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN');
+    await expect(panel.getByText('范围上下限可设置在 1 到 30 之间。默认根据 diff 复杂度在 3 到 12 之间自适应。')).toBeVisible();
+    await panel.getByRole('button', { name: '固定' }).click();
+    await expect(panel.getByText('可选范围 1 到 30。')).toBeVisible();
+  });
+
+  test('Settings preferences quiz controls have no mobile overflow', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 });
+    const panel = await openPreferences(page);
+    await panel.getByRole('button', { name: 'Adaptive' }).click();
+    await expect(panel.getByRole('spinbutton', { name: 'Max questions' })).toBeVisible();
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+  });
+
+  test('Settings provider smart config uses draft limits profile and localized warnings', async ({
+    page,
+  }) => {
+    const { previewBodies, updateBodies } = await installProviderSmartConfigMock(page);
+
+    await page.goto('/#/settings?tab=provider');
+    const card = page.getByTestId('provider-card-openai-gpt5');
+    await expect(card).toBeVisible();
+    await card.locator('.provider-card__header').click();
+    await card.getByRole('button', { name: 'Edit' }).click();
+
+    await expect(card.getByText('Max Output', { exact: true })).toBeVisible();
+    await expect(card.getByText('128,000')).toBeVisible();
+    await card.getByText('Advanced').click();
+    await card.getByLabel('Model Name').fill('deployment-prod');
+    await card.getByLabel('Limits profile').fill('openai/gpt-4o');
+    await card.getByLabel('Max Output Tokens').fill('200000');
+
+    await expect(card.getByText('This registry row has low confidence')).toBeVisible();
+    await expect
+      .poll(() =>
+        previewBodies.some(
+          (body) =>
+            body.model_name === 'deployment-prod'
+            && body.model_limits_name === 'openai/gpt-4o',
+        ),
+      )
+      .toBe(true);
+
+    const localeWait = page.waitForResponse(
+      (res) => res.url().endsWith('/api/locale') && res.request().method() === 'PUT',
+    );
+    await page.getByRole('button', { name: '简体中文' }).click();
+    await localeWait;
+
+    await expect(card.getByText('该注册表条目可信度较低')).toBeVisible();
+    await card.getByRole('button', { name: '使用推荐值' }).click();
+    await expect(card.getByLabel('最大输出 Tokens')).toHaveValue('16384');
+    await card.getByRole('button', { name: '保存' }).click();
+
+    await expect(card.getByText('已把保存的输出覆盖值收敛到已知模型上限')).toBeVisible();
+    await expect
+      .poll(() => updateBodies.at(-1))
+      .toMatchObject({
+        model_name: 'deployment-prod',
+        model_limits_name: 'openai/gpt-4o',
+        max_output_tokens: 16384,
+      });
+  });
+
+  test('rapid sequential navigation produces no JS errors', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    await page.goto('/');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    // Navigate rapidly: Dashboard -> Lesson -> Quiz -> Concepts
+    await page.goto('/#/run/test-run/lesson');
+    await page.goto('/#/run/test-run/quiz');
+    await page.goto('/#/concepts');
+
+    // Final page should render Concepts heading
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Concept/i);
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('dashboard fetch error shows alert then recovers on retry navigation', async ({
+    page,
+  }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    // Override /api/runs to fail
+    await page.route(
+      (url) => url.pathname === '/api/runs',
+      (route) => route.fulfill({ status: 500, contentType: 'text/plain', body: 'error' }),
+    );
+
+    await page.goto('/');
+
+    // Should show error alert
+    const alert = page.locator('[role="alert"]');
+    await expect(alert).toBeVisible();
+
+    // Remove the failing route and re-add the success route
+    await page.unroute((url) => url.pathname === '/api/runs');
+    await page.route(
+      (url) => url.pathname === '/api/runs',
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ runs: [] }),
+        }),
+    );
+
+    // Navigate away and back to trigger refetch
+    await page.goto('/#/concepts');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    await page.goto('/');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Dashboard/i);
+
+    // Error alert should be gone, empty state should show
+    await expect(page.locator('.dashboard__empty')).toBeVisible();
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('empty runs list renders Dashboard empty hint', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    // Default mock returns { runs: [] }
+    await page.goto('/');
+
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Dashboard/i);
+    // Verify empty state hint text is visible
+    const emptyHint = page.locator('.dashboard__empty-hint');
+    await expect(emptyHint).toBeVisible();
+    await expect(emptyHint).toHaveText(/ahadiff learn/);
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('Dashboard empty Learn dialog suppresses global search shortcut', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: /Start your first Learn Run/i }).click();
+
+    const learnDialog = page.getByRole('dialog', { name: /Start a Learn Run/i });
+    await expect(learnDialog).toBeVisible();
+    const advancedToggle = learnDialog.getByRole('button', { name: /More options for this source/i });
+    await expect(advancedToggle).toHaveAttribute('aria-expanded', 'false');
+    await advancedToggle.focus();
+
+    await page.keyboard.press('Control+K');
+
+    await expect(page.getByRole('dialog')).toHaveCount(1);
+    await expect(learnDialog).toBeVisible();
+    await expect(page.getByRole('dialog', { name: /Search|搜索/i })).toHaveCount(0);
+  });
+
+  test('topbar wires search button + active New-Run button', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    const viewport = page.viewportSize();
+    const isMobile = viewport != null && viewport.width < 768;
+    const usesMobilePreview = viewport != null && viewport.width <= 768;
+
+    const searchBtn = page.getByRole('button', { name: /Open search/i });
+    const newRun = page.locator('.topbar__btn--primary');
+
+    if (isMobile) {
+      await expect(searchBtn).toHaveCount(0);
+      await page.keyboard.press('Control+K');
+    } else {
+      await expect(searchBtn).toBeVisible();
+      await expect(searchBtn).toHaveCount(1);
+      await expect(searchBtn).not.toHaveAttribute('aria-disabled', 'true');
+      await expect(newRun).toBeVisible();
+      await expect(newRun).not.toBeDisabled();
+      await searchBtn.click();
+    }
+
+    await expect(page.getByRole('dialog', { name: /Search|搜索/i })).toBeVisible();
+    await expect(page.locator('.topbar')).toHaveAttribute('inert', '');
+    await expect(page.locator('.app-shell__body')).toHaveAttribute('inert', '');
+    await expect(page.locator('#search-overlay-input')).toBeFocused();
+    const backgroundTookFocus = await page.evaluate(() => {
+      const target = document.querySelector<HTMLElement>('.topbar__search, .topbar__mobile-btn');
+      target?.focus();
+      return !document.activeElement?.closest('.search-overlay');
+    });
+    expect(backgroundTookFocus).toBe(false);
+
+    const allFilter = page.getByRole('radio', { name: /^All$/ });
+    const conceptsFilter = page.getByRole('radio', { name: /^Concepts$/ });
+    await expect(allFilter).toHaveAttribute('aria-checked', 'true');
+    await allFilter.focus();
+    await page.keyboard.press('ArrowRight');
+    await expect(conceptsFilter).toBeFocused();
+    await expect(conceptsFilter).toHaveAttribute('aria-checked', 'true');
+    await page.keyboard.press('ArrowLeft');
+    await expect(allFilter).toBeFocused();
+    await expect(allFilter).toHaveAttribute('aria-checked', 'true');
+    await page.keyboard.press('ArrowRight');
+    await expect(conceptsFilter).toBeFocused();
+    await expect(conceptsFilter).toHaveAttribute('aria-checked', 'true');
+
+    const searchTablesSeen: string[] = [];
+    await page.route(
+      (url) => url.pathname === '/api/search',
+      (route) => {
+        searchTablesSeen.push(new URL(route.request().url()).searchParams.get('tables') ?? '');
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            results: [
+              {
+                source_table: 'result_events',
+                primary_key: 'event-123',
+                snippet: 'task timeout result',
+                rank: 0.9,
+                href: '#/run/run-real/lesson',
+              },
+            ],
+          }),
+        });
+      },
+    );
+    const searchInput = page.locator('#search-overlay-input');
+    await searchInput.focus();
+    await searchInput.fill('timeout');
+    await expect(searchInput).toHaveValue('timeout');
+    const resultButton = page.locator('.search-overlay__result-btn').first();
+    await expect(resultButton).toContainText('task timeout result');
+    expect(searchTablesSeen.at(-1)).toBe('concepts');
+    await resultButton.click();
+    if (usesMobilePreview) {
+      await page.locator('.search-overlay__preview-btn').click();
+    }
+    await expect(page).toHaveURL(/#\/run\/run-real\/lesson/);
+  });
+
+  test('ScaffoldingTabs keyboard navigation moves focus correctly', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    await page.goto('/#/run/test-run/lesson');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    const tablist = page.getByRole('tablist', { name: /Lesson/i });
+    await expect(tablist).toBeVisible();
+
+    // Tab order: compact → hint → full (simple-to-complex)
+    // Mock weak concepts return scaffolding_level='full', so auto-recommendation selects Full
+    const compactTab = tablist.getByRole('tab', { name: /Compact/i });
+    const hintTab = tablist.getByRole('tab', { name: /Hint/i });
+    const fullTab = tablist.getByRole('tab', { name: /Full/i });
+
+    await expect(fullTab).toHaveAttribute('aria-selected', 'true');
+
+    // Focus the active tab then use ArrowLeft (full is rightmost, move left)
+    await fullTab.focus();
+    await page.keyboard.press('ArrowLeft');
+    await expect(hintTab).toHaveAttribute('aria-selected', 'true');
+    await expect(hintTab).toBeFocused();
+
+    await page.keyboard.press('ArrowLeft');
+    await expect(compactTab).toHaveAttribute('aria-selected', 'true');
+    await expect(compactTab).toBeFocused();
+
+    // ArrowRight should move back
+    await page.keyboard.press('ArrowRight');
+    await expect(hintTab).toHaveAttribute('aria-selected', 'true');
+    await expect(hintTab).toBeFocused();
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('long lesson content does not produce horizontal overflow', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    // Override lesson endpoint with very long content
+    const longLine = 'A'.repeat(2000);
+    const longContent = `# Very Long Lesson\n\n${longLine}\n\nEnd of lesson.`;
+    await page.route(
+      (url) => /^\/api\/run\/[^/]+\/lesson$/.test(url.pathname),
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            run_id: 'test-run',
+            artifact_type: 'lesson',
+            content: longContent,
+            content_lang: 'en',
+          }),
+        }),
+    );
+
+    await page.goto('/#/run/test-run/lesson');
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    // Wait for lesson content to render (V6 3-column: prose container)
+    await expect(page.locator('.lesson__prose')).toBeVisible();
+
+    // Check that document-level horizontal overflow does not exist
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('mobile viewport opens sidebar drawer from hamburger', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.goto('/');
+
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+
+    const menuButton = page.locator('.topbar__mobile-btn');
+    const sidebar = page.locator('#sidebar');
+    await expect(menuButton).toBeVisible();
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(sidebar).not.toHaveClass(/sidebar--open/);
+
+    await menuButton.click();
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'true');
+    await expect(sidebar).toHaveClass(/sidebar--open/);
+
+    const nav = page.getByRole('navigation', { name: /Navigation|导航/i });
+    await expect(nav).toBeVisible();
+
+    const dashboardLink = nav.getByRole('link', { name: /Dashboard/ });
+    await expect(dashboardLink).toBeVisible();
+
+    const conceptsLink = nav.getByRole('link', { name: /Concepts/ });
+    await expect(conceptsLink).toBeVisible();
+
+    await page.keyboard.press('Escape');
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(sidebar).not.toHaveClass(/sidebar--open/);
+    await expect(menuButton).toBeFocused();
+
+    await menuButton.click();
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'true');
+    await expect(sidebar).toHaveClass(/sidebar--open/);
+
+    await page.locator('.app-shell__backdrop').click();
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(sidebar).not.toHaveClass(/sidebar--open/);
+    await expect(menuButton).toBeFocused();
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+
+    expect(errors).toHaveLength(0);
+  });
+
+  test('769-1024px viewport shows icon-only sidebar rail (no drawer)', async ({ page }) => {
+    /* Three-state sidebar paradigm (matches AppShell.tsx + Sidebar.css):
+     *   <=768px:    drawer overlay with hamburger (JS-driven, isMobileNav=true)
+     *   769-1024px: icon-only rail (~56px, sidebar always visible, hamburger hidden)
+     *   >1024px:    full sidebar (~248px, hamburger hidden, labels visible)
+     */
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await page.goto('/');
+
+    const menuButton = page.locator('.topbar__mobile-btn');
+    const sidebar = page.locator('#sidebar');
+
+    // -- Top boundary (1024px): still icon rail, hamburger hidden.
+    await expect(menuButton).toBeHidden();
+    await expect(sidebar).toBeVisible();
+    await expect(sidebar).not.toHaveClass(/sidebar--open/);
+    const sidebarBox = await sidebar.boundingBox();
+    expect(sidebarBox?.width).toBeGreaterThanOrEqual(50);
+    expect(sidebarBox?.width).toBeLessThanOrEqual(70);
+
+    // -- Mid-rail (~900px): explicit assertion that the icon rail is the
+    //    visible paradigm (not the drawer). Brand text + nav labels collapse,
+    //    but icons remain visible and NavLinks keep aria-label semantics.
+    await page.setViewportSize({ width: 900, height: 800 });
+    await expect(menuButton).toBeHidden();
+    await expect(sidebar).toBeVisible();
+    await expect(sidebar.locator('.sidebar__brand-text')).toBeHidden();
+    await expect(sidebar.locator('.sidebar__label-main').first()).toBeHidden();
+    await expect(sidebar.locator('.sidebar__icon').first()).toBeVisible();
+    const dashboardRailLink = sidebar.getByRole('link', { name: /Dashboard/ });
+    await expect(dashboardRailLink).toBeVisible();
+    await dashboardRailLink.focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/#\/?$/);
+    const disabledLesson = sidebar.locator('.sidebar__item--disabled[aria-label^="Lesson"]').first();
+    await expect(disabledLesson).toHaveAttribute('title', /Lesson.*run/i);
+    const railOverflow = await sidebar.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(railOverflow).toBeLessThanOrEqual(0);
+
+    // -- Bottom boundary (769px): still icon rail.
+    await page.setViewportSize({ width: 769, height: 768 });
+    await expect(menuButton).toBeHidden();
+    await expect(sidebar).toBeVisible();
+
+    // -- 768px crosses into drawer mode: hamburger appears, sidebar closed.
+    await page.setViewportSize({ width: 768, height: 1024 });
+    await expect(menuButton).toBeVisible();
+    await expect(sidebar).not.toHaveClass(/sidebar--open/);
+    await page.evaluate(() => {
+      document.documentElement.setAttribute('dir', 'rtl');
+    });
+    await expect
+      .poll(() => sidebar.evaluate((el) => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41))
+      .toBeGreaterThan(0);
+    await menuButton.click();
+    await expect(menuButton).toHaveAttribute('aria-expanded', 'true');
+    await expect
+      .poll(() => sidebar.evaluate((el) => Math.round(new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)))
+      .toBe(0);
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => {
+      document.documentElement.removeAttribute('dir');
+    });
+
+    // -- Above 1024px: full sidebar returns with labels visible.
+    await page.setViewportSize({ width: 1025, height: 800 });
+    await expect(menuButton).toBeHidden();
+    await expect(sidebar).toBeVisible();
+    const justFullBox = await sidebar.boundingBox();
+    expect(justFullBox?.width).toBeGreaterThan(200);
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(menuButton).toBeHidden();
+    await expect(sidebar).toBeVisible();
+    const fullBox = await sidebar.boundingBox();
+    expect(fullBox?.width).toBeGreaterThan(200);
+    await expect(sidebar.locator('.sidebar__brand-text')).toBeVisible();
+    await expect(sidebar.locator('.sidebar__label-main').first()).toBeVisible();
+  });
+});

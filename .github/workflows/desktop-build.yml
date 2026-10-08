@@ -1,0 +1,158 @@
+name: Desktop Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+            arch: x64
+            command: package:win
+          - platform: macos-arm64
+            runner: macos-15
+            arch: arm64
+            command: package:mac
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.33.0'
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: |
+            viewer/pnpm-lock.yaml
+            desktop/pnpm-lock.yaml
+
+      - name: Validate source and build viewer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm --dir viewer install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败' }
+          pnpm --dir viewer typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript 校验失败' }
+          node --check desktop/main.mjs
+          if ($LASTEXITCODE -ne 0) { throw '桌面入口语法校验失败' }
+          pnpm --dir viewer build
+          if ($LASTEXITCODE -ne 0) { throw '前端构建失败' }
+
+      - name: Build Python sidecar
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv sync --frozen --no-dev --group desktop --python 3.13
+          if ($LASTEXITCODE -ne 0) { throw 'Python 依赖安装失败' }
+          & 'desktop/build-sidecar.ps1'
+
+      - name: Package desktop app
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm --dir desktop install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw '桌面依赖安装失败' }
+          pnpm --dir desktop '${{ matrix.command }}' '--${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw '桌面打包失败' }
+
+      - name: Verify packaged resources and startup
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+              $resources = 'dist/desktop/win-unpacked/resources'
+              $binary = 'dist/desktop/win-unpacked/知枝.exe'
+              $sidecar = Join-Path $resources 'sidecar/growth-sidecar.exe'
+          } else {
+              $app = Get-ChildItem -LiteralPath 'dist/desktop/mac-arm64' -Directory -Filter '*.app' | Select-Object -First 1
+              if (-not $app) { throw '缺少 macOS 应用' }
+              $resources = Join-Path $app.FullName 'Contents/Resources'
+              $sidecar = Join-Path $resources 'sidecar/growth-sidecar'
+              codesign --verify --deep --strict $app.FullName
+              if ($LASTEXITCODE -ne 0) { throw 'macOS 临时签名校验失败' }
+          }
+          foreach ($required in @('viewer/index.html', 'icon.png', 'app.asar')) {
+              if (-not (Test-Path -LiteralPath (Join-Path $resources $required))) { throw "打包资源缺失：$required" }
+          }
+          if ((Get-FileHash -LiteralPath (Join-Path $resources 'icon.png')).Hash -ne
+              (Get-FileHash -LiteralPath 'viewer/public/icons/growth-192.png').Hash) { throw '打包图标与新品牌图标不一致' }
+          $version = & $sidecar --version
+          if ($LASTEXITCODE -ne 0) { throw '打包后端无法启动' }
+          $startup = 'sidecar-version-pass'
+          if ($IsWindows) {
+              $env:GROWTH_WORKSPACE = Join-Path $env:RUNNER_TEMP 'zhizhi-smoke-workspace'
+              $env:GROWTH_SMOKE_EXIT = '1'
+              $stdout = Join-Path $env:RUNNER_TEMP 'zhizhi-smoke.stdout.log'
+              $stderr = Join-Path $env:RUNNER_TEMP 'zhizhi-smoke.stderr.log'
+              $process = Start-Process -FilePath (Resolve-Path -LiteralPath $binary).Path -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+              if (-not $process.WaitForExit(90000)) {
+                  Stop-Process -Id $process.Id -Force
+                  throw '打包应用启动超时'
+              }
+              $process.Refresh()
+              $output = (Get-Content -LiteralPath $stdout -Encoding UTF8 -Raw) + (Get-Content -LiteralPath $stderr -Encoding UTF8 -Raw)
+              if ($process.ExitCode -ne 0 -or $output -notmatch 'GROWTH_DESKTOP_SMOKE_OK') { throw "打包应用启动失败：$output" }
+              $startup = 'desktop-load-pass'
+          }
+          [ordered]@{
+              commit = '${{ github.sha }}'
+              run_url = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+              platform = '${{ matrix.platform }}'
+              desktop_version = (Get-Content -LiteralPath 'desktop/package.json' -Encoding UTF8 -Raw | ConvertFrom-Json).version
+              sidecar_version = $version
+              icon_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $resources 'icon.png')).Hash.ToLowerInvariant()
+              startup = $startup
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath 'dist/desktop/build-info.json' -Encoding UTF8
+
+      - name: Generate SHA256 checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = Get-ChildItem -LiteralPath 'dist/desktop' -File | Where-Object Extension -In '.exe', '.dmg'
+          if (-not $packages) { throw '未生成安装包' }
+          $packages | ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath 'dist/desktop/SHA256SUMS.txt' -Encoding UTF8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zhizhi-${{ matrix.platform }}
+          path: |
+            dist/desktop/*.exe
+            dist/desktop/*.dmg
+            dist/desktop/SHA256SUMS.txt
+            dist/desktop/build-info.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.platform }}
+          path: |
+            dist/desktop/builder-debug.yml
+            dist/desktop/builder-effective-config.yaml
+            ${{ runner.temp }}/zhizhi-smoke.*.log
+          if-no-files-found: ignore

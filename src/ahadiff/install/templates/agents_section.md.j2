@@ -1,0 +1,29 @@
+## AhaDiff
+
+This section is shared by Codex CLI and OpenCode; keep it tool-neutral.
+
+Use AhaDiff after meaningful code changes to turn the current diff into verified
+lessons, claims, quiz cards, and score artifacts.
+
+Common commands:
+
+- `ahadiff learn HEAD~1..HEAD`
+- `ahadiff learn --staged`
+- `ahadiff quiz <run_id>`
+- `ahadiff review`
+- `ahadiff verify <run_id>`
+- `ahadiff improve --rounds 1`
+- `ahadiff serve`
+
+Additional learn capture modes:
+
+- `ahadiff learn --last`
+- `ahadiff learn --since "2 hours ago"`
+
+## Boundaries
+
+- Keep provider credentials in environment variables.
+- Do not commit `.ahadiff/audit.private.jsonl`.
+- Treat `.ahadiff/` as local state.
+- Prefer verified claims with file-line evidence.
+- Do not upload `.ahadiff/` artifacts to external services without explicit user consent.

@@ -1,0 +1,977 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from ahadiff.contracts import ClaimRecord, ClaimStatus, RejectReasonCode, SourceHunk, SourceHunkSide
+from ahadiff.core.paths import path_identity_key
+from ahadiff.core.source_evidence import is_faithful_source_quote, validate_source_anchor_references
+
+from .classify import classify_claim_status, resolve_claim_confidence
+from .negative_scan import scan_negative_evidence
+from .schema import ClaimCandidate, VerifiedClaim
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
+
+    from ahadiff.contracts import ClaimExtractor
+    from ahadiff.contracts.source_anchor import SourceAnchor
+    from ahadiff.git.line_map import FileLineMap, HunkLineMap
+    from ahadiff.git.symbols import SymbolRecord
+
+
+_MAX_SOURCE_HUNK_SPAN = 120
+
+
+@dataclass(frozen=True)
+class _MatchedContext:
+    source_hunks: tuple[SourceHunk, ...]
+    matched_hunks: tuple[HunkLineMap, ...]
+
+
+@dataclass(frozen=True)
+class _MatchFailure:
+    reason_code: RejectReasonCode
+    source_hunks: tuple[SourceHunk, ...]
+
+
+def verify_claim_candidate(
+    candidate: ClaimCandidate,
+    *,
+    line_maps: Iterable[FileLineMap],
+    symbols: Iterable[SymbolRecord],
+    before_text_by_path: Mapping[str, str] | None = None,
+    after_text_by_path: Mapping[str, str] | None = None,
+    source_anchors: Sequence[SourceAnchor] = (),
+    source_kind: str = "diff",
+) -> VerifiedClaim:
+    if candidate.source_anchors or source_kind == "document":
+        return _verify_format_candidate(
+            candidate,
+            source_anchors=source_anchors,
+            source_kind=source_kind,
+            line_maps=tuple(line_maps),
+            symbols=tuple(symbols),
+            before_text_by_path=before_text_by_path,
+            after_text_by_path=after_text_by_path,
+        )
+    file_lookup = _build_file_lookup(line_maps)
+    before_lookup = _build_text_lookup(before_text_by_path or {})
+    after_lookup = _build_text_lookup(after_text_by_path or {})
+    matched = _match_source_hunks(
+        candidate.source_hunks,
+        file_lookup=file_lookup,
+        before_text_lookup=before_lookup,
+        after_text_lookup=after_lookup,
+    )
+    if isinstance(matched, _MatchFailure):
+        return VerifiedClaim(
+            record=ClaimRecord(
+                claim_id=candidate.claim_id,
+                run_id=candidate.run_id,
+                text=candidate.text,
+                status="rejected",
+                reason_code=matched.reason_code,
+                confidence="low",
+                source_hunks=list(matched.source_hunks),
+                symbols=list(candidate.symbols),
+                extractor=_resolve_claim_extractor(candidate),
+            )
+        )
+
+    matched_hunk_ids = tuple(dict.fromkeys(hunk.hunk_id for hunk in matched.matched_hunks))
+    if candidate.hunk_ids and any(
+        hunk_id not in matched_hunk_ids for hunk_id in candidate.hunk_ids
+    ):
+        return VerifiedClaim(
+            record=ClaimRecord(
+                claim_id=candidate.claim_id,
+                run_id=candidate.run_id,
+                text=candidate.text,
+                status="rejected",
+                reason_code="hunk_id_mismatch",
+                confidence="low",
+                source_hunks=list(matched.source_hunks),
+                symbols=list(candidate.symbols),
+                extractor=_resolve_claim_extractor(candidate),
+            ),
+            matched_hunk_ids=list(matched_hunk_ids),
+        )
+
+    symbol_matches, unmatched_symbols = _match_symbols(
+        candidate.symbols,
+        source_hunks=matched.source_hunks,
+        matched_hunks=matched.matched_hunks,
+        symbols=symbols,
+    )
+    negative_evidence = scan_negative_evidence(
+        candidate.text,
+        source_hunks=matched.source_hunks,
+        matched_symbols=symbol_matches,
+        before_text_by_path=before_text_by_path or {},
+        after_text_by_path=after_text_by_path or {},
+    )
+    status = classify_claim_status(
+        unmatched_symbols=unmatched_symbols,
+        negative_evidence=negative_evidence,
+        matched_symbols=symbol_matches,
+    )
+    confidence = resolve_claim_confidence(
+        status=status,
+        matched_symbols=symbol_matches,
+    )
+    return VerifiedClaim(
+        record=ClaimRecord(
+            claim_id=candidate.claim_id,
+            run_id=candidate.run_id,
+            text=candidate.text,
+            status=status,
+            confidence=confidence,
+            source_hunks=list(matched.source_hunks),
+            symbols=list(candidate.symbols),
+            negative_evidence=[item.render() for item in negative_evidence],
+            extractor=_resolve_claim_extractor(candidate, symbol_matches=symbol_matches),
+        ),
+        matched_hunk_ids=list(matched_hunk_ids),
+        matched_symbols=[item.qualified_name for item in symbol_matches],
+        negative_evidence=list(negative_evidence),
+    )
+
+
+def verify_claim_candidates(
+    candidates: Iterable[ClaimCandidate],
+    *,
+    line_maps: Iterable[FileLineMap],
+    symbols: Iterable[SymbolRecord],
+    before_text_by_path: Mapping[str, str] | None = None,
+    after_text_by_path: Mapping[str, str] | None = None,
+    source_anchors: Sequence[SourceAnchor] = (),
+    source_kind: str = "diff",
+) -> tuple[VerifiedClaim, ...]:
+    line_map_items = tuple(line_maps)
+    symbol_items = tuple(symbols)
+    before_lookup = before_text_by_path or {}
+    after_lookup = after_text_by_path or {}
+    return tuple(
+        verify_claim_candidate(
+            candidate,
+            line_maps=line_map_items,
+            symbols=symbol_items,
+            before_text_by_path=before_lookup,
+            after_text_by_path=after_lookup,
+            source_anchors=source_anchors,
+            source_kind=source_kind,
+        )
+        for candidate in candidates
+    )
+
+
+def _verify_format_candidate(
+    candidate: ClaimCandidate,
+    *,
+    source_anchors: Sequence[SourceAnchor],
+    source_kind: str,
+    line_maps: Sequence[FileLineMap],
+    symbols: Sequence[SymbolRecord],
+    before_text_by_path: Mapping[str, str] | None,
+    after_text_by_path: Mapping[str, str] | None,
+) -> VerifiedClaim:
+    expected_kind = "document" if source_kind == "document" else "diff"
+    valid = validate_source_anchor_references(candidate.source_anchors, source_anchors)
+    valid = valid and all(
+        anchor.source_kind == expected_kind for anchor in candidate.source_anchors
+    )
+    if source_kind == "document" and (
+        candidate.source_hunks or candidate.hunk_ids or candidate.symbols
+    ):
+        valid = False
+    matched_hunks: list[SourceHunk] = []
+    if valid and expected_kind == "diff":
+        for anchor in candidate.source_anchors:
+            intersections: list[SourceHunk] = []
+            for file_map in line_maps:
+                path = file_map.old_path if anchor.side == "old" else file_map.new_path
+                if path is None or _identity(path) != _identity(anchor.file):
+                    continue
+                for hunk in file_map.hunks:
+                    line_numbers = (
+                        set(hunk.deleted_lines) | set(hunk.context_old_lines)
+                        if anchor.side == "old"
+                        else set(hunk.added_lines) | set(hunk.context_new_lines)
+                    )
+                    for start, end in _line_number_ranges(
+                        {line for line in line_numbers if anchor.start <= line <= anchor.end}
+                    ):
+                        intersections.append(
+                            SourceHunk(
+                                file=anchor.file,
+                                start=start,
+                                end=end,
+                                side=cast("SourceHunkSide", anchor.side),
+                                file_id=file_map.file_id,
+                                display_path=file_map.display_path,
+                                hunk_id=hunk.hunk_id,
+                                hunk_hash=hunk.hunk_hash,
+                            )
+                        )
+            if not intersections:
+                valid = False
+            matched_hunks.extend(intersections)
+    old_result: VerifiedClaim | None = None
+    if valid and expected_kind == "diff":
+        old_candidate = candidate.model_copy(
+            update={
+                "source_hunks": [*matched_hunks, *candidate.source_hunks],
+                "source_anchors": [],
+                "assertion_kind": None,
+            }
+        )
+        old_result = verify_claim_candidate(
+            old_candidate,
+            line_maps=line_maps,
+            symbols=symbols,
+            before_text_by_path=before_text_by_path,
+            after_text_by_path=after_text_by_path,
+        )
+        matched_hunks = old_result.record.source_hunks
+    status: ClaimStatus
+    if not valid:
+        status = "rejected"
+    elif old_result is not None and old_result.record.status in {
+        "rejected",
+        "contradicted",
+        "not_proven",
+    }:
+        status = old_result.record.status
+    elif candidate.assertion_kind == "runtime_effect":
+        status = "not_proven"
+    elif candidate.assertion_kind == "source_fact" and is_faithful_source_quote(
+        candidate.text, candidate.source_anchors
+    ):
+        status = "verified"
+    else:
+        status = "weak"
+    return VerifiedClaim(
+        record=ClaimRecord(
+            claim_id=candidate.claim_id,
+            run_id=candidate.run_id,
+            text=candidate.text,
+            status=status,
+            reason_code=(
+                old_result.record.reason_code
+                if old_result is not None and old_result.record.status == "rejected"
+                else "evidence_missing"
+            )
+            if status == "rejected"
+            else None,
+            confidence="high" if status == "verified" else "low",
+            source_hunks=matched_hunks,
+            source_anchors=candidate.source_anchors,
+            assertion_kind=candidate.assertion_kind,
+            symbols=candidate.symbols,
+            negative_evidence=old_result.record.negative_evidence if old_result is not None else [],
+            extractor=old_result.record.extractor if old_result is not None else None,
+        ),
+        matched_hunk_ids=old_result.matched_hunk_ids if old_result is not None else [],
+        matched_symbols=old_result.matched_symbols if old_result is not None else [],
+        negative_evidence=old_result.negative_evidence if old_result is not None else [],
+    )
+
+
+def _match_source_hunks(
+    source_hunks: Sequence[SourceHunk],
+    *,
+    file_lookup: Mapping[str, tuple[FileLineMap, ...]],
+    before_text_lookup: Mapping[str, str],
+    after_text_lookup: Mapping[str, str],
+) -> _MatchedContext | _MatchFailure:
+    matched_hunks: list[HunkLineMap] = []
+    normalized_hunks: list[SourceHunk] = []
+    for source_hunk in source_hunks:
+        file_candidates = file_lookup.get(_identity(source_hunk.file))
+        if file_candidates is None:
+            return _MatchFailure(
+                reason_code="file_not_in_patch",
+                source_hunks=(source_hunk,),
+            )
+        if len(file_candidates) != 1:
+            return _MatchFailure(
+                reason_code="evidence_missing",
+                source_hunks=(source_hunk,),
+            )
+        file_map = file_candidates[0]
+        normalized_file = _resolve_source_hunk_file(file_map, source_hunk.file)
+        if source_hunk.end - source_hunk.start + 1 > _MAX_SOURCE_HUNK_SPAN:
+            return _MatchFailure(
+                reason_code="evidence_missing",
+                source_hunks=(
+                    SourceHunk(
+                        file=normalized_file,
+                        start=source_hunk.start,
+                        end=source_hunk.end,
+                        side=source_hunk.side,
+                        file_id=file_map.file_id,
+                        display_path=file_map.display_path,
+                    ),
+                ),
+            )
+        requested_sides = _requested_source_hunk_sides(source_hunk, file_map=file_map)
+        if not file_map.hunks:
+            resolved_side = None
+            if file_map.change_kind == "renamed":
+                resolved_side = _resolve_text_only_source_hunk_side(
+                    source_hunk,
+                    requested_sides=requested_sides,
+                    file_map=file_map,
+                    before_text_lookup=before_text_lookup,
+                    after_text_lookup=after_text_lookup,
+                )
+            if resolved_side is not None:
+                normalized_hunks.append(
+                    SourceHunk(
+                        file=normalized_file,
+                        start=source_hunk.start,
+                        end=source_hunk.end,
+                        side=resolved_side,
+                        file_id=file_map.file_id,
+                        display_path=file_map.display_path,
+                    )
+                )
+                continue
+            if file_map.change_kind == "renamed" and _source_hunk_is_within_file_text(
+                source_hunk,
+                file_map=file_map,
+                before_text_lookup=before_text_lookup,
+                after_text_lookup=after_text_lookup,
+            ):
+                return _MatchFailure(
+                    reason_code="evidence_missing",
+                    source_hunks=(
+                        SourceHunk(
+                            file=normalized_file,
+                            start=source_hunk.start,
+                            end=source_hunk.end,
+                            side=source_hunk.side,
+                            file_id=file_map.file_id,
+                            display_path=file_map.display_path,
+                        ),
+                    ),
+                )
+            return _MatchFailure(
+                reason_code="line_outside_hunk",
+                source_hunks=(
+                    SourceHunk(
+                        file=normalized_file,
+                        start=source_hunk.start,
+                        end=source_hunk.end,
+                        side=source_hunk.side,
+                        file_id=file_map.file_id,
+                        display_path=file_map.display_path,
+                    ),
+                ),
+            )
+        matched_by_side: dict[SourceHunkSide, list[HunkLineMap]] = {
+            "old": [],
+            "new": [],
+            "either": [],
+        }
+        for hunk in file_map.hunks:
+            for matched_side in _source_hunk_matching_sides(
+                source_hunk,
+                hunk,
+                requested_sides=requested_sides,
+            ):
+                matched_by_side[matched_side].append(hunk)
+        resolved_side = _resolve_source_hunk_side_match(
+            source_hunk,
+            requested_sides=requested_sides,
+            matched_by_side=matched_by_side,
+        )
+        if resolved_side is None:
+            multi_hunk_match = _normalize_multi_hunk_source_hunk(
+                source_hunk,
+                file_map=file_map,
+                normalized_file=normalized_file,
+                requested_sides=requested_sides,
+                before_text_lookup=before_text_lookup,
+                after_text_lookup=after_text_lookup,
+            )
+            if multi_hunk_match is not None:
+                multi_source_hunks, multi_matched_hunks = multi_hunk_match
+                if _source_hunk_hunk_id_mismatched(source_hunk, multi_matched_hunks):
+                    return _MatchFailure(
+                        reason_code="hunk_id_mismatch",
+                        source_hunks=(
+                            SourceHunk(
+                                file=normalized_file,
+                                start=source_hunk.start,
+                                end=source_hunk.end,
+                                side=source_hunk.side,
+                                file_id=file_map.file_id,
+                                display_path=file_map.display_path,
+                            ),
+                        ),
+                    )
+                normalized_hunks.extend(multi_source_hunks)
+                matched_hunks.extend(multi_matched_hunks)
+                continue
+            if any(matched_by_side[side] for side in ("old", "new")):
+                return _MatchFailure(
+                    reason_code="evidence_missing",
+                    source_hunks=(
+                        SourceHunk(
+                            file=normalized_file,
+                            start=source_hunk.start,
+                            end=source_hunk.end,
+                            side=source_hunk.side,
+                            file_id=file_map.file_id,
+                            display_path=file_map.display_path,
+                        ),
+                    ),
+                )
+            return _MatchFailure(
+                reason_code="line_outside_hunk",
+                source_hunks=(
+                    SourceHunk(
+                        file=normalized_file,
+                        start=source_hunk.start,
+                        end=source_hunk.end,
+                        side=source_hunk.side,
+                        file_id=file_map.file_id,
+                        display_path=file_map.display_path,
+                    ),
+                ),
+            )
+        primary_hunk = matched_by_side[resolved_side][0]
+        if _source_hunk_hunk_id_mismatched(source_hunk, matched_by_side[resolved_side]):
+            return _MatchFailure(
+                reason_code="hunk_id_mismatch",
+                source_hunks=(
+                    SourceHunk(
+                        file=normalized_file,
+                        start=source_hunk.start,
+                        end=source_hunk.end,
+                        side=source_hunk.side,
+                        file_id=file_map.file_id,
+                        display_path=file_map.display_path,
+                    ),
+                ),
+            )
+        normalized_hunks.append(
+            SourceHunk(
+                file=normalized_file,
+                start=source_hunk.start,
+                end=source_hunk.end,
+                side=resolved_side,
+                file_id=file_map.file_id,
+                display_path=file_map.display_path,
+                hunk_id=primary_hunk.hunk_id,
+                hunk_hash=primary_hunk.hunk_hash,
+            )
+        )
+        matched_hunks.extend(matched_by_side[resolved_side])
+    return _MatchedContext(
+        source_hunks=tuple(normalized_hunks),
+        matched_hunks=tuple(dict.fromkeys(matched_hunks)),
+    )
+
+
+def _build_file_lookup(line_maps: Iterable[FileLineMap]) -> dict[str, tuple[FileLineMap, ...]]:
+    lookup: dict[str, list[FileLineMap]] = {}
+
+    def add(path: str | None, item: FileLineMap) -> None:
+        if path is None:
+            return
+        identity = _identity(path)
+        existing = lookup.setdefault(identity, [])
+        if all(candidate.file_id != item.file_id for candidate in existing):
+            existing.append(item)
+
+    for item in line_maps:
+        add(item.display_path, item)
+        add(item.old_path, item)
+        add(item.new_path, item)
+    return {key: tuple(value) for key, value in lookup.items()}
+
+
+def _match_symbols(
+    claim_symbols: Sequence[str],
+    *,
+    source_hunks: Sequence[SourceHunk],
+    matched_hunks: Sequence[HunkLineMap],
+    symbols: Iterable[SymbolRecord],
+) -> tuple[tuple[SymbolRecord, ...], tuple[str, ...]]:
+    if not claim_symbols:
+        return (), ()
+    allowed_paths = {_identity(item.file) for item in source_hunks}
+    allowed_hunk_ids = {item.hunk_id for item in matched_hunks}
+    candidate_symbols = [
+        item
+        for item in symbols
+        if _identity(item.path) in allowed_paths
+        and (not allowed_hunk_ids or bool(set(item.hunk_ids) & allowed_hunk_ids))
+    ]
+    matched: list[SymbolRecord] = []
+    unmatched: list[str] = []
+    for claim_symbol in claim_symbols:
+        exact = [item for item in candidate_symbols if item.qualified_name == claim_symbol]
+        if exact:
+            matched.append(_pick_best_symbol(exact))
+            continue
+        fuzzy = _match_fuzzy_symbol(
+            claim_symbol,
+            source_hunks=source_hunks,
+            candidate_symbols=candidate_symbols,
+        )
+        if fuzzy is not None:
+            matched.append(fuzzy)
+            continue
+        unmatched.append(claim_symbol)
+    return tuple(dict.fromkeys(matched)), tuple(unmatched)
+
+
+def _pick_best_symbol(matches: Sequence[SymbolRecord]) -> SymbolRecord:
+    priority = {"high": 3, "medium": 2, "low": 1}
+    return max(
+        matches,
+        key=lambda item: (
+            priority[item.confidence],
+            len(item.hunk_ids),
+            len(item.touched_lines),
+            item.qualified_name,
+        ),
+    )
+
+
+def _source_hunk_matching_sides(
+    source_hunk: SourceHunk,
+    hunk: HunkLineMap,
+    *,
+    requested_sides: Sequence[SourceHunkSide],
+) -> tuple[SourceHunkSide, ...]:
+    old_lines, new_lines = _hunk_line_sides(hunk)
+    matched: list[SourceHunkSide] = []
+    if "old" in requested_sides and _source_hunk_is_within_lines(source_hunk, old_lines):
+        matched.append("old")
+    if "new" in requested_sides and _source_hunk_is_within_lines(source_hunk, new_lines):
+        matched.append("new")
+    return tuple(matched)
+
+
+def _normalize_multi_hunk_source_hunk(
+    source_hunk: SourceHunk,
+    *,
+    file_map: FileLineMap,
+    normalized_file: str,
+    requested_sides: Sequence[SourceHunkSide],
+    before_text_lookup: Mapping[str, str],
+    after_text_lookup: Mapping[str, str],
+) -> tuple[tuple[SourceHunk, ...], tuple[HunkLineMap, ...]] | None:
+    matched_by_side: dict[SourceHunkSide, tuple[HunkLineMap, ...]] = {}
+    for side in ("old", "new"):
+        if side not in requested_sides:
+            continue
+        if not _source_hunk_is_within_file_text_for_side(
+            source_hunk,
+            side=side,
+            file_map=file_map,
+            before_text_lookup=before_text_lookup,
+            after_text_lookup=after_text_lookup,
+        ):
+            continue
+        matched_hunks = tuple(
+            hunk
+            for hunk in file_map.hunks
+            if _source_hunk_intersects_hunk_side(source_hunk, hunk, side=side)
+        )
+        if matched_hunks and not _source_hunk_has_unparsed_lines_in_hunk_headers(
+            source_hunk,
+            matched_hunks,
+            side=side,
+        ):
+            matched_by_side[side] = matched_hunks
+    if source_hunk.side != "either":
+        resolved_side = source_hunk.side if source_hunk.side in matched_by_side else None
+    elif len(matched_by_side) == 1:
+        resolved_side = next(iter(matched_by_side))
+    else:
+        resolved_side = None
+    if resolved_side is None:
+        return None
+
+    normalized_hunks: list[SourceHunk] = []
+    for hunk in matched_by_side[resolved_side]:
+        for start, end in _source_hunk_intersections_for_hunk_side(
+            source_hunk,
+            hunk,
+            side=resolved_side,
+        ):
+            normalized_hunks.append(
+                SourceHunk(
+                    file=normalized_file,
+                    start=start,
+                    end=end,
+                    side=resolved_side,
+                    file_id=file_map.file_id,
+                    display_path=file_map.display_path,
+                    hunk_id=hunk.hunk_id,
+                    hunk_hash=hunk.hunk_hash,
+                )
+            )
+    if not normalized_hunks:
+        return None
+    return tuple(normalized_hunks), matched_by_side[resolved_side]
+
+
+def _source_hunk_intersects_hunk_side(
+    source_hunk: SourceHunk,
+    hunk: HunkLineMap,
+    *,
+    side: SourceHunkSide,
+) -> bool:
+    return bool(_source_hunk_intersections_for_hunk_side(source_hunk, hunk, side=side))
+
+
+def _source_hunk_has_unparsed_lines_in_hunk_headers(
+    source_hunk: SourceHunk,
+    hunks: Sequence[HunkLineMap],
+    *,
+    side: SourceHunkSide,
+) -> bool:
+    parsed_lines: set[int] = set()
+    header_lines: set[int] = set()
+    for hunk in hunks:
+        header_start, header_end = _hunk_side_header_range(hunk, side)
+        if header_start is not None and header_end is not None:
+            start = max(source_hunk.start, header_start)
+            end = min(source_hunk.end, header_end)
+            if start <= end:
+                header_lines.update(range(start, end + 1))
+        for start, end in _source_hunk_intersections_for_hunk_side(
+            source_hunk,
+            hunk,
+            side=side,
+        ):
+            parsed_lines.update(range(start, end + 1))
+    return bool(header_lines - parsed_lines)
+
+
+def _hunk_side_header_range(
+    hunk: HunkLineMap,
+    side: SourceHunkSide,
+) -> tuple[int | None, int | None]:
+    if side == "old":
+        return hunk.old_start, hunk.old_end
+    if side == "new":
+        return hunk.new_start, hunk.new_end
+    return None, None
+
+
+def _source_hunk_intersections_for_hunk_side(
+    source_hunk: SourceHunk,
+    hunk: HunkLineMap,
+    *,
+    side: SourceHunkSide,
+) -> tuple[tuple[int, int], ...]:
+    ranges = _hunk_side_parsed_line_ranges(hunk, side)
+    intersections: list[tuple[int, int]] = []
+    for hunk_start, hunk_end in ranges:
+        start = max(source_hunk.start, hunk_start)
+        end = min(source_hunk.end, hunk_end)
+        if start <= end:
+            intersections.append((start, end))
+    return tuple(intersections)
+
+
+def _hunk_side_parsed_line_ranges(
+    hunk: HunkLineMap,
+    side: SourceHunkSide,
+) -> tuple[tuple[int, int], ...]:
+    old_lines, new_lines = _hunk_line_sides(hunk)
+    if side == "old":
+        return _line_number_ranges(old_lines)
+    if side == "new":
+        return _line_number_ranges(new_lines)
+    return ()
+
+
+def _line_number_ranges(line_numbers: set[int]) -> tuple[tuple[int, int], ...]:
+    if not line_numbers:
+        return ()
+    ranges: list[tuple[int, int]] = []
+    start = previous = min(line_numbers)
+    for line_number in sorted(line_numbers - {start}):
+        if line_number == previous + 1:
+            previous = line_number
+            continue
+        ranges.append((start, previous))
+        start = previous = line_number
+    ranges.append((start, previous))
+    return tuple(ranges)
+
+
+def _source_hunk_hunk_id_mismatched(
+    source_hunk: SourceHunk,
+    matched_hunks: Sequence[HunkLineMap],
+) -> bool:
+    return source_hunk.hunk_id is not None and all(
+        hunk.hunk_id != source_hunk.hunk_id for hunk in matched_hunks
+    )
+
+
+def _hunk_line_sides(hunk: HunkLineMap) -> tuple[set[int], set[int]]:
+    return (
+        {
+            *hunk.deleted_lines,
+            *hunk.context_old_lines,
+        },
+        {
+            *hunk.added_lines,
+            *hunk.context_new_lines,
+        },
+    )
+
+
+def _source_hunk_is_within_lines(source_hunk: SourceHunk, line_numbers: set[int]) -> bool:
+    return all(
+        line_number in line_numbers for line_number in range(source_hunk.start, source_hunk.end + 1)
+    )
+
+
+def _requested_source_hunk_sides(
+    source_hunk: SourceHunk,
+    *,
+    file_map: FileLineMap,
+) -> tuple[SourceHunkSide, ...]:
+    if source_hunk.side != "either":
+        return (source_hunk.side,)
+    inferred = _infer_source_hunk_side_from_path(file_map, raw_path=source_hunk.file)
+    if inferred is not None:
+        return (inferred,)
+    if file_map.change_kind == "deleted":
+        return ("old",)
+    if file_map.change_kind == "added":
+        return ("new",)
+    return ("old", "new")
+
+
+def _infer_source_hunk_side_from_path(
+    file_map: FileLineMap,
+    *,
+    raw_path: str,
+) -> SourceHunkSide | None:
+    target = _identity(raw_path)
+    old_matches = file_map.old_path is not None and _identity(file_map.old_path) == target
+    new_matches = file_map.new_path is not None and _identity(file_map.new_path) == target
+    if old_matches and not new_matches:
+        return "old"
+    if new_matches and not old_matches:
+        return "new"
+    return None
+
+
+def _resolve_source_hunk_side_match(
+    source_hunk: SourceHunk,
+    *,
+    requested_sides: Sequence[SourceHunkSide],
+    matched_by_side: Mapping[SourceHunkSide, Sequence[HunkLineMap]],
+) -> SourceHunkSide | None:
+    if source_hunk.side != "either":
+        return source_hunk.side if matched_by_side[source_hunk.side] else None
+    if len(requested_sides) == 1:
+        requested_side = requested_sides[0]
+        return requested_side if matched_by_side[requested_side] else None
+    old_matched = bool(matched_by_side["old"])
+    new_matched = bool(matched_by_side["new"])
+    if old_matched and not new_matched:
+        return "old"
+    if new_matched and not old_matched:
+        return "new"
+    if old_matched and new_matched and source_hunk.start != source_hunk.end:
+        return "new"
+    return None
+
+
+def _resolve_text_only_source_hunk_side(
+    source_hunk: SourceHunk,
+    *,
+    requested_sides: Sequence[SourceHunkSide],
+    file_map: FileLineMap,
+    before_text_lookup: Mapping[str, str],
+    after_text_lookup: Mapping[str, str],
+) -> SourceHunkSide | None:
+    matched_sides: list[SourceHunkSide] = [
+        side
+        for side in requested_sides
+        if _source_hunk_is_within_file_text_for_side(
+            source_hunk,
+            side=side,
+            file_map=file_map,
+            before_text_lookup=before_text_lookup,
+            after_text_lookup=after_text_lookup,
+        )
+    ]
+    if source_hunk.side != "either":
+        return source_hunk.side if matched_sides else None
+    if len(matched_sides) == 1:
+        return matched_sides[0]
+    return None
+
+
+def _resolve_claim_extractor(
+    candidate: ClaimCandidate,
+    symbol_matches: Sequence[SymbolRecord] = (),
+) -> ClaimExtractor:
+    if symbol_matches:
+        return symbol_matches[0].extractor
+    if candidate.extractor is not None:
+        return cast("ClaimExtractor", candidate.extractor)
+    return "section_header"
+
+
+def _normalize_symbol_name(value: str) -> str:
+    return re.sub(r"[\s_\-]+", "", value).casefold()
+
+
+def _match_fuzzy_symbol(
+    claim_symbol: str,
+    *,
+    source_hunks: Sequence[SourceHunk],
+    candidate_symbols: Sequence[SymbolRecord],
+) -> SymbolRecord | None:
+    normalized_claim = _normalize_symbol_segments(claim_symbol)
+    if not normalized_claim:
+        return None
+    full_matches = [
+        item
+        for item in candidate_symbols
+        if _normalize_symbol_segments(item.qualified_name) == normalized_claim
+    ]
+    if full_matches:
+        return _pick_best_symbol(full_matches)
+
+    claim_parent = normalized_claim[:-1]
+    claim_basename = normalized_claim[-1]
+    basename_matches = [
+        item
+        for item in candidate_symbols
+        if _normalize_symbol_segments(item.qualified_name)[-1:] == (claim_basename,)
+    ]
+    if not basename_matches:
+        return None
+    if claim_parent:
+        scoped_matches = [
+            item
+            for item in basename_matches
+            if _normalize_symbol_segments(item.qualified_name)[:-1] == claim_parent
+        ]
+        if scoped_matches:
+            return _pick_best_symbol(scoped_matches)
+        return None
+
+    overlapping_matches = [
+        item for item in basename_matches if _symbol_overlaps_source_hunks(item, source_hunks)
+    ]
+    if len(overlapping_matches) == 1:
+        return overlapping_matches[0]
+    if overlapping_matches:
+        basename_matches = overlapping_matches
+
+    parent_scopes = {
+        _normalize_symbol_segments(item.qualified_name)[:-1] for item in basename_matches
+    }
+    if len(parent_scopes) > 1:
+        return None
+    return _pick_best_symbol(basename_matches)
+
+
+def _normalize_symbol_segments(value: str) -> tuple[str, ...]:
+    normalized = value.replace("::", ".").replace("#", ".")
+    parts = [part for part in normalized.split(".") if part]
+    if not parts:
+        return ()
+    return tuple(_normalize_symbol_name(part) for part in parts if _normalize_symbol_name(part))
+
+
+def _symbol_overlaps_source_hunks(
+    symbol: SymbolRecord,
+    source_hunks: Sequence[SourceHunk],
+) -> bool:
+    symbol_lines = set(symbol.touched_lines)
+    symbol_path = _identity(symbol.path)
+    for source_hunk in source_hunks:
+        if _identity(source_hunk.file) != symbol_path:
+            continue
+        if symbol_lines & set(range(source_hunk.start, source_hunk.end + 1)):
+            return True
+    return False
+
+
+def _build_text_lookup(mapping: Mapping[str, str]) -> dict[str, str]:
+    return {_identity(path): text for path, text in mapping.items()}
+
+
+def _resolve_source_hunk_file(file_map: FileLineMap, raw_path: str) -> str:
+    target = _identity(raw_path)
+    for candidate in (file_map.old_path, file_map.new_path, file_map.display_path):
+        if candidate is not None and _identity(candidate) == target:
+            return candidate
+    return file_map.display_path
+
+
+def _source_hunk_is_within_file_text(
+    source_hunk: SourceHunk,
+    *,
+    file_map: FileLineMap,
+    before_text_lookup: Mapping[str, str],
+    after_text_lookup: Mapping[str, str],
+) -> bool:
+    line_counts: list[int] = []
+    for candidate in (file_map.old_path, file_map.new_path, file_map.display_path):
+        if candidate is None:
+            continue
+        candidate_identity = _identity(candidate)
+        before_text = before_text_lookup.get(candidate_identity)
+        if before_text is not None:
+            line_counts.append(len(before_text.splitlines()))
+        after_text = after_text_lookup.get(candidate_identity)
+        if after_text is not None:
+            line_counts.append(len(after_text.splitlines()))
+    if not line_counts:
+        return False
+    return source_hunk.start >= 1 and source_hunk.end <= max(line_counts)
+
+
+def _source_hunk_is_within_file_text_for_side(
+    source_hunk: SourceHunk,
+    *,
+    side: SourceHunkSide,
+    file_map: FileLineMap,
+    before_text_lookup: Mapping[str, str],
+    after_text_lookup: Mapping[str, str],
+) -> bool:
+    if side == "old":
+        candidate_paths = (file_map.old_path, file_map.display_path)
+        lookup = before_text_lookup
+    else:
+        candidate_paths = (file_map.new_path, file_map.display_path)
+        lookup = after_text_lookup
+    line_counts: list[int] = []
+    for candidate in candidate_paths:
+        if candidate is None:
+            continue
+        text = lookup.get(_identity(candidate))
+        if text is not None:
+            line_counts.append(len(text.splitlines()))
+    if not line_counts:
+        return False
+    return source_hunk.start >= 1 and source_hunk.end <= max(line_counts)
+
+
+def _identity(path: str) -> str:
+    return path_identity_key(Path(path))
+
+
+__all__ = ["verify_claim_candidate", "verify_claim_candidates"]

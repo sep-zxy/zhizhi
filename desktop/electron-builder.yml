@@ -1,0 +1,26 @@
+appId: io.local.growthcompanion
+productName: 知枝
+artifactName: zhizhi-${version}-${os}-${arch}.${ext}
+directories:
+  output: ../dist/desktop
+files:
+  - main.mjs
+  - package.json
+extraResources:
+  - from: ../viewer/dist
+    to: viewer
+  - from: ../viewer/public/icons/growth-192.png
+    to: icon.png
+  - from: sidecar/growth-sidecar
+    to: sidecar
+win:
+  icon: build/icon.ico
+  target: nsis
+mac:
+  icon: build/icon.icns
+  identity: '-'
+  target: dmg
+  category: public.app-category.education
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

@@ -1,0 +1,954 @@
+"""GET /api/config and GET /api/doctor endpoints."""
+
+from __future__ import annotations
+
+import logging
+import math
+import sqlite3
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+from anyio import to_thread
+from starlette.responses import JSONResponse
+
+from ahadiff.contracts import AhaDiffError, ErrorCode
+from ahadiff.contracts.serve_app import ConfigResponse, ConfigUpdateResponse
+from ahadiff.contracts.serve_doctor import DoctorCheck, DoctorResponse
+from ahadiff.core.sqlite_util import (
+    safe_sqlite_connect,
+    sqlite_runtime_gate_ok,
+    sqlite_runtime_gate_requirement_message,
+    sqlite_runtime_version_tuple,
+)
+
+from ._errors import error_response
+from .lock import serve_repo_write_lock
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
+
+    from ahadiff.core.config import ConfigSnapshot
+
+    from .state import ServeState
+
+log = logging.getLogger(__name__)
+
+_QUIZ_DEFAULTS: dict[str, Any] = {
+    "quiz_question_count": 3,
+    "quiz_question_count_mode": "fixed",
+    "quiz_auto_range_min": 3,
+    "quiz_auto_range_max": 12,
+}
+_CAPTURE_DEFAULTS: dict[str, Any] = {
+    "mode": "auto",
+    "max_files": 30,
+    "hard_limit": 3000,
+    "max_patch_bytes": 5_000_000,
+    "file_ranking": "learning_value",
+    "symbol_extractor": "auto",
+}
+
+
+def _config_error(message: str, *, status: int = 400) -> JSONResponse:
+    return error_response(ErrorCode.INPUT_BAD_FIELD, message, status=status)
+
+
+def _empty_config_snapshot() -> dict[str, Any]:
+    return {
+        "lang": None,
+        "privacy_mode": None,
+        "generate_provider": None,
+        "generate_model": None,
+        "judge_provider": None,
+        "judge_model": None,
+        "serve_port": None,
+        "key_status": {},
+        "capture": dict(_CAPTURE_DEFAULTS),
+        "llm": {
+            "input_token_budget": 200_000,
+            "output_token_budget": 50_000,
+            "request_timeout_seconds": 30,
+            "max_concurrent": 3,
+            "retry_attempts": 3,
+            "output_lang": "auto",
+        },
+        "learn": {
+            "learnability_threshold": 0.3,
+            "desired_retention": 0.9,
+        },
+        "quiz": dict(_QUIZ_DEFAULTS),
+        "model_limits": {"generate": None, "judge": None},
+    }
+
+
+def _object_mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in cast("dict[object, object]", value).items()}
+
+
+def _provider_key_status(providers: object) -> dict[str, str]:
+    import os
+
+    statuses: dict[str, str] = {}
+    for provider_name, raw_provider in _object_mapping(providers).items():
+        provider_values = _object_mapping(raw_provider)
+        api_key_env = provider_values.get("api_key_env")
+        if isinstance(api_key_env, str) and api_key_env:
+            statuses[provider_name] = "configured" if os.environ.get(api_key_env) else "missing"
+    return statuses
+
+
+def _add_legacy_llm_key_status(key_status: dict[str, str], api_key_env: object) -> None:
+    if not isinstance(api_key_env, str) or not api_key_env:
+        return
+    import os
+
+    key_status.setdefault("llm", "configured" if os.environ.get(api_key_env) else "missing")
+
+
+def _model_limit_summaries(
+    result: dict[str, Any],
+    providers: object,
+    resolved: object = None,
+) -> dict[str, Any]:
+    from .routes_providers import build_model_limits_response
+
+    summaries: dict[str, Any] = {"generate": None, "judge": None}
+    providers_map = _object_mapping(providers)
+    for role in ("generate", "judge"):
+        alias_value = _effective_provider_alias(result, providers_map, role=role)
+        if alias_value is None:
+            continue
+        provider_data = _object_mapping(providers_map.get(alias_value))
+        if not provider_data:
+            continue
+        model_value = _explicit_role_model_override(result, resolved, role=role)
+        response = build_model_limits_response(
+            alias=alias_value,
+            provider_data=provider_data,
+            model_name_override=model_value,
+        )
+        if response is not None:
+            summaries[role] = response.model_dump(mode="json")
+    return summaries
+
+
+def _effective_provider_alias(
+    result: dict[str, Any],
+    providers_map: dict[str, object],
+    *,
+    role: str,
+) -> str | None:
+    alias_value = result.get(f"{role}_provider")
+    if isinstance(alias_value, str) and alias_value:
+        return alias_value
+    if len(providers_map) != 1:
+        return None
+    alias, provider_data = next(iter(providers_map.items()))
+    if not _object_mapping(provider_data):
+        return None
+    return alias
+
+
+def _explicit_role_model_override(
+    result: dict[str, Any],
+    resolved: object,
+    *,
+    role: str,
+) -> str | None:
+    model_value = result.get(f"{role}_model")
+    if not isinstance(model_value, str) or not model_value.strip():
+        return None
+    source = _resolved_setting_source(resolved, f"llm.{role}_model")
+    if source == "default":
+        return None
+    return model_value
+
+
+def _resolved_setting_source(resolved: object, key: str) -> str | None:
+    if not isinstance(resolved, dict):
+        return None
+    setting = cast("dict[object, object]", resolved).get(key)
+    source = getattr(setting, "source", None)
+    return source if isinstance(source, str) else None
+
+
+def _safe_config_snapshot(state: ServeState) -> dict[str, Any]:
+    from .config_runtime import load_serve_config_snapshot
+
+    try:
+        cfg = load_serve_config_snapshot(state)
+    except Exception:
+        return _empty_config_snapshot()
+
+    values = getattr(cfg, "values", None)
+    if isinstance(values, dict):
+        snapshot_values = _object_mapping(cast("object", values))
+        llm_values = _object_mapping(snapshot_values.get("llm"))
+        serve_values = _object_mapping(snapshot_values.get("serve"))
+        capture_values = _object_mapping(snapshot_values.get("capture"))
+        quiz_values = _object_mapping(snapshot_values.get("quiz"))
+        result: dict[str, Any] = {
+            "lang": snapshot_values.get("lang"),
+            "privacy_mode": snapshot_values.get("privacy_mode"),
+            "generate_provider": llm_values.get("generate_provider", ""),
+            "generate_model": llm_values.get("generate_model"),
+            "judge_provider": llm_values.get("judge_provider", ""),
+            "judge_model": llm_values.get("judge_model"),
+            "serve_port": serve_values.get("port"),
+            "capture": {
+                "mode": capture_values.get("mode", "auto"),
+                "max_files": capture_values.get("max_files", 30),
+                "hard_limit": capture_values.get("hard_limit", 3000),
+                "max_patch_bytes": capture_values.get("max_patch_bytes", 5_000_000),
+                "file_ranking": capture_values.get("file_ranking", "learning_value"),
+                "symbol_extractor": capture_values.get("symbol_extractor", "auto"),
+            },
+            "llm": {
+                "input_token_budget": llm_values.get("input_token_budget", 200_000),
+                "output_token_budget": llm_values.get("output_token_budget", 50_000),
+                "request_timeout_seconds": llm_values.get("request_timeout_seconds", 30),
+                "max_concurrent": llm_values.get("max_concurrent", 3),
+                "retry_attempts": llm_values.get("retry_attempts", 3),
+                "output_lang": llm_values.get("output_lang", "auto"),
+            },
+            "quiz": {
+                "quiz_question_count": quiz_values.get("quiz_question_count", 3),
+                "quiz_question_count_mode": quiz_values.get("quiz_question_count_mode", "fixed"),
+                "quiz_auto_range_min": quiz_values.get("quiz_auto_range_min", 3),
+                "quiz_auto_range_max": quiz_values.get("quiz_auto_range_max", 12),
+            },
+        }
+        learn_values = _object_mapping(snapshot_values.get("learn"))
+        result["learn"] = {
+            "learnability_threshold": learn_values.get("learnability_threshold", 0.3),
+            "desired_retention": learn_values.get("desired_retention", 0.9),
+        }
+        api_key_env = llm_values.get("api_key_env")
+        providers = snapshot_values.get("providers")
+    else:
+        result = {}
+        result["lang"] = getattr(cfg, "lang", None)
+        result["privacy_mode"] = getattr(cfg, "privacy_mode", None)
+
+        llm = getattr(cfg, "llm", None)
+        result["generate_provider"] = getattr(llm, "generate_provider", "") if llm else ""
+        result["generate_model"] = getattr(llm, "generate_model", None) if llm else None
+        result["judge_provider"] = getattr(llm, "judge_provider", "") if llm else ""
+        result["judge_model"] = getattr(llm, "judge_model", None) if llm else None
+
+        serve = getattr(cfg, "serve", None)
+        result["serve_port"] = getattr(serve, "port", None) if serve else None
+        result["capture"] = dict(_CAPTURE_DEFAULTS)
+        result["llm"] = {
+            "input_token_budget": 200_000,
+            "output_token_budget": 50_000,
+            "request_timeout_seconds": 30,
+            "max_concurrent": 3,
+            "retry_attempts": 3,
+            "output_lang": "auto",
+        }
+        result["learn"] = {"learnability_threshold": 0.3, "desired_retention": 0.9}
+        result["quiz"] = dict(_QUIZ_DEFAULTS)
+        api_key_env = getattr(llm, "api_key_env", None) if llm else None
+        providers = getattr(cfg, "providers", None)
+
+    key_status = _provider_key_status(providers)
+    _add_legacy_llm_key_status(key_status, api_key_env)
+    result["key_status"] = key_status
+    result["model_limits"] = _model_limit_summaries(
+        result,
+        providers,
+        resolved=getattr(cfg, "resolved", None),
+    )
+
+    return result
+
+
+def _doctor_check(
+    name: str,
+    status: str,
+    message: str,
+    *,
+    category: str,
+    details: dict[str, Any] | None = None,
+) -> DoctorCheck:
+    return DoctorCheck(
+        name=name,
+        category=category,
+        status=cast("Any", status),
+        message=message,
+        details=details or {},
+    )
+
+
+def _summary_status(checks: list[DoctorCheck]) -> str:
+    if any(check.status == "fail" for check in checks):
+        return "fail"
+    if any(check.status == "warn" for check in checks):
+        return "warn"
+    return "pass"
+
+
+def _run_doctor_checks(state: ServeState) -> dict[str, Any]:
+    checks: list[DoctorCheck] = []
+
+    repo_root = state.state_dir.parent
+    ahadiff_dir = repo_root / ".ahadiff"
+    checks.append(
+        _doctor_check(
+            "repo_root",
+            "pass" if ahadiff_dir.is_dir() else "fail",
+            ".ahadiff/ exists" if ahadiff_dir.is_dir() else ".ahadiff/ not found",
+            category="paths",
+            details={"path": ".ahadiff"},
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "state_dir_path",
+            "pass" if state.state_dir.is_dir() else "fail",
+            "state directory is accessible"
+            if state.state_dir.is_dir()
+            else "state directory is missing",
+            category="paths",
+            details={"name": state.state_dir.name},
+        )
+    )
+
+    sqlite_ver = sqlite3.sqlite_version
+    sqlite_gate_ok = sqlite_runtime_gate_ok(sqlite_runtime_version_tuple())
+    checks.append(
+        _doctor_check(
+            "sqlite_version",
+            "pass",
+            f"SQLite {sqlite_ver}",
+            category="runtime",
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "sqlite_runtime_gate",
+            "pass" if sqlite_gate_ok else "fail",
+            f"SQLite runtime accepted: {sqlite_ver}"
+            if sqlite_gate_ok
+            else sqlite_runtime_gate_requirement_message(),
+            category="runtime",
+        )
+    )
+
+    cfg: Any | None = None
+    try:
+        from .config_runtime import load_serve_config_snapshot
+
+        cfg = load_serve_config_snapshot(state)
+        checks.append(
+            _doctor_check(
+                "config_valid",
+                "pass",
+                "Config loaded successfully",
+                category="config",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            _doctor_check(
+                "config_valid",
+                "fail",
+                f"Config error: {type(exc).__name__}",
+                category="config",
+            )
+        )
+
+    unknown_keys: list[str] = []
+    sensitive_keys: list[str] = []
+    precedence_conflicts: list[str] = []
+    if cfg is not None:
+        for attr in ("repo_unknown_keys", "global_unknown_keys"):
+            unknown_keys.extend(str(item) for item in getattr(cfg, attr, ()) or ())
+        for attr in ("repo_sensitive_keys", "global_sensitive_keys"):
+            sensitive_keys.extend(str(item) for item in getattr(cfg, attr, ()) or ())
+        precedence_conflicts.extend(
+            str(item) for item in getattr(cfg, "precedence_conflicts", ()) or ()
+        )
+    checks.append(
+        _doctor_check(
+            "config_unknown_keys",
+            "warn" if unknown_keys else "pass",
+            "Unknown config keys found" if unknown_keys else "No unknown config keys",
+            category="config",
+            details={"count": len(unknown_keys), "keys": unknown_keys[:20]},
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "config_sensitive_keys",
+            "fail" if sensitive_keys else "pass",
+            "Sensitive config keys found" if sensitive_keys else "No sensitive config keys",
+            category="config",
+            details={"count": len(sensitive_keys), "keys": sensitive_keys[:20]},
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "config_precedence_conflicts",
+            "warn" if precedence_conflicts else "pass",
+            "Config precedence conflicts found"
+            if precedence_conflicts
+            else "No config precedence conflicts",
+            category="config",
+            details={"count": len(precedence_conflicts)},
+        )
+    )
+
+    review_db = state.state_dir / "review.sqlite"
+    checks.append(
+        _doctor_check(
+            "review_db",
+            "pass" if review_db.is_file() else "warn",
+            "review.sqlite present" if review_db.is_file() else "review.sqlite not found",
+            category="storage",
+        )
+    )
+    if review_db.is_file() and not sqlite_gate_ok:
+        checks.append(
+            _doctor_check(
+                "review_db_quick_check",
+                "warn",
+                "SQLite runtime gate failed; review.sqlite quick_check skipped",
+                category="storage",
+            )
+        )
+    elif review_db.is_file():
+        try:
+            with safe_sqlite_connect(review_db) as conn:
+                row = conn.execute("PRAGMA quick_check").fetchone()
+            quick_check_ok = row is not None and row[0] == "ok"
+            checks.append(
+                _doctor_check(
+                    "review_db_quick_check",
+                    "pass" if quick_check_ok else "fail",
+                    "review.sqlite quick_check ok"
+                    if quick_check_ok
+                    else "review.sqlite quick_check failed",
+                    category="storage",
+                )
+            )
+        except (sqlite3.DatabaseError, OSError):
+            checks.append(
+                _doctor_check(
+                    "review_db_quick_check",
+                    "fail",
+                    "review.sqlite quick_check failed",
+                    category="storage",
+                )
+            )
+    else:
+        checks.append(
+            _doctor_check(
+                "review_db_quick_check",
+                "warn",
+                "review.sqlite not found",
+                category="storage",
+            )
+        )
+
+    try:
+        from ahadiff.core.paths import usage_db_path
+
+        usage_db = usage_db_path()
+        checks.append(
+            _doctor_check(
+                "usage_db",
+                "pass" if usage_db.is_file() else "warn",
+                "usage.sqlite present" if usage_db.is_file() else "usage.sqlite not found",
+                category="storage",
+                details={"filename": usage_db.name},
+            )
+        )
+    except Exception:
+        checks.append(
+            _doctor_check(
+                "usage_db",
+                "warn",
+                "usage.sqlite path unavailable",
+                category="storage",
+            )
+        )
+
+    audit_path = state.state_dir / "audit.jsonl"
+    checks.append(
+        _doctor_check(
+            "audit_file",
+            "pass" if audit_path.is_file() else "warn",
+            "audit.jsonl present" if audit_path.is_file() else "audit.jsonl not found",
+            category="storage",
+        )
+    )
+
+    return DoctorResponse(
+        summary_status=cast("Any", _summary_status(checks)),
+        checks=checks,
+    ).model_dump(mode="json")
+
+
+async def get_config(request: Request) -> JSONResponse:
+    from .auth import serve_state
+
+    state: ServeState = serve_state(request)
+    snapshot = await to_thread.run_sync(_safe_config_snapshot, state)
+    return JSONResponse(ConfigResponse.model_validate(snapshot).model_dump(mode="json"))
+
+
+async def get_doctor(request: Request) -> JSONResponse:
+    from .auth import serve_state
+
+    state: ServeState = serve_state(request)
+    payload = await to_thread.run_sync(_run_doctor_checks, state)
+    return JSONResponse(payload)
+
+
+_ALLOWED_CONFIG_LANG = frozenset({"en", "zh-CN"})
+_ALLOWED_PRIVACY_MODES = frozenset({"strict_local", "redacted_remote", "explicit_remote"})
+_ALLOWED_FILE_RANKINGS = frozenset({"learning_value", "changed_lines", "path"})
+_ALLOWED_CAPTURE_MODES = frozenset({"auto", "manual"})
+_CAPTURE_INT_FIELDS: dict[str, tuple[int, int]] = {
+    "max_files": (1, 500),
+    "hard_limit": (100, 100_000),
+    "max_patch_bytes": (100_000, 50 * 1024 * 1024),
+}
+_LLM_INT_FIELDS: dict[str, tuple[int, int]] = {
+    "input_token_budget": (1_000, 10_000_000),
+    "output_token_budget": (1_000, 10_000_000),
+    "request_timeout_seconds": (5, 600),
+    "max_concurrent": (1, 20),
+    "retry_attempts": (0, 10),
+    "structured_validation_retries": (0, 2),
+}
+_ALLOWED_SYMBOL_EXTRACTORS = frozenset({"auto", "builtin", "tree_sitter"})
+_ALLOWED_OUTPUT_LANGS = frozenset({"auto", "en", "zh-CN"})
+_ALLOWED_STRUCTURED_OUTPUT_MODES = frozenset(
+    {
+        "prompt_contract",
+        "json_object",
+        "native_json_schema",
+        "strict_tool",
+    }
+)
+_ALLOWED_QUIZ_COUNT_MODES = frozenset({"fixed", "auto"})
+_QUIZ_INT_FIELDS = {
+    "quiz_question_count",
+    "quiz_auto_range_min",
+    "quiz_auto_range_max",
+}
+
+
+def _validate_llm_update(llm: object) -> dict[str, Any] | str:
+    if not isinstance(llm, dict):
+        return "llm must be a JSON object"
+    llm_dict = cast("dict[str, Any]", llm)
+    allowed = set(_LLM_INT_FIELDS) | {"output_lang", "structured_output_mode"}
+    unknown_llm: set[str] = set(llm_dict.keys()) - allowed
+    if unknown_llm:
+        return f"unknown llm keys: {sorted(unknown_llm)}"
+    validated: dict[str, Any] = {}
+    for field_name, (lo, hi) in _LLM_INT_FIELDS.items():
+        if field_name in llm_dict:
+            val: object = llm_dict[field_name]
+            if not isinstance(val, int) or isinstance(val, bool):
+                return f"llm.{field_name} must be an integer"
+            if val < lo or val > hi:
+                return f"llm.{field_name} must be between {lo} and {hi}"
+            validated[field_name] = val
+    if "output_lang" in llm_dict:
+        ol: object = llm_dict["output_lang"]
+        if not isinstance(ol, str) or ol not in _ALLOWED_OUTPUT_LANGS:
+            return f"llm.output_lang must be one of {sorted(_ALLOWED_OUTPUT_LANGS)}"
+        validated["output_lang"] = ol
+    if "structured_output_mode" in llm_dict:
+        mode: object = llm_dict["structured_output_mode"]
+        if not isinstance(mode, str) or mode not in _ALLOWED_STRUCTURED_OUTPUT_MODES:
+            return (
+                "llm.structured_output_mode must be one of "
+                f"{sorted(_ALLOWED_STRUCTURED_OUTPUT_MODES)}"
+            )
+        validated["structured_output_mode"] = mode
+    return validated
+
+
+def _validate_capture_update(capture: object) -> dict[str, Any] | str:
+    if not isinstance(capture, dict):
+        return "capture must be a JSON object"
+    capture_dict = cast("dict[str, Any]", capture)
+    allowed = {
+        "mode",
+        "max_files",
+        "hard_limit",
+        "max_patch_bytes",
+        "file_ranking",
+        "symbol_extractor",
+    }
+    unknown_cap: set[str] = set(capture_dict.keys()) - allowed
+    if unknown_cap:
+        return f"unknown capture keys: {sorted(unknown_cap)}"
+    validated: dict[str, Any] = {}
+    mode = capture_dict.get("mode")
+    if "mode" in capture_dict:
+        if not isinstance(mode, str) or mode not in _ALLOWED_CAPTURE_MODES:
+            return f"capture.mode must be one of {sorted(_ALLOWED_CAPTURE_MODES)}"
+        validated["mode"] = mode
+    validate_numeric_fields = mode != "auto"
+    for field_name, (lo, hi) in _CAPTURE_INT_FIELDS.items():
+        if validate_numeric_fields and field_name in capture_dict:
+            val: object = capture_dict[field_name]
+            if not isinstance(val, int) or isinstance(val, bool):
+                return f"capture.{field_name} must be an integer"
+            if val < lo or val > hi:
+                return f"capture.{field_name} must be between {lo} and {hi}"
+            validated[field_name] = val
+    if "file_ranking" in capture_dict:
+        ranking: object = capture_dict["file_ranking"]
+        if not isinstance(ranking, str) or ranking not in _ALLOWED_FILE_RANKINGS:
+            return f"capture.file_ranking must be one of {sorted(_ALLOWED_FILE_RANKINGS)}"
+        validated["file_ranking"] = ranking
+    if "symbol_extractor" in capture_dict:
+        se: object = capture_dict["symbol_extractor"]
+        if not isinstance(se, str) or se not in _ALLOWED_SYMBOL_EXTRACTORS:
+            return f"capture.symbol_extractor must be one of {sorted(_ALLOWED_SYMBOL_EXTRACTORS)}"
+        validated["symbol_extractor"] = se
+    return validated
+
+
+def _validate_learn_update(learn: object) -> dict[str, Any] | str:
+    if not isinstance(learn, dict):
+        return "learn must be a JSON object"
+    learn_dict = cast("dict[str, Any]", learn)
+    allowed = {"learnability_threshold", "desired_retention"}
+    unknown_learn: set[str] = set(learn_dict.keys()) - allowed
+    if unknown_learn:
+        return f"unknown learn keys: {sorted(unknown_learn)}"
+    validated: dict[str, Any] = {}
+    if "learnability_threshold" in learn_dict:
+        val: object = learn_dict["learnability_threshold"]
+        if not isinstance(val, int | float) or isinstance(val, bool):
+            return "learn.learnability_threshold must be a number"
+        parsed = float(val)
+        if not math.isfinite(parsed):
+            return "learn.learnability_threshold must be a finite number"
+        if parsed < 0.0 or parsed > 1.0:
+            return "learn.learnability_threshold must be between 0.0 and 1.0"
+        validated["learnability_threshold"] = parsed
+    if "desired_retention" in learn_dict:
+        val = learn_dict["desired_retention"]
+        if not isinstance(val, int | float) or isinstance(val, bool):
+            return "learn.desired_retention must be a number"
+        parsed = float(val)
+        if not math.isfinite(parsed):
+            return "learn.desired_retention must be a finite number"
+        if parsed < 0.7 or parsed > 0.99:
+            return "learn.desired_retention must be between 0.7 and 0.99"
+        validated["desired_retention"] = parsed
+    return validated
+
+
+def _validate_quiz_int_field(field: str, value: object) -> int | str:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return f"quiz.{field} must be an integer"
+    if value < 1 or value > 30:
+        return f"quiz.{field} must be between 1 and 30"
+    return value
+
+
+def _validate_quiz_update(quiz: object) -> dict[str, Any] | str:
+    if not isinstance(quiz, dict):
+        return "quiz must be a JSON object"
+    quiz_dict = cast("dict[str, Any]", quiz)
+    allowed = _QUIZ_INT_FIELDS | {"quiz_question_count_mode"}
+    unknown_quiz: set[str] = set(quiz_dict.keys()) - allowed
+    if unknown_quiz:
+        return f"unknown quiz keys: {sorted(unknown_quiz)}"
+    validated: dict[str, Any] = {}
+    if "quiz_question_count_mode" in quiz_dict:
+        mode: object = quiz_dict["quiz_question_count_mode"]
+        if not isinstance(mode, str) or mode not in _ALLOWED_QUIZ_COUNT_MODES:
+            allowed_modes = sorted(_ALLOWED_QUIZ_COUNT_MODES)
+            return f"quiz.quiz_question_count_mode must be one of {allowed_modes}"
+        validated["quiz_question_count_mode"] = mode
+    for field in _QUIZ_INT_FIELDS:
+        if field not in quiz_dict:
+            continue
+        parsed = _validate_quiz_int_field(field, quiz_dict[field])
+        if isinstance(parsed, str):
+            return parsed
+        validated[field] = parsed
+
+    range_min = validated.get("quiz_auto_range_min")
+    range_max = validated.get("quiz_auto_range_max")
+    if isinstance(range_min, int) and isinstance(range_max, int) and range_min > range_max:
+        return "quiz.quiz_auto_range_min must be <= quiz.quiz_auto_range_max"
+    return validated
+
+
+def configured_provider_aliases(state: ServeState, fallback_aliases: set[str]) -> set[str]:
+    from .config_runtime import load_serve_config_snapshot
+
+    try:
+        cfg = load_serve_config_snapshot(state)
+        values = cast("dict[str, Any]", getattr(cfg, "values", {}))
+        providers_config = values.get("providers")
+        if isinstance(providers_config, Mapping):
+            provider_mapping = cast("Mapping[object, object]", providers_config)
+            return {str(alias) for alias in provider_mapping}
+    except Exception:
+        log.debug("failed to load merged provider config", exc_info=True)
+        return set(fallback_aliases)
+    return set(fallback_aliases)
+
+
+def validate_role_thinking_update(snapshot: ConfigSnapshot, roles: set[str]) -> str | None:
+    from ahadiff.core.errors import ProviderError
+    from ahadiff.core.orchestrator import (
+        implicit_duplicate_provider_name,
+        provider_names_for_auto_default,
+    )
+    from ahadiff.llm.adapters.thinking import (
+        minimum_thinking_output_tokens,
+        reject_unsupported_thinking,
+    )
+
+    llm = _object_mapping(snapshot.values.get("llm"))
+    providers = _object_mapping(snapshot.values.get("providers"))
+    for role in sorted(roles):
+        model_override = _explicit_role_model_override(llm, snapshot.resolved, role=role)
+        alias = llm.get(f"{role}_provider")
+        if not isinstance(alias, str) or not alias:
+            names = provider_names_for_auto_default(snapshot=snapshot, providers_table=providers)
+            alias = (
+                names[0]
+                if len(names) == 1
+                else implicit_duplicate_provider_name(
+                    providers_table=providers, configured_names=names, model=model_override
+                )
+            )
+        if alias is None:
+            continue
+        provider = _object_mapping(providers.get(alias))
+        if not provider:
+            return f"{role}_provider '{alias}' not found in configured providers"
+        level = provider.get("thinking_level")
+        profile = provider.get("model_limits_name") if model_override is None else None
+        try:
+            reject_unsupported_thinking(
+                str(provider.get("provider_class", "")),
+                level if isinstance(level, str) else None,
+                model_name=model_override or str(provider.get("model_name", "")),
+                base_url=str(provider.get("base_url", "")),
+                model_limits_name=profile if isinstance(profile, str) else None,
+            )
+            minimum = minimum_thinking_output_tokens(
+                str(provider.get("provider_class", "")),
+                model_override or str(provider.get("model_name", "")),
+                level if isinstance(level, str) else None,
+                base_url=str(provider.get("base_url", "")),
+            )
+            output_cap = provider.get("max_output_tokens")
+            if minimum is not None and isinstance(output_cap, int) and 0 < output_cap < minimum:
+                raise ProviderError(f"max_output_tokens must be at least {minimum}")
+        except ProviderError as exc:
+            return (
+                f"{role} provider '{alias}': {exc}. Choose a compatible model or a "
+                "separate provider alias with the required thinking level."
+            )
+    return None
+
+
+def _validate_and_persist_config_with_lock(
+    app_state: Any,
+    state: ServeState,
+    persist_updates: dict[str, Any],
+    provider_alias_updates: dict[str, str],
+    has_quiz_update: bool,
+    quiz_update: object | None,
+    lang_update: Literal["en", "zh-CN"] | None,
+) -> str | None:
+    from ahadiff.core.config import preview_workspace_config, read_config_data, write_config_data
+    from ahadiff.core.errors import ConfigError
+
+    config_path = state.state_dir.parent / ".ahadiff" / "config.toml"
+    with serve_repo_write_lock(state, command="serve config update"):
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        data = read_config_data(config_path) if config_path.exists() else {}
+        if provider_alias_updates:
+            raw_providers = data.get("providers")
+            providers = (
+                cast("dict[str, object]", raw_providers) if isinstance(raw_providers, dict) else {}
+            )
+            configured_aliases = configured_provider_aliases(state, set(providers))
+            for prov_key, pv_stripped in provider_alias_updates.items():
+                if pv_stripped and pv_stripped not in configured_aliases:
+                    return f"{prov_key} '{pv_stripped}' not found in configured providers"
+                persist_updates.setdefault("llm", {})[prov_key] = pv_stripped
+        if has_quiz_update:
+            quiz_result = _validate_quiz_update(quiz_update)
+            if isinstance(quiz_result, str):
+                return quiz_result
+            if quiz_result:
+                persist_updates["quiz"] = quiz_result
+        if persist_updates:
+            for key, value in persist_updates.items():
+                if isinstance(value, dict):
+                    section = data.setdefault(key, {})
+                    section.update(value)
+                else:
+                    data[key] = value
+        llm_updates = _object_mapping(persist_updates.get("llm"))
+        changed_roles = {
+            role
+            for role in ("generate", "judge")
+            if f"{role}_provider" in llm_updates or f"{role}_model" in llm_updates
+        }
+        if has_quiz_update or changed_roles:
+            try:
+                snapshot = preview_workspace_config(
+                    state.state_dir.parent,
+                    data,
+                    global_config_root=state.global_config_root,
+                )
+            except ConfigError as exc:
+                return str(exc)
+            thinking_error = validate_role_thinking_update(snapshot, changed_roles)
+            if thinking_error is not None:
+                return thinking_error
+        if persist_updates:
+            write_config_data(config_path, data)
+        if lang_update is not None:
+            app_state.ahadiff = state.with_locale(lang_update)
+    return None
+
+
+async def put_config(request: Request) -> JSONResponse:
+    from .auth import require_write_token, serve_state
+
+    require_write_token(request)
+    payload: Any = await request.json()
+    if not isinstance(payload, dict):
+        return error_response(ErrorCode.INPUT_BAD_FIELD, "expected JSON object", status=400)
+
+    body = cast("dict[str, Any]", payload)
+    allowed_keys: set[str] = {
+        "lang",
+        "capture",
+        "privacy_mode",
+        "generate_provider",
+        "generate_model",
+        "judge_provider",
+        "judge_model",
+        "serve_port",
+        "llm",
+        "learn",
+        "quiz",
+    }
+    unknown: set[str] = set(body.keys()) - allowed_keys
+    if unknown:
+        return _config_error(f"unknown config keys: {sorted(unknown)}")
+
+    state = serve_state(request)
+    persist_updates: dict[str, Any] = {}
+    lang_update: Literal["en", "zh-CN"] | None = None
+    provider_alias_updates: dict[str, str] = {}
+    has_quiz_update = False
+    quiz_update: object | None = None
+
+    if "lang" in body:
+        lang: str = str(body["lang"])
+        if lang not in _ALLOWED_CONFIG_LANG:
+            return _config_error(f"lang must be one of {sorted(_ALLOWED_CONFIG_LANG)}")
+        lang_update = cast("Literal['en', 'zh-CN']", lang)
+        persist_updates["lang"] = lang
+
+    if "privacy_mode" in body:
+        pm: object = body["privacy_mode"]
+        if not isinstance(pm, str) or pm not in _ALLOWED_PRIVACY_MODES:
+            return _config_error(f"privacy_mode must be one of {sorted(_ALLOWED_PRIVACY_MODES)}")
+        persist_updates["privacy_mode"] = pm
+
+    for role in ("generate", "judge"):
+        prov_key = f"{role}_provider"
+        if prov_key in body:
+            pv: object = body[prov_key]
+            if not isinstance(pv, str):
+                return _config_error(f"{prov_key} must be a string")
+            pv_stripped = pv.strip()
+            provider_alias_updates[prov_key] = pv_stripped
+
+    if "generate_model" in body:
+        gm: object = body["generate_model"]
+        if not isinstance(gm, str) or not gm.strip():
+            return _config_error("generate_model must be a non-empty string")
+        persist_updates.setdefault("llm", {})["generate_model"] = gm.strip()
+
+    if "judge_model" in body:
+        jm: object = body["judge_model"]
+        if not isinstance(jm, str) or not jm.strip():
+            return _config_error("judge_model must be a non-empty string")
+        persist_updates.setdefault("llm", {})["judge_model"] = jm.strip()
+
+    if "serve_port" in body:
+        sp: object = body["serve_port"]
+        if not isinstance(sp, int) or isinstance(sp, bool):
+            return _config_error("serve_port must be an integer")
+        if sp < 1024 or sp > 65535:
+            return _config_error("serve_port must be between 1024 and 65535")
+        persist_updates.setdefault("serve", {})["port"] = sp
+
+    if "llm" in body:
+        llm_result = _validate_llm_update(body["llm"])
+        if isinstance(llm_result, str):
+            return _config_error(llm_result)
+        if llm_result:
+            persist_updates.setdefault("llm", {}).update(llm_result)
+
+    if "capture" in body:
+        result = _validate_capture_update(body["capture"])
+        if isinstance(result, str):
+            return _config_error(result)
+        if result:
+            persist_updates["capture"] = result
+
+    if "learn" in body:
+        learn_result = _validate_learn_update(body["learn"])
+        if isinstance(learn_result, str):
+            return _config_error(learn_result)
+        if learn_result:
+            persist_updates["learn"] = learn_result
+
+    if "quiz" in body:
+        has_quiz_update = True
+        quiz_update = body["quiz"]
+
+    if persist_updates or provider_alias_updates or has_quiz_update:
+        try:
+            config_error = await to_thread.run_sync(
+                _validate_and_persist_config_with_lock,
+                request.app.state,
+                state,
+                persist_updates,
+                provider_alias_updates,
+                has_quiz_update,
+                quiz_update,
+                lang_update,
+            )
+        except AhaDiffError as exc:
+            message = (
+                "another_ahadiff_process_is_running"
+                if exc.code is ErrorCode.LOCK_CONFLICT
+                else str(exc) or exc.code.value.lower()
+            )
+            return error_response(exc.code, message)
+        except Exception as exc:
+            return _config_error(f"cannot update config: {exc}")
+        if config_error is not None:
+            return _config_error(config_error)
+
+    return JSONResponse(ConfigUpdateResponse(updated=True, scope="session").model_dump(mode="json"))

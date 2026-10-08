@@ -1,0 +1,423 @@
+/* ==========================================================================
+   Sidebar — extracted from AppShell.css
+   Uses tokens from styles/tokens.css exclusively.
+   ========================================================================== */
+
+/* ---------- Sidebar ---------- */
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  height: 100dvh;
+  background: linear-gradient(180deg, var(--subtle) 0%, var(--paper) 100%);
+  border-inline-end: 1px solid var(--hair);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-top: 0;
+}
+
+/* ---------- Brand ---------- */
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 22px 18px;
+  border-bottom: 1px solid var(--hair);
+  flex-shrink: 0;
+}
+
+.brand-mark {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-ink) 100%);
+  color: var(--on-accent);
+  display: grid;
+  place-items: center;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+  box-shadow: var(--shadow-brand);
+  flex-shrink: 0;
+}
+
+.brand-mark span {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-ink);
+  color: var(--on-accent);
+  transform: translateY(-1px);
+}
+
+.brand-name {
+  font-family: var(--font-serif);
+  font-size: var(--fs-h3);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  line-height: var(--lh-tight);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.brand-en {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+/* ---------- Nav sections ---------- */
+
+.nav-section {
+  padding: 14px 12px 4px;
+  flex-shrink: 0;
+}
+
+.nav-label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--muted-strong);
+  padding: 6px 10px;
+  line-height: 1.4;
+}
+
+/* ---------- Nav items ---------- */
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  color: var(--ink-2);
+  font-size: 14px;
+  cursor: pointer;
+  margin: 1px 0;
+  text-decoration: none;
+  letter-spacing: 0.002em;
+  transition: background var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart),
+    transform var(--dur-fast) var(--ease-out-quart);
+}
+
+.nav-item:hover {
+  background: var(--accent-softer);
+  transform: translateX(1px);
+}
+
+.nav-item:active:not(.nav-item--disabled) {
+  transform: scale(0.98);
+}
+
+.nav-item.active {
+  background: var(--elevated);
+  color: var(--ink);
+  box-shadow: 0 1px 0 var(--hair), 0 4px 12px -8px rgba(120, 80, 50, 0.22);
+}
+
+.nav-item.active .ic {
+  opacity: 1;
+  color: var(--accent-ink);
+}
+
+.nav-item.active .en {
+  color: var(--accent-ink);
+}
+
+.nav-item .ic {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  opacity: 0.75;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+
+.nav-item--disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.nav-item--disabled:hover {
+  background: transparent;
+  transform: none;
+}
+
+.nav-item .en {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted-2);
+  margin-left: auto;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* ---------- Status footer ---------- */
+
+.side-foot {
+  margin-top: auto;
+  padding: 14px 16px;
+  border-top: 1px solid var(--hair);
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(47, 111, 79, 0.15);
+  flex: none;
+}
+
+.status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.status-text span:first-child {
+  color: var(--ink);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-text span:last-child {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.side-foot__github {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 500;
+  width: 100%;
+  padding-left: 18px;
+  margin-top: 4px;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+
+.side-foot__github:hover,
+.side-foot__github:focus {
+  color: var(--accent);
+}
+
+.side-foot__github-icon {
+  flex: none;
+}
+
+.side-foot__version {
+  width: 100%;
+  text-align: end;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+/* ---------- Responsive ---------- */
+
+/* Default sidebar width tracks the AppShell grid column (248px). The shell
+ * grid sets the column, so the sidebar simply fills it via flex. */
+
+/* Icon-only rail: 769-1024px. The sidebar stays in document flow (no drawer);
+ * labels and brand text collapse, leaving an icon column. */
+@media (max-width: 1024px) and (min-width: 769px) {
+  .sidebar {
+    /* Use width transition for the rail collapse. The grid column already
+     * shrinks to 56px in AppShell.css, so width here matches that. */
+    width: 100%;
+    transition: none;
+    /* Preserve vertical scroll on short viewports (e.g., 600px tall tablet
+     * landscape) so the rail does not clip its bottom items. The base rule
+     * sets this too; restating it inside the rail block makes the contract
+     * explicit and resistant to future refactors. */
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .brand {
+    justify-content: center;
+    padding: var(--sp-4) var(--sp-1) var(--sp-3);
+    gap: 0;
+  }
+
+  .brand > div:last-child {
+    display: none;
+  }
+
+  .nav-section {
+    padding: var(--sp-2) var(--sp-1) var(--sp-1);
+  }
+
+  .nav-label {
+    /* Hide section headings (Workspace / Practice / System) but keep them
+     * accessible to screen readers via the parent <section aria-labelledby>. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .nav-item {
+    justify-content: center;
+    gap: 0;
+    padding: var(--sp-2);
+    margin: 2px 4px;
+    min-height: 40px;
+  }
+
+  .nav-item > span:not(.ic) {
+    display: none;
+  }
+
+  .side-foot {
+    /* The status footer is bilingual + multi-line; hide in icon mode rather
+     * than truncate. Screen readers still see the full sidebar in non-rail
+     * widths. */
+    display: none;
+  }
+}
+
+/* Drawer sidebar at <=768px; 769-1024px gets the icon rail instead. */
+@media (max-width: 768px) {
+  .sidebar {
+    position: fixed;
+    top: 0;
+    inset-inline-start: 0;
+    bottom: auto;
+    width: min(280px, calc(100vw - 48px));
+    height: 100vh;
+    height: 100dvh;
+    z-index: var(--z-sticky);
+    transform: translateX(-100%);
+    transition: transform var(--dur-fast) var(--ease-out-quart);
+    border-inline-end: 1px solid var(--hair);
+    box-shadow: 0 0 40px rgba(0, 0, 0, 0.2);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  :dir(rtl) .sidebar {
+    transform: translateX(100%);
+  }
+
+  .sidebar--open {
+    transform: translateX(0);
+  }
+
+  :dir(rtl) .sidebar.sidebar--open {
+    transform: translateX(0);
+  }
+
+  .nav-section {
+    padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  }
+
+  .nav-item {
+    flex-direction: row;
+    gap: 10px;
+    padding: var(--sp-2) 10px;
+    font-size: 14px;
+    border-radius: var(--r-md);
+    min-width: 0;
+    min-height: 44px;
+  }
+
+  .nav-item .ic {
+    font-size: 14px;
+    width: var(--sp-4);
+    height: var(--sp-4);
+  }
+}
+
+@media (max-width: 359px) {
+  .nav-item {
+    min-width: 0;
+    min-height: 44px;
+    font-size: 13px;
+    padding: 7px var(--sp-2);
+  }
+}
+
+/* ---- Reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .nav-item,
+  .side-foot__github {
+    transition: none;
+  }
+
+  .nav-item:active:not(.nav-item--disabled) {
+    transform: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .nav-item.active {
+    border: 1px solid LinkText;
+  }
+
+  .brand-mark {
+    outline: 1px solid CanvasText;
+  }
+
+  .side-foot span {
+    color: CanvasText;
+  }
+
+  .side-foot__github,
+  .side-foot__github span {
+    color: LinkText;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar {
+    background: linear-gradient(180deg, var(--subtle) 0%, var(--paper) 100%);
+  }
+
+  @media (max-width: 767px) {
+    .sidebar {
+      box-shadow: 0 0 40px rgba(0, 0, 0, 0.32);
+    }
+  }
+}
