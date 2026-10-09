@@ -17,5 +17,5 @@ export function highlightSource(text: string, path?: string | null) {
 
 export default function KnowledgeCode({ text }: { text: string }) {
   const highlighted = useMemo(() => hljs.highlightAuto(text).value, [text]);
-  return <pre className="knowledge-numbered-code"><span className="knowledge-code-gutter" aria-hidden="true">{text.split('\n').map((_, index) => <span key={index}>{index + 1}</span>)}</span><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>;
+  return <pre className="knowledge-numbered-code" tabIndex={0} role="region" aria-label="教学代码"><span className="knowledge-code-gutter" aria-hidden="true">{text.split('\n').map((_, index) => <span key={index}>{index + 1}</span>)}</span><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>;
 }

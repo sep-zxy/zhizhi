@@ -170,3 +170,14 @@
 
 .growth-overview__counts { grid-template-columns: repeat(4, 1fr); }
 @media (max-width: 680px) { .growth-overview__counts { grid-template-columns: repeat(2, 1fr); gap: 18px; } .growth-overview__counts div:nth-child(3) { border-left: 0; padding-left: 0; } }
+
+/* Keep every nested grid/flex content column shrinkable for paths and long prose. */
+.growth-page :is(.growth-page__panel, .growth-page__form, .growth-page__capture,
+  .growth-page__code-index, .growth-page__commit-row, .growth-page__card-intro,
+  .growth-page__reference, .growth-page__conversation, .growth-library__card) > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.growth-workspace__section-heading { flex-wrap: wrap; }
+.growth-workspace__filters { grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)); }
+@media (max-width: 850px) { .growth-workspace__filters { grid-template-columns: minmax(0, 1fr); } }
