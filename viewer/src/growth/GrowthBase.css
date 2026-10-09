@@ -75,3 +75,16 @@ a { color: var(--accent-ink); }
 .lang-switcher__btn { min-width: 40px; min-height: 36px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
 .lang-switcher__btn--active { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; }
 .lang-switcher__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* User content must fit its parent without imposing an intrinsic column width. */
+:where(h1, h2, h3, h4, p, li, dd, summary) { overflow-wrap: anywhere; }
+:where(pre) { min-width: 0; max-width: 100%; overflow: auto; }
+:where(input, select, textarea) { min-width: 0; max-width: 100%; }
+
+pre[class$="__code-block"] {
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}

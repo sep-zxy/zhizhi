@@ -265,3 +265,12 @@ kbd {
     transition: none;
   }
 }
+
+/* Shared Markdown can appear inside either grid or flex reading surfaces. */
+pre[class$="__code-block"] {
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}
