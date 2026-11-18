@@ -34,13 +34,17 @@ validatePublishContext({ ref, version });
 assert.match(runId ?? '', /^\d+$/, '无效的运行编号');
 const run = api(`repos/${repository}/actions/runs/${runId}`);
 validateBuildRun(run, { repository, repositoryId });
-const jobs = [];
-for (let page = 1; ; page++) {
-  const result = api(`repos/${repository}/actions/runs/${runId}/jobs?filter=latest&per_page=100&page=${page}`);
-  jobs.push(...result.jobs);
-  if (jobs.length >= result.total_count) break;
+function fetchJobs(filter) {
+  const jobs = [];
+  for (let page = 1; ; page++) {
+    const result = api(`repos/${repository}/actions/runs/${runId}/jobs?filter=${filter}&per_page=100&page=${page}`);
+    jobs.push(...result.jobs);
+    if (jobs.length >= result.total_count) return jobs;
+  }
 }
+const jobs = fetchJobs('latest');
 validateJobs(jobs);
+const jobHistory = run.run_attempt === 1 ? jobs : fetchJobs('all');
 validateMainMembership(api(`repos/${repository}/compare/${run.head_sha}...main`), run.head_sha);
 const source = api(`repos/${repository}/contents/desktop/package.json?ref=${run.head_sha}`);
 const packageInfo = JSON.parse(Buffer.from(source.content, 'base64').toString('utf8'));
@@ -63,7 +67,7 @@ for (const platform of PLATFORMS) {
   const dir = join('packages', platform);
   gh('run', 'download', runId, '--repo', repository, '--name', `zhizhi-${platform}`, '--dir', dir);
   const info = JSON.parse(readFileSync(join(dir, 'build-info.json'), 'utf8').replace(/^\uFEFF/, ''));
-  validateBuildInfo(info, run, platform, version);
+  validateBuildInfo(info, run, platform, version, jobHistory);
   validatePackageEntries(readdirSync(dir), platform, version);
   const line = readFileSync(join(dir, 'SHA256SUMS.txt'), 'utf8').replace(/^\uFEFF/, '').trim();
   const { filename, sha256 } = parseChecksumManifest(line, platform, version);

@@ -15,7 +15,7 @@ const run = {
 };
 const jobs = ['secrets', 'static', 'configuration', 'CI Gate',
   'desktop / Package (windows-x64)', 'desktop / Package (macos-arm64)']
-  .map(name => ({ name, status: 'completed', conclusion: 'success' }));
+  .map(name => ({ name, status: 'completed', conclusion: 'success', run_id: run.id, run_attempt: 2, head_sha: sha }));
 const info = {
   commit: sha, build_run_id: '1234', build_run_attempt: '2', platform: 'windows-x64',
   desktop_version: '0.1.1', startup: 'desktop-load-pass', icon_sha256: 'b'.repeat(64),
@@ -26,8 +26,8 @@ test('accepts a complete main CI, both platforms, source ancestry and provenance
   validateBuildRun(run, identity);
   validateJobs(jobs);
   for (const status of ['ahead', 'identical']) validateMainMembership({ status, merge_base_commit: { sha } }, sha);
-  validateBuildInfo(info, run, 'windows-x64', '0.1.1');
-  validateBuildInfo({ ...info, platform: 'macos-arm64', startup: 'sidecar-version-pass' }, run, 'macos-arm64', '0.1.1');
+  validateBuildInfo(info, run, 'windows-x64', '0.1.1', jobs);
+  validateBuildInfo({ ...info, platform: 'macos-arm64', startup: 'sidecar-version-pass' }, run, 'macos-arm64', '0.1.1', jobs);
   assert.deepEqual(PLATFORMS.map(p => expectedPackageName(p, '0.1.1')), ['zhizhi-0.1.1-win-x64.exe', 'zhizhi-0.1.1-mac-arm64.dmg']);
 });
 
@@ -62,7 +62,20 @@ test('rejects the wrong merge base', () => assert.throws(() => validateMainMembe
 for (const [field, value] of Object.entries({
   commit: 'c'.repeat(40), build_run_id: '4321', build_run_attempt: '1', platform: 'macos-arm64',
   desktop_version: '0.1.2', startup: 'failed', icon_sha256: '',
-})) test(`rejects mismatched artifact ${field}`, () => assert.throws(() => validateBuildInfo({ ...info, [field]: value }, run, 'windows-x64', '0.1.1')));
+})) test(`rejects mismatched artifact ${field}`, () => assert.throws(() => validateBuildInfo({ ...info, [field]: value }, run, 'windows-x64', '0.1.1', jobs)));
+
+const previousWindowsJob = { ...jobs.find(job => job.name.endsWith('Package (windows-x64)')), run_attempt: 1 };
+test('accepts a successful same-commit platform artifact reused after a failed-job retry', () => {
+  validateBuildInfo({ ...info, build_run_attempt: '1' }, run, 'windows-x64', '0.1.1', [...jobs, previousWindowsJob]);
+});
+for (const [field, value] of Object.entries({
+  run_id: 4321, head_sha: 'c'.repeat(40), status: 'in_progress', conclusion: 'failure', name: 'desktop / Package (macos-arm64)',
+})) test(`rejects reused artifacts with invalid historical ${field}`, () => {
+  assert.throws(() => validateBuildInfo({ ...info, build_run_attempt: '1' }, run, 'windows-x64', '0.1.1', [...jobs, { ...previousWindowsJob, [field]: value }]));
+});
+for (const attempt of ['0', '3', 'not-an-attempt']) test(`rejects invalid artifact attempt ${attempt}`, () => {
+  assert.throws(() => validateBuildInfo({ ...info, build_run_attempt: attempt }, run, 'windows-x64', '0.1.1', jobs));
+});
 
 const filename = expectedPackageName('windows-x64', '0.1.1');
 const digest = 'd'.repeat(64);

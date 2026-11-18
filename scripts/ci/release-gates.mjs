@@ -54,10 +54,17 @@ export function expectedPackageName(platform, version) {
   return `zhizhi-${version}-${platform === 'windows-x64' ? 'win-x64.exe' : 'mac-arm64.dmg'}`;
 }
 
-export function validateBuildInfo(info, run, platform, version) {
+export function validateBuildInfo(info, run, platform, version, jobHistory) {
   assert.equal(info.commit, run.head_sha, '产物源码提交不匹配');
   assert.equal(String(info.build_run_id), String(run.id), '产物来自其他 CI 运行');
-  assert.equal(String(info.build_run_attempt), String(run.run_attempt), '产物来自旧的运行次数，请重跑全部 CI');
+  const attempt = Number(info.build_run_attempt);
+  assert.ok(Number.isSafeInteger(attempt) && attempt > 0 && attempt <= run.run_attempt, '无效的产物运行次数');
+  const jobName = `Package (${platform})`;
+  assert.ok(jobHistory.some(job =>
+    (job.name === jobName || job.name.endsWith(` / ${jobName}`)) &&
+    job.run_id === run.id && job.run_attempt === attempt && job.head_sha === run.head_sha &&
+    job.status === 'completed' && job.conclusion === 'success'
+  ), '产物没有对应提交与运行次数的成功平台任务');
   assert.equal(info.platform, platform, '产物平台不匹配');
   assert.equal(info.desktop_version, version, '产物桌面版本不匹配');
   assert.equal(info.startup, platform === 'windows-x64' ? 'desktop-load-pass' : 'sidecar-version-pass', '启动检查未通过');
