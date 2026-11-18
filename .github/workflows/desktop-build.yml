@@ -39,6 +39,9 @@ jobs:
     env:
       SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # PRs must exercise the same ad hoc signer as main. No certificate or
+      # publishing credentials are passed to this read-only build workflow.
+      CSC_FOR_PULL_REQUEST: 'true'
       ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: 'false'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
