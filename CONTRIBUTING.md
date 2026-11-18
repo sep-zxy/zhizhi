@@ -10,23 +10,24 @@
 
 1. Fork 仓库，从 `main` 创建聚焦单个问题的分支。
 2. 保持现有目录和风格，优先小步修复。
-3. 本地完成必要的语法、类型和配置检查。
+3. 推送后通过 GitHub 上的完整 CI；本地不执行构建和验证。
 4. 使用中文提交信息，将问题、行为变化和验证情况写清楚。
 5. 提交 Pull Request，说明是否影响工作区、模型调用、数据库或导出格式。
 
 请阅读 [AGENTS.md](AGENTS.md)。所有构建只允许在 GitHub 托管的 Actions runner 上执行；通过 [构建说明](docs/BUILDING.md) 触发并下载产物。本地不打包，不以伪造环境变量绕过构建限制。
 
-## 本地静态校验
+## GitHub 验证
 
-在已有依赖环境中可执行：
+创建 PR 后，`Static Checks` 自动执行密钥扫描、语法类型检查、工作流与发布门禁验证，以及 Windows/macOS 打包和启动检查。所有任务通过后，统一的 `CI Gate` 才会通过。主分支保护要求这一检查通过，并要求 PR 与最新主分支保持同步。
+
+需要在 GitHub 上手动执行相同流程时：
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-node --check desktop/main.mjs
-pnpm --dir viewer typecheck
+gh workflow run 'checks.yml' --repo 'sep-zxy/zhizhi' --ref '你的分支名'
 ```
 
-Python 使用 `uv` 调用，仅进行语法检查时使用 `ast.parse` 等无需导入应用的方式。不要为了本地校验生成发行包或构建前端资源。
+所有验证在 GitHub 托管 runner 上执行。Python 语法检查使用 `uv` 和 `ast.parse`，不会导入应用。PR 预览包与正式发布门禁的区别见 [构建说明](docs/BUILDING.md)。
 
 保留底座测试和基准输入。新增测试应验证实际行为边界，不只镜像实现。未经明确要求不做视觉检查。
 
