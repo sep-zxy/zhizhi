@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   CI_WORKFLOW, PLATFORMS, expectedPackageName, parseChecksumManifest, validatePackageEntries, validateBuildInfo, validateBuildRun,
-  validateJobs, validateMainMembership, validatePublishContext,
+  validateJobs, validateMainMembership, validatePublishContext, validateReleaseState,
 } from '../../scripts/ci/release-gates.mjs';
 
 const sha = 'a'.repeat(40);
@@ -76,3 +76,14 @@ for (const badName of ['../escape.exe', 'zhizhi-0.1.2-win-x64.exe', 'zhizhi-0.1.
 test('rejects multiple manifest entries', () => assert.throws(() => parseChecksumManifest(`${digest}  ${filename}\n${digest}  ${filename}`, 'windows-x64', '0.1.1')));
 test('rejects a missing installer', () => assert.throws(() => validatePackageEntries(['SHA256SUMS.txt', 'build-info.json'], 'windows-x64', '0.1.1')));
 test('rejects unexpected artifact files', () => assert.throws(() => validatePackageEntries(['SHA256SUMS.txt', 'build-info.json', filename, 'extra.exe'], 'windows-x64', '0.1.1')));
+
+test('dry run accepts a new release or a matching resumable draft/tag', () => {
+  validateReleaseState(null, undefined, sha);
+  validateReleaseState({ draft: true, target_commitish: sha }, undefined, sha);
+  validateReleaseState({ draft: true, target_commitish: sha }, { type: 'commit', sha }, sha);
+});
+test('dry run rejects an already published version', () => assert.throws(() => validateReleaseState({ draft: false, target_commitish: sha }, undefined, sha)));
+test('dry run rejects a draft for another source commit', () => assert.throws(() => validateReleaseState({ draft: true, target_commitish: 'c'.repeat(40) }, undefined, sha)));
+test('dry run rejects a tag for another commit', () => assert.throws(() => validateReleaseState(null, { type: 'commit', sha: 'c'.repeat(40) }, sha)));
+test('dry run fails closed if a tag cannot be fully resolved', () => assert.throws(() => validateReleaseState(null, { type: 'tag', sha }, sha)));
+test('dry run fails closed on incomplete release metadata', () => assert.throws(() => validateReleaseState({ target_commitish: sha }, undefined, sha)));

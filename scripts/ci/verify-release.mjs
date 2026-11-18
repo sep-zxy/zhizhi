@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   PLATFORMS, parseChecksumManifest, validatePackageEntries, validateBuildInfo, validateBuildRun,
-  validateJobs, validateMainMembership, validatePublishContext,
+  validateJobs, validateMainMembership, validatePublishContext, validateReleaseState,
 } from './release-gates.mjs';
 
 function gh(...args) {
@@ -13,6 +13,14 @@ function gh(...args) {
 }
 function api(endpoint) {
   return JSON.parse(gh('api', endpoint));
+}
+function optionalApi(endpoint) {
+  try {
+    return api(endpoint);
+  } catch (error) {
+    if (error.status === 1 && /\(HTTP 404\)/.test(String(error.stderr))) return null;
+    throw error;
+  }
 }
 function write(path, value) {
   writeFileSync(path, value, 'utf8');
@@ -37,6 +45,16 @@ validateMainMembership(api(`repos/${repository}/compare/${run.head_sha}...main`)
 const source = api(`repos/${repository}/contents/desktop/package.json?ref=${run.head_sha}`);
 const packageInfo = JSON.parse(Buffer.from(source.content, 'base64').toString('utf8'));
 assert.equal(packageInfo.version, version, '发布版本与源码版本不匹配');
+
+// Dry runs must reject the same existing-release/tag conflicts as publication.
+// The write job checks again immediately before publishing to avoid stale state.
+const tag = `v${version}`;
+const existingTag = optionalApi(`repos/${repository}/git/ref/tags/${tag}`);
+let tagTarget = existingTag?.object;
+for (let depth = 0; tagTarget?.type === 'tag' && depth < 10; depth++) {
+  tagTarget = api(`repos/${repository}/git/tags/${tagTarget.sha}`).object;
+}
+validateReleaseState(optionalApi(`repos/${repository}/releases/tags/${tag}`), tagTarget, run.head_sha);
 
 mkdirSync('packages', { recursive: true });
 const records = [];

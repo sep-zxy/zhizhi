@@ -38,6 +38,17 @@ export function validateMainMembership(comparison, sha) {
   assert.equal(comparison.merge_base_commit?.sha, sha, '构建提交不是 main 的祖先');
 }
 
+export function validateReleaseState(release, tagTarget, commit) {
+  if (tagTarget) {
+    assert.equal(tagTarget.type, 'commit', '无法确认已有标签的最终提交');
+    assert.equal(tagTarget.sha, commit, '已有标签指向其他提交');
+  }
+  if (release) {
+    assert.equal(release.draft, true, '拒绝覆盖已发布版本');
+    assert.equal(release.target_commitish, commit, '已有草稿属于其他提交');
+  }
+}
+
 export function expectedPackageName(platform, version) {
   assert.ok(PLATFORMS.includes(platform), '未知的平台');
   return `zhizhi-${version}-${platform === 'windows-x64' ? 'win-x64.exe' : 'mac-arm64.dmg'}`;
