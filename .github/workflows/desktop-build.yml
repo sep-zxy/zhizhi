@@ -30,7 +30,7 @@ jobs:
             arch: x64
             command: package:win
           - platform: macos-arm64
-            runner: macos-15
+            runner: macos-26
             arch: arm64
             command: package:mac
     defaults:
@@ -56,6 +56,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $actual = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$' -or $actual -ne $env:SOURCE_SHA) { throw '构建提交与已检查提交不一致' }
+          if ($env:RUNNER_ARCH -ine '${{ matrix.arch }}') { throw '构建机器架构与目标平台不一致' }
 
       - name: Validate source and build viewer
         run: |
