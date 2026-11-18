@@ -13,7 +13,7 @@
 | Windows x64 | `windows-2025` | NSIS `.exe` |
 | macOS arm64 | `macos-15` | DMG `.dmg` |
 
-共享的 `.github/actions/setup-toolchain/action.yml` 锁定 Node.js 22.20.0、pnpm 10.33.0、uv 0.13.9 和 Python 3.13.7，第三方 Action 固定到提交 SHA，并使用仓库中的 pnpm 和 uv 锁文件。Electron 使用 `desktop/package.json` 中锁定的版本。
+共享的 `.github/actions/setup-toolchain/action.yml` 锁定 Node.js 22.23.5、pnpm 10.33.0、uv 0.13.9 和 Python 3.13.18，第三方 Action 固定到提交 SHA，并使用仓库中的 pnpm 和 uv 锁文件。仅安装依赖的任务开启依赖缓存，避免只读配置检查在保存空缓存时失败。Electron 使用 `desktop/package.json` 中锁定的版本。
 
 ## 合并检查
 

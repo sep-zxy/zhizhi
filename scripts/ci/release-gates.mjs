@@ -53,3 +53,14 @@ export function validateBuildInfo(info, run, platform, version) {
   assert.match(info.icon_sha256 ?? '', /^[0-9a-f]{64}$/, '缺少图标校验记录');
 }
 
+export function validatePackageEntries(entries, platform, version) {
+  const filename = expectedPackageName(platform, version);
+  assert.deepEqual([...entries].sort(), ['SHA256SUMS.txt', 'build-info.json', filename].sort(), '产物包含缺失或多余文件');
+}
+
+export function parseChecksumManifest(text, platform, version) {
+  const match = text.replace(/^\uFEFF/, '').trim().match(/^([0-9a-f]{64}) {2}([^\r\n]+)$/);
+  assert.ok(match && match[2] === expectedPackageName(platform, version), '校验清单或文件名错误');
+  return { sha256: match[1], filename: match[2] };
+}
+

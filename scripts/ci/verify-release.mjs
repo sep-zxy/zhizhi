@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  PLATFORMS, expectedPackageName, validateBuildInfo, validateBuildRun,
+  PLATFORMS, parseChecksumManifest, validatePackageEntries, validateBuildInfo, validateBuildRun,
   validateJobs, validateMainMembership, validatePublishContext,
 } from './release-gates.mjs';
 
@@ -46,13 +46,11 @@ for (const platform of PLATFORMS) {
   gh('run', 'download', runId, '--repo', repository, '--name', `zhizhi-${platform}`, '--dir', dir);
   const info = JSON.parse(readFileSync(join(dir, 'build-info.json'), 'utf8').replace(/^\uFEFF/, ''));
   validateBuildInfo(info, run, platform, version);
-  const filename = expectedPackageName(platform, version);
-  assert.deepEqual(readdirSync(dir).sort(), ['SHA256SUMS.txt', 'build-info.json', filename].sort(), '产物包含缺失或多余文件');
+  validatePackageEntries(readdirSync(dir), platform, version);
   const line = readFileSync(join(dir, 'SHA256SUMS.txt'), 'utf8').replace(/^\uFEFF/, '').trim();
-  const match = line.match(/^([0-9a-f]{64}) {2}([^\r\n]+)$/);
-  assert.ok(match && match[2] === filename, '校验清单或文件名错误');
+  const { filename, sha256 } = parseChecksumManifest(line, platform, version);
   const actual = createHash('sha256').update(readFileSync(join(dir, filename))).digest('hex');
-  assert.equal(actual, match[1], '安装包哈希不匹配');
+  assert.equal(actual, sha256, '安装包哈希不匹配');
   checksums.push(line);
   records.push(info);
 }

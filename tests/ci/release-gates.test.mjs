@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  CI_WORKFLOW, PLATFORMS, expectedPackageName, validateBuildInfo, validateBuildRun,
+  CI_WORKFLOW, PLATFORMS, expectedPackageName, parseChecksumManifest, validatePackageEntries, validateBuildInfo, validateBuildRun,
   validateJobs, validateMainMembership, validatePublishContext,
 } from '../../scripts/ci/release-gates.mjs';
 
@@ -63,3 +63,16 @@ for (const [field, value] of Object.entries({
   commit: 'c'.repeat(40), build_run_id: '4321', build_run_attempt: '1', platform: 'macos-arm64',
   desktop_version: '0.1.2', startup: 'failed', icon_sha256: '',
 })) test(`rejects mismatched artifact ${field}`, () => assert.throws(() => validateBuildInfo({ ...info, [field]: value }, run, 'windows-x64', '0.1.1')));
+
+const filename = expectedPackageName('windows-x64', '0.1.1');
+const digest = 'd'.repeat(64);
+test('accepts a complete package and UTF8 BOM checksum manifest', () => {
+  validatePackageEntries(['SHA256SUMS.txt', filename, 'build-info.json'], 'windows-x64', '0.1.1');
+  assert.deepEqual(parseChecksumManifest(`\uFEFF${digest}  ${filename}\r\n`, 'windows-x64', '0.1.1'), { sha256: digest, filename });
+});
+for (const badName of ['../escape.exe', 'zhizhi-0.1.2-win-x64.exe', 'zhizhi-0.1.1-mac-arm64.dmg']) {
+  test(`rejects manifest filename ${badName}`, () => assert.throws(() => parseChecksumManifest(`${digest}  ${badName}`, 'windows-x64', '0.1.1')));
+}
+test('rejects multiple manifest entries', () => assert.throws(() => parseChecksumManifest(`${digest}  ${filename}\n${digest}  ${filename}`, 'windows-x64', '0.1.1')));
+test('rejects a missing installer', () => assert.throws(() => validatePackageEntries(['SHA256SUMS.txt', 'build-info.json'], 'windows-x64', '0.1.1')));
+test('rejects unexpected artifact files', () => assert.throws(() => validatePackageEntries(['SHA256SUMS.txt', 'build-info.json', filename, 'extra.exe'], 'windows-x64', '0.1.1')));

@@ -100,12 +100,25 @@ jobs:
           macOS 使用临时签名，尚未公证；Windows 尚未配置代码签名。未进行页面视觉验收。
           "@
           Set-Content -LiteralPath 'packages/release-notes.md' -Value $notes -Encoding UTF8
-          $tagLookup = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha' 2>$null
-          if ($LASTEXITCODE -eq 0 -and $tagLookup -ne $commit) { throw '已有标签指向其他提交，拒绝发布' }
-          $existingText = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,targetCommitish 2>$null
-          if ($LASTEXITCODE -eq 0) {
-              $existing = $existingText | ConvertFrom-Json
-              if (-not $existing.isDraft -or $existing.targetCommitish -ne $commit) { throw '不覆盖已发布版本或其他提交的草稿' }
+          function Get-OptionalGitHubResource([string]$ApiPath) {
+              $response = gh api $ApiPath 2>&1
+              if ($LASTEXITCODE -eq 0) { return (($response -join "`n") | ConvertFrom-Json) }
+              if (($response -join "`n") -match '\(HTTP 404\)') { return $null }
+              throw '无法确认 GitHub 现有标签或版本状态，拒绝发布'
+          }
+          $tagLookup = Get-OptionalGitHubResource "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+          if ($tagLookup) {
+              $target = $tagLookup.object
+              for ($depth = 0; $target.type -eq 'tag' -and $depth -lt 10; $depth++) {
+                  $annotated = Get-OptionalGitHubResource "repos/$env:GITHUB_REPOSITORY/git/tags/$($target.sha)"
+                  if (-not $annotated) { throw '无法解析已有标签' }
+                  $target = $annotated.object
+              }
+              if ($target.type -ne 'commit' -or $target.sha -ne $commit) { throw '已有标签指向其他提交，拒绝发布' }
+          }
+          $existing = Get-OptionalGitHubResource "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if ($existing) {
+              if (-not $existing.draft -or $existing.target_commitish -ne $commit) { throw '不覆盖已发布版本或其他提交的草稿' }
           } else {
               gh release create $tag --repo $env:GITHUB_REPOSITORY --target $commit --draft --title ('知枝 ' + $tag) --notes-file 'packages/release-notes.md'
               if ($LASTEXITCODE -ne 0) { throw '发布草稿创建失败' }
