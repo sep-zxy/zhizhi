@@ -99,6 +99,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GitHub Actions 配置校验失败' }
           node --test tests/ci/release-gates.test.mjs
           if ($LASTEXITCODE -ne 0) { throw '发布门禁验证失败' }
+          & 'tests/ci/secret-scope.ps1'
 
   desktop:
     needs: [secrets, static, configuration]
