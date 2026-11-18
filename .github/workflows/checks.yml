@@ -5,64 +5,50 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   secrets:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
+    runs-on: windows-2025
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - name: Scan Git history for credentials
+          persist-credentials: false
+      - name: Scan the tested commit's history
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = '8.30.1'
-          $asset = "gitleaks_${version}_windows_x64.zip"
-          $baseUrl = "https://github.com/gitleaks/gitleaks/releases/download/v$version"
-          $archive = Join-Path $env:RUNNER_TEMP $asset
-          $checksumFile = Join-Path $env:RUNNER_TEMP 'gitleaks_checksums.txt'
-          Invoke-WebRequest -Uri "$baseUrl/$asset" -OutFile $archive
-          Invoke-WebRequest -Uri "$baseUrl/gitleaks_${version}_checksums.txt" -OutFile $checksumFile
-          $checksumLine = Get-Content -LiteralPath $checksumFile -Encoding UTF8 | Where-Object { $_ -match ('\s' + [regex]::Escape($asset) + '$') }
-          if (@($checksumLine).Count -ne 1) { throw '无法确认 Gitleaks 校验值' }
-          $expected = ($checksumLine -split '\s+')[0]
-          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Gitleaks 下载校验失败' }
-          $toolDir = Join-Path $env:RUNNER_TEMP 'gitleaks'
-          Expand-Archive -LiteralPath $archive -DestinationPath $toolDir
-          & (Join-Path $toolDir 'gitleaks.exe') git --redact=100 --no-banner --log-opts='--all' --report-format=json --report-path="$env:RUNNER_TEMP/gitleaks-redacted.json"
-          if ($LASTEXITCODE -ne 0) { throw '凭证扫描失败；请查看已脱敏的检测结果' }
+          & 'scripts/ci/scan-secrets.ps1'
       - name: Upload redacted scan findings
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: credential-scan-redacted
           path: ${{ runner.temp }}/gitleaks-redacted.json
           retention-days: 1
 
   static:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
+    runs-on: windows-2025
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          version: '10.33.0'
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: pnpm
-          cache-dependency-path: viewer/pnpm-lock.yaml
+          persist-credentials: false
+      - uses: ./.github/actions/setup-toolchain
       - name: Check JavaScript and TypeScript
         run: |
           $ErrorActionPreference = 'Stop'
@@ -70,22 +56,69 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败' }
           pnpm --dir viewer typecheck
           if ($LASTEXITCODE -ne 0) { throw 'TypeScript 校验失败' }
-          node --check desktop/main.mjs
-          if ($LASTEXITCODE -ne 0) { throw '桌面入口语法校验失败' }
-          node --check scripts/require-github-actions.mjs
-          if ($LASTEXITCODE -ne 0) { throw '构建限制脚本语法校验失败' }
-          node --check desktop/sign-macos.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'macOS 签名脚本语法校验失败' }
-      - name: Check Python syntax
+          foreach ($file in @(git ls-files '*.mjs')) {
+              node --check $file
+              if ($LASTEXITCODE -ne 0) { throw "JavaScript 语法校验失败：$file" }
+          }
+      - name: Check Python and PowerShell syntax
         run: |
           $ErrorActionPreference = 'Stop'
+          foreach ($file in @(git ls-files '*.ps1')) {
+              $syntaxErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $file), [ref]$null, [ref]$syntaxErrors) | Out-Null
+              if ($syntaxErrors) { throw "PowerShell 语法校验失败：$file" }
+          }
           $syntaxCode = @'
           import ast
+          import subprocess
           from pathlib import Path
-          files = [file for folder in ('src', 'tests', 'scripts', 'desktop') for file in Path(folder).rglob('*.py') if not any(part in ('node_modules', 'sidecar', '__pycache__', '.pyinstaller') for part in file.parts)]
-          for file in files:
-              ast.parse(file.read_text(encoding='utf-8-sig'), filename=str(file))
-          print(f'Python syntax checked: {len(files)} files')
+          files = subprocess.check_output(['git', 'ls-files', '-z', '*.py']).decode('utf-8').split('\0')
+          for file in filter(None, files):
+              ast.parse(Path(file).read_text(encoding='utf-8-sig'), filename=file)
+          print(f'Python syntax checked: {len(files) - 1} files')
           '@
-          uv run --no-project --python 3.13 python -c $syntaxCode
+          uv run --no-project --python $env:UV_PYTHON python -c $syntaxCode
           if ($LASTEXITCODE -ne 0) { throw 'Python 语法校验失败' }
+
+  configuration:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-toolchain
+      - name: Validate workflows and release gate behavior
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . 'scripts/ci/download-tool.ps1'
+          $tool = Get-VerifiedReleaseTool -Repository 'rhysd/actionlint' -Tag 'v1.7.12' -ArchiveName 'actionlint_1.7.12_windows_amd64.zip' -ChecksumsName 'actionlint_1.7.12_checksums.txt' -BinaryName 'actionlint.exe'
+          & $tool -color
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Actions 配置校验失败' }
+          node --test tests/ci/release-gates.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw '发布门禁验证失败' }
+
+  desktop:
+    needs: [secrets, static, configuration]
+    uses: ./.github/workflows/desktop-build.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [secrets, static, configuration, desktop]
+    runs-on: windows-2025
+    timeout-minutes: 5
+    env:
+      JOB_RESULTS: ${{ toJSON(needs) }}
+      SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - name: Require every check and both desktop packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $results = $env:JOB_RESULTS | ConvertFrom-Json
+          foreach ($job in $results.PSObject.Properties) {
+              if ($job.Value.result -ne 'success') { throw "合并检查未通过：$($job.Name) = $($job.Value.result)" }
+          }
+          "CI Gate passed for $env:SOURCE_SHA" | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8 -Append

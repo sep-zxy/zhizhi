@@ -2,12 +2,18 @@ name: Desktop Build
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact commit already checked by the caller
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: desktop-build-${{ github.ref }}
+  group: desktop-build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -20,7 +26,7 @@ jobs:
       matrix:
         include:
           - platform: windows-x64
-            runner: windows-latest
+            runner: windows-2025
             arch: x64
             command: package:win
           - platform: macos-arm64
@@ -31,24 +37,24 @@ jobs:
       run:
         shell: pwsh
     env:
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: 'false'
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          enable-cache: true
-      - uses: pnpm/action-setup@v4
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-toolchain
         with:
-          version: '10.33.0'
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: pnpm
           cache-dependency-path: |
             viewer/pnpm-lock.yaml
             desktop/pnpm-lock.yaml
+      - name: Verify the exact source commit
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$' -or $actual -ne $env:SOURCE_SHA) { throw '构建提交与已检查提交不一致' }
 
       - name: Validate source and build viewer
         run: |
@@ -65,7 +71,7 @@ jobs:
       - name: Build Python sidecar
         run: |
           $ErrorActionPreference = 'Stop'
-          uv sync --frozen --no-dev --group desktop --python 3.13
+          uv sync --frozen --no-dev --group desktop --python $env:UV_PYTHON
           if ($LASTEXITCODE -ne 0) { throw 'Python 依赖安装失败' }
           & 'desktop/build-sidecar.ps1'
 
@@ -116,7 +122,9 @@ jobs:
               $startup = 'desktop-load-pass'
           }
           [ordered]@{
-              commit = '${{ github.sha }}'
+              commit = $env:SOURCE_SHA
+              build_run_id = '${{ github.run_id }}'
+              build_run_attempt = '${{ github.run_attempt }}'
               run_url = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
               platform = '${{ matrix.platform }}'
               desktop_version = (Get-Content -LiteralPath 'desktop/package.json' -Encoding UTF8 -Raw | ConvertFrom-Json).version
@@ -135,7 +143,7 @@ jobs:
               "$hash  $($_.Name)"
           } | Set-Content -LiteralPath 'dist/desktop/SHA256SUMS.txt' -Encoding UTF8
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zhizhi-${{ matrix.platform }}
           path: |
@@ -148,7 +156,7 @@ jobs:
 
       - name: Upload diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: diagnostics-${{ matrix.platform }}
           path: |
