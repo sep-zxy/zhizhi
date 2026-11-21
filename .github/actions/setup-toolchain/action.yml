@@ -1,0 +1,30 @@
+name: Pinned build toolchain
+description: Shared tool versions for source checks and desktop packaging
+inputs:
+  enable-cache:
+    description: Enable dependency caches only in jobs that install dependencies
+    default: 'false'
+  cache-dependency-path:
+    description: pnpm lockfiles used for the cache key
+    default: viewer/pnpm-lock.yaml
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      with:
+        version: '0.13.9'
+        enable-cache: ${{ inputs.enable-cache }}
+    - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        version: '10.33.0'
+        run_install: false
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: '22.23.5'
+        cache: ${{ inputs.enable-cache == 'true' && 'pnpm' || '' }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+    - name: Pin Python for every uv command
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        'UV_PYTHON=3.13.18' | Out-File -LiteralPath $env:GITHUB_ENV -Encoding UTF8 -Append

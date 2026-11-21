@@ -75,7 +75,7 @@
 | Windows x64 | `zhizhi-<版本>-win-x64.exe` | NSIS 安装包，包含桌面宿主、界面与本机 Python 服务 |
 | macOS Apple Silicon | `zhizhi-<版本>-mac-arm64.dmg` | DMG，使用临时签名，尚未通过 Apple 公证 |
 
-安装包在 GitHub Actions 构建。工作流同时生成 `SHA256SUMS.txt` 和 `build-info.json`，记录安装包校验值、源码提交与构建地址。尚未发布的构建可在 [Actions](https://github.com/sep-zxy/zhizhi/actions/workflows/desktop-build.yml) 的成功运行中下载 Artifact。
+安装包在 GitHub Actions 构建。工作流同时生成 `SHA256SUMS.txt` 和 `build-info.json`，记录安装包校验值、源码提交与构建地址。尚未发布的构建可在 [CI](https://github.com/sep-zxy/zhizhi/actions/workflows/checks.yml) 或手动 Desktop Build 的成功运行中下载 Artifact；PR 预览包不能用于正式发布。
 
 桌面版无需单独安装 Python 或 Node.js。使用 Git 项目功能需要系统中有可用的 Git：
 
@@ -160,7 +160,7 @@ zhizhi/
 
 技术栈为 React / TypeScript / Vite、Electron、Python 与 SQLite；可选同步云使用 PostgreSQL。
 
-**所有构建必须在 GitHub 托管的 Actions runner 上执行。** 本地只进行必要的语法、类型和配置校验；前端构建、PyInstaller 打包、Python 发行包构建和 Electron 打包均不在本地运行。
+**所有构建与验证必须在 GitHub 托管的 Actions runner 上执行。** PR 和主分支使用同一套 CI，全部检查与双平台构建通过后才会产生可合并的 `CI Gate`。正式发布只接受已进入主分支、同一次完整 CI 通过的产物；本地不执行语法检查、测试或打包。
 
 触发构建并下载结果：
 
