@@ -149,6 +149,7 @@ export function renderMarkdownProse(content: string, classPrefix = 'lesson'): Re
         key={`code-${blockKey++}`}
         className={`${classPrefix}__code-block`}
         data-language={codeLanguage || undefined}
+        tabIndex={0}
       >
         <code>{codeLines.join('\n')}</code>
       </pre>,
